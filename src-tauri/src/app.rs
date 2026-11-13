@@ -146,6 +146,8 @@ impl App {
             "SyncHopper: setup not finished".into()
         } else if self.engine.has_problems() {
             "SyncHopper: needs attention".into()
+        } else if self.engine.waiting_for_koofr() {
+            "SyncHopper: waiting for Koofr".into()
         } else if self.engine.busy() {
             "SyncHopper: syncing".into()
         } else if self.uploads.active() > 0 {
@@ -291,7 +293,25 @@ impl App {
                 self.core.log(&e);
             }
         }
+        if let Err(e) = self.apply_sidebar().await {
+            self.core.log(&e);
+        }
         self.drive.apply().await;
+    }
+
+    /// Adds or removes the Koofr entry in File Explorer's sidebar to match
+    /// the settings. It points at the folder that holds the synced folders.
+    pub async fn apply_sidebar(&self) -> Result<(), String> {
+        let s = self.core.settings();
+        let Some(exe) = self.core.host.exe_path() else { return Ok(()) };
+        let wanted = s.setup_complete && s.feature_sync && s.feature_sidebar && !s.base_folder.trim().is_empty();
+        if wanted {
+            let folder = PathBuf::from(s.base_folder.trim());
+            std::fs::create_dir_all(&folder).map_err(|e| format!("Could not create {}: {e}", folder.display()))?;
+            platform::set_sidebar(Some(&folder), &exe).await
+        } else {
+            platform::set_sidebar(None, &exe).await
+        }
     }
 
     pub async fn refresh_about(&self) {
@@ -372,6 +392,7 @@ impl App {
         let _ = self.core.host.set_autostart(false);
         if let Some(exe) = self.core.host.exe_path() {
             let _ = platform::set_context_menu(false, &exe).await;
+            let _ = platform::set_sidebar(None, &exe).await;
         }
         self.core.update(|s| {
             s.setup_complete = false;
@@ -443,11 +464,11 @@ impl App {
 
     /// Saves changed settings and applies what follows from them.
     pub async fn update_settings(self: &Arc<Self>, patch: serde_json::Value) -> Result<(), String> {
-        const EDITABLE: [&str; 17] = [
-            "feature_sync", "feature_drive", "drive_letter", "feature_context_menu", "autostart",
+        const EDITABLE: [&str; 19] = [
+            "feature_sync", "feature_drive", "drive_letter", "feature_context_menu", "feature_sidebar", "autostart",
             "check_interval_min", "transfers", "max_delete_percent", "use_http2", "upload_limit_mbps",
             "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery",
-            "pause_on_metered", "notify_level", "auto_update_engine",
+            "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app",
         ];
         let old = self.core.settings();
         let mut value = serde_json::to_value(&old).map_err(|e| e.to_string())?;
@@ -484,6 +505,12 @@ impl App {
             }
             self.engine.rewatch();
         }
+        if old.feature_sidebar != new.feature_sidebar || old.feature_sync != new.feature_sync {
+            if let Err(e) = self.apply_sidebar().await {
+                self.core.update(|s| s.feature_sidebar = old.feature_sidebar);
+                problems.push(e);
+            }
+        }
         if old.ignore_patterns != new.ignore_patterns {
             self.engine.filters_changed();
         }
@@ -508,7 +535,7 @@ impl App {
         let mut defaults = self.core.settings();
         defaults.restore_advanced_defaults();
         let patch = serde_json::to_value(&defaults).map_err(|e| e.to_string())?;
-        let keep = ["use_http2", "upload_limit_mbps", "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery", "pause_on_metered", "notify_level", "auto_update_engine"];
+        let keep = ["use_http2", "upload_limit_mbps", "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery", "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app"];
         let only: serde_json::Map<String, serde_json::Value> = patch
             .as_object()
             .map(|o| o.iter().filter(|(k, _)| keep.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -599,8 +626,8 @@ impl App {
         out.push_str(&format!("Sync engine: rclone {} ({}, {})\n", e.version, e.state, if e.managed { "app copy" } else { "found on this PC" }));
         out.push_str(&format!("Account: {}\n", mask_email(&s.account_email)));
         out.push_str(&format!(
-            "Features: sync {}, drive {} ({}), right-click {}, start with Windows {}\n",
-            s.feature_sync, s.feature_drive, d.state, s.feature_context_menu, s.autostart
+            "Features: sync {}, drive {} ({}), right-click {}, sidebar {}, start with Windows {}, app updates {}\n",
+            s.feature_sync, s.feature_drive, d.state, s.feature_context_menu, s.feature_sidebar, s.autostart, s.auto_update_app
         ));
         out.push_str(&format!(
             "Sync: every {} min, {} at a time, HTTP/2 {}, limits up {} down {} MB/s, conflicts {}, delete check {}%\n",
@@ -611,15 +638,20 @@ impl App {
         out.push_str(&format!("Paused: {} {}\n", sync.paused_all, sync.auto_pause.unwrap_or_default()));
         for p in self.engine.pair_views() {
             out.push_str(&format!(
-                "Folder: {} <-> Koofr:/{} | {:?}{} | last synced {} | left out {} | {}\n",
+                "Folder: {} <-> Koofr:/{} | {:?}{} | last synced {} | left out {} | ignored {} | {}{}\n",
                 p.local,
                 p.remote,
                 p.phase,
                 if p.paused { " (paused)" } else { "" },
                 if p.last_sync == 0 { "never".to_string() } else { crate::core::timestamp(p.last_sync) },
-                p.skipped.len(),
-                p.error.unwrap_or_default()
+                p.files.len(),
+                p.ignored.len(),
+                p.error.unwrap_or_default(),
+                p.waiting.unwrap_or_default()
             ));
+            for f in p.files.iter().take(5) {
+                out.push_str(&format!("    left out: {} ({}): {}\n", f.path, f.kind, f.detail));
+            }
             for line in p.details.iter().take(5) {
                 out.push_str(&format!("    {line}\n"));
             }

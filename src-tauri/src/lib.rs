@@ -26,6 +26,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_notification::NotificationExt as _;
 use tauri_plugin_opener::OpenerExt as _;
+use tauri_plugin_updater::UpdaterExt as _;
 
 struct TauriHost {
     handle: AppHandle,
@@ -76,13 +77,236 @@ struct Tray {
     pause_item: Mutex<Option<MenuItem<tauri::Wry>>>,
 }
 
+// ----- updates to SyncHopper itself ------------------------------------
+
+/// Where SyncHopper is in checking for and installing its own updates.
+#[derive(Clone, Default, serde::Serialize)]
+struct UpdateView {
+    /// False in builds made without the update signing key, such as test
+    /// builds made on a PC. Those can't update themselves.
+    enabled: bool,
+    /// "idle", "checking", "current", "available", "downloading",
+    /// "installing" or "error".
+    status: String,
+    version: String,
+    notes: String,
+    percent: u8,
+    message: String,
+    checked_at: u64,
+}
+
+struct Updates {
+    view: Mutex<UpdateView>,
+    pending: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    notified_for: Mutex<String>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl Updates {
+    fn set(&self, change: impl FnOnce(&mut UpdateView)) {
+        change(&mut self.view.lock().unwrap());
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    fn view(&self) -> UpdateView {
+        self.view.lock().unwrap().clone()
+    }
+}
+
+/// True when this build carries the public key needed to check updates.
+fn updates_possible(config: &tauri::Config) -> bool {
+    config
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|u| u.get("pubkey"))
+        .and_then(|k| k.as_str())
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Asks the release page whether a newer SyncHopper exists.
+async fn check_for_update(handle: &AppHandle, manual: bool) -> Result<(), String> {
+    let updates = handle.state::<Arc<Updates>>().inner().clone();
+    if !updates.view().enabled {
+        return Err("This copy of SyncHopper was built on this PC, so it can't update itself. Install the release version to get updates.".into());
+    }
+    if matches!(updates.view().status.as_str(), "checking" | "downloading" | "installing") {
+        return Ok(());
+    }
+    updates.set(|u| {
+        u.status = "checking".into();
+        u.message.clear();
+    });
+    let mut builder = handle.updater_builder();
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("SYNCHOPPER_UPDATE_URL") {
+        let parsed = url.parse().map_err(|e| format!("{e}"))?;
+        builder = builder.endpoints(vec![parsed]).map_err(|e| e.to_string())?;
+    }
+    let result = match builder.build() {
+        Ok(updater) => updater.check().await.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let app = handle.state::<Arc<App>>().inner().clone();
+    match result {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            let notes = update.body.clone().unwrap_or_default();
+            app.core.log(&format!("SyncHopper {version} is available"));
+            *updates.pending.lock().await = Some(update);
+            updates.set(|u| {
+                u.status = "available".into();
+                u.version = version.clone();
+                u.notes = notes;
+                u.checked_at = util::now_secs();
+            });
+            let first_time = {
+                let mut seen = updates.notified_for.lock().unwrap();
+                let fresh = *seen != version;
+                *seen = version.clone();
+                fresh
+            };
+            if first_time && !manual {
+                app.core.notify(
+                    core::Notice::Info,
+                    &format!("SyncHopper {version} is available"),
+                    "Open SyncHopper to install it. It only takes a moment.",
+                );
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            *updates.pending.lock().await = None;
+            updates.set(|u| {
+                u.status = "current".into();
+                u.version.clear();
+                u.checked_at = util::now_secs();
+            });
+            Ok(())
+        }
+        Err(e) => {
+            app.core.log(&format!("Update check failed: {e}"));
+            updates.set(|u| {
+                u.status = if manual { "error".into() } else { "idle".into() };
+                u.message = format!("Couldn't check for updates: {e}");
+            });
+            if manual {
+                Err(format!("Couldn't check for updates: {e}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Downloads and installs the update found by the last check. On Windows
+/// the installer closes SyncHopper, installs, and opens it again.
+async fn install_update(handle: &AppHandle) -> Result<(), String> {
+    let updates = handle.state::<Arc<Updates>>().inner().clone();
+    let Some(update) = updates.pending.lock().await.clone() else {
+        return Err("There is no update waiting to be installed. Check for updates first.".into());
+    };
+    let app = handle.state::<Arc<App>>().inner().clone();
+    app.core.log(&format!("Installing SyncHopper {}", update.version));
+    // Let anything in progress stop cleanly first. Interrupted syncs pick up
+    // where they left off after the restart.
+    app.engine.stop_all();
+    app.uploads.cancel_all();
+    app.drive.stop();
+    app.engine.wait_idle().await;
+    updates.set(|u| {
+        u.status = "downloading".into();
+        u.percent = 0;
+        u.message.clear();
+    });
+    let total = Arc::new(Mutex::new((0u64, None::<u64>)));
+    let progress = updates.clone();
+    let counter = total.clone();
+    let finished = updates.clone();
+    let result = update
+        .download_and_install(
+            move |chunk, length| {
+                let mut t = counter.lock().unwrap();
+                t.0 += chunk as u64;
+                t.1 = length;
+                let pct = match t.1 {
+                    Some(len) if len > 0 => ((t.0 * 100) / len).min(100) as u8,
+                    _ => 0,
+                };
+                progress.set(|u| u.percent = pct);
+            },
+            move || finished.set(|u| u.status = "installing".into()),
+        )
+        .await;
+    match result {
+        Ok(()) => {
+            // Reached only where the installer does not close the app itself.
+            handle.restart();
+        }
+        Err(e) => {
+            app.core.log(&format!("Update install failed: {e}"));
+            updates.set(|u| {
+                u.status = "error".into();
+                u.message = format!("The update could not be installed: {e}");
+            });
+            // Put back what was stopped for the install.
+            app.drive.apply().await;
+            app.engine.sync_now(None);
+            Err(format!("The update could not be installed: {e}"))
+        }
+    }
+}
+
+/// Checks for updates a minute after starting, then twice a day.
+async fn update_loop(handle: AppHandle) {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    loop {
+        let app = handle.state::<Arc<App>>().inner().clone();
+        if app.core.settings().auto_update_app {
+            let _ = check_for_update(&handle, false).await;
+        }
+        tokio::time::sleep(Duration::from_secs(12 * 3600)).await;
+    }
+}
+
+/// The app state plus the update state, as one object for the screens.
+fn full_state(handle: &AppHandle) -> serde_json::Value {
+    let app = handle.state::<Arc<App>>().inner().clone();
+    let mut v = app.snapshot();
+    if let (Some(obj), Some(updates)) = (v.as_object_mut(), handle.try_state::<Arc<Updates>>()) {
+        obj.insert("update".into(), serde_json::to_value(updates.view()).unwrap_or_default());
+    }
+    v
+}
+
 type Ctx<'a> = State<'a, Arc<App>>;
 
 // ----- commands the screens call ---------------------------------------
 
 #[tauri::command]
-fn get_state(app: Ctx<'_>) -> serde_json::Value {
-    app.snapshot()
+fn get_state(handle: AppHandle) -> serde_json::Value {
+    full_state(&handle)
+}
+
+#[tauri::command]
+async fn check_updates(handle: AppHandle) -> Result<(), String> {
+    check_for_update(&handle, true).await
+}
+
+#[tauri::command]
+async fn install_app_update(handle: AppHandle) -> Result<(), String> {
+    install_update(&handle).await
+}
+
+#[tauri::command]
+async fn ignore_file(app: Ctx<'_>, id: String, path: String) -> Result<(), String> {
+    app.engine.ignore_file(&id, &path)
+}
+
+#[tauri::command]
+async fn unignore_file(app: Ctx<'_>, id: String, path: String) -> Result<(), String> {
+    app.engine.unignore_file(&id, &path)
 }
 
 #[tauri::command]
@@ -360,7 +584,7 @@ async fn state_pump(handle: AppHandle, app: Arc<App>, dirty: Arc<AtomicBool>) {
         if !dirty.swap(false, Ordering::SeqCst) {
             continue;
         }
-        let _ = handle.emit("state", app.snapshot());
+        let _ = handle.emit("state", full_state(&handle));
         let tip = app.status_line();
         if tip != last_tip {
             if let Some(tray) = handle.tray_by_id("main") {
@@ -402,7 +626,13 @@ fn test_remote() -> Option<String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+    let can_update = updates_possible(context.config());
+    let mut builder = tauri::Builder::default();
+    if can_update {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
         .plugin(tauri_plugin_single_instance::init(|handle, argv, _cwd| {
             // A second launch lands here, inside the copy that is already
             // running. Hand the work to the async runtime and return at once
@@ -422,9 +652,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|tauri_app| {
+        .setup(move |tauri_app| {
             let handle = tauri_app.handle().clone();
             let dirty = Arc::new(AtomicBool::new(true));
+            handle.manage(Arc::new(Updates {
+                view: Mutex::new(UpdateView { enabled: can_update, status: "idle".into(), ..Default::default() }),
+                pending: tokio::sync::Mutex::new(None),
+                notified_for: Mutex::new(String::new()),
+                dirty: dirty.clone(),
+            }));
             let host = Arc::new(TauriHost { handle: handle.clone(), dirty: dirty.clone() });
             let test = test_remote();
             let app = App::new(
@@ -444,6 +680,9 @@ pub fn run() {
             }
 
             tauri::async_runtime::spawn(state_pump(handle.clone(), app.clone(), dirty));
+            if can_update {
+                tauri::async_runtime::spawn(update_loop(handle.clone()));
+            }
             let starter = app.clone();
             tauri::async_runtime::spawn(async move {
                 starter.start().await;
@@ -504,7 +743,11 @@ pub fn run() {
             open_target,
             diagnostics,
             hide_window,
+            check_updates,
+            install_app_update,
+            ignore_file,
+            unignore_file,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running SyncHopper");
 }

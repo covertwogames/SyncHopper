@@ -114,6 +114,10 @@
           <label for="st-menu"><span>Send to Koofr in the right-click menu</span><span class="small muted">Adds an entry to File Explorer's menu. On Windows 11 it is under "Show more options".</span></label>
         </div>
         <div class="check">
+          <input id="st-sidebar" type="checkbox" data-set="feature_sidebar">
+          <label for="st-sidebar"><span>Koofr in File Explorer's sidebar</span><span class="small muted" id="st-sidebar-note">Adds Koofr next to OneDrive and This PC. It opens the folder your synced folders are in.</span></label>
+        </div>
+        <div class="check">
           <input id="st-start" type="checkbox" data-set="autostart">
           <label for="st-start"><span>Start with Windows</span><span class="small muted">Open in the tray when you sign in.</span></label>
         </div>
@@ -216,6 +220,13 @@
               <option value="all">Everything</option>
               <option value="none">Nothing</option>
             </select>
+          </div>
+          <div class="check">
+            <input id="ad-app-update" type="checkbox" data-set="auto_update_app">
+            <label for="ad-app-update"><span>Check for SyncHopper updates automatically</span><span class="small muted" id="ad-app-note"></span></label>
+          </div>
+          <div class="row gap8 indent-check">
+            <button type="button" class="btn" id="ad-check">Check for updates now</button>
           </div>
           <div class="check">
             <input id="ad-update" type="checkbox" data-set="auto_update_engine">

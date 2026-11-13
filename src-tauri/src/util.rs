@@ -131,6 +131,100 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    // Days since 1970-01-01, after Howard Hinnant's algorithm.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Reads a timestamp like "2026-11-13T15:10:34.650367249+0000" or
+/// "2026-11-13T10:10:34.65-05:00" or "...Z" into nanoseconds since 1970.
+pub fn parse_time_ns(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let num = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
+    if t.len() < 19 || t.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, se) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let mut rest = &t[19..];
+    let mut nanos: i64 = 0;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+        rest = &frac[digits.len()..];
+        let mut padded = digits.chars().take(9).collect::<String>();
+        while padded.len() < 9 {
+            padded.push('0');
+        }
+        nanos = padded.parse().ok()?;
+    }
+    let offset_secs: i64 = if rest.is_empty() || rest == "Z" || rest == "z" {
+        0
+    } else {
+        let sign = match rest.as_bytes()[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let digits: String = rest[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() != 4 {
+            return None;
+        }
+        sign * (digits[0..2].parse::<i64>().ok()? * 3600 + digits[2..4].parse::<i64>().ok()? * 60)
+    };
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset_secs;
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+/// Undoes Go-style string quoting as used in rclone's sync records, for
+/// example "sub dir/we\"ird.txt". The text passed in excludes the outer quotes.
+pub fn go_unquote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(e) = chars.next() else { break };
+        let hex = |n: usize, chars: &mut std::str::Chars| -> Option<char> {
+            let h: String = chars.by_ref().take(n).collect();
+            u32::from_str_radix(&h, 16).ok().and_then(char::from_u32)
+        };
+        match e {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            'v' => out.push('\u{0B}'),
+            'x' => {
+                if let Some(ch) = hex(2, &mut chars) {
+                    out.push(ch)
+                }
+            }
+            'u' => {
+                if let Some(ch) = hex(4, &mut chars) {
+                    out.push(ch)
+                }
+            }
+            'U' => {
+                if let Some(ch) = hex(8, &mut chars) {
+                    out.push(ch)
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +253,25 @@ mod tests {
         assert!(paths_overlap("docs", "docs/work", '/'));
         assert!(!paths_overlap("docs2", "docs", '/'));
         assert!(paths_overlap("", "docs", '/'));
+    }
+
+    #[test]
+    fn times() {
+        let a = parse_time_ns("2026-11-13T15:10:34.650367249+0000").unwrap();
+        let b = parse_time_ns("2026-11-13T10:10:34.650367249-05:00").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(parse_time_ns("1970-01-01T00:00:01Z"), Some(1_000_000_000));
+        assert_eq!(parse_time_ns("2000-02-29T00:00:00.5Z"), Some(951_782_400_500_000_000));
+        assert!(parse_time_ns("yesterday").is_none());
+    }
+
+    #[test]
+    fn unquote() {
+        assert_eq!(go_unquote(r#"sub dir/we\"ird [x].txt"#), "sub dir/we\"ird [x].txt");
+        assert_eq!(go_unquote(r"back\\slash"), "back\\slash");
+        assert_eq!(go_unquote(r"tab\there"), "tab\there");
+        assert_eq!(go_unquote(r"\u00e9t\xe9"), "\u{e9}t\u{e9}");
+        assert_eq!(go_unquote("plain émoji 😀"), "plain émoji 😀");
     }
 
     #[test]

@@ -97,8 +97,10 @@ impl Rig {
         let log = std::fs::read_to_string(self.app.core.log_path()).unwrap_or_default();
         let tail: Vec<&str> = log.lines().rev().take(25).collect();
         format!(
-            "phase={:?} error={:?} details={:?} approval={:?} skipped={:?}\nlog tail:\n{}",
-            v.phase, v.error, v.details, v.approval, v.skipped,
+            "phase={:?} error={:?} waiting={:?} details={:?} approval={:?} files={:?} ignored={:?}\nlog tail:\n{}",
+            v.phase, v.error, v.waiting, v.details, v.approval,
+            v.files.iter().map(|f| (&f.path, &f.kind, f.flagged, &f.detail)).collect::<Vec<_>>(),
+            v.ignored,
             tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         )
     }
@@ -141,4 +143,101 @@ pub async fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     panic!("timed out waiting for: {what}");
+}
+
+/// A stand-in for the sync engine program that can pretend Koofr is down, or
+/// that particular files fail, and can run the real engine as an unprivileged
+/// user so files can be made unreadable to it. Controlled by files in the
+/// rig's folder:
+/// - `outage`: every two-way sync fails as if Koofr returned errors.
+/// - `fail.list`: lines of `path|object type|message`. A two-way sync that
+///   would touch one of these paths (because it is not left out yet) syncs
+///   everything else, then reports these files as failed.
+/// - `locked.list`: absolute paths made unreadable to the engine.
+///
+/// Returns None when the test machine can't run it.
+#[cfg(unix)]
+pub fn fake_engine(rig: &Rig, as_nobody: bool) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let out = std::process::Command::new("sh").args(["-c", "command -v rclone; command -v setpriv; id -u"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    let rclone = lines.first()?.to_string();
+    if as_nobody && (lines.len() < 3 || lines[2] != "0") {
+        return None;
+    }
+    let root = rig.dir.path().to_string_lossy().to_string();
+    let run = if as_nobody {
+        format!("setpriv --reuid=65534 --regid=65534 --clear-groups '{rclone}'")
+    } else {
+        format!("'{rclone}'")
+    };
+    let script = format!(
+        r#"#!/bin/sh
+R='{root}'
+chmod -R a+rwX "$R" 2>/dev/null
+if [ -f "$R/locked.list" ]; then while read -r f; do chmod 000 "$f"; done < "$R/locked.list"; fi
+if [ "$1" != "bisync" ]; then exec {run} "$@"; fi
+work=""; filters=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--workdir" ] && work="$a"
+  [ "$prev" = "--filters-file" ] && filters="$a"
+  prev="$a"
+done
+if [ -f "$R/outage" ]; then
+  echo '{{"level":"error","msg":"error reading destination root directory: Invalid response status! Got 500, expected [200 206]"}}' >&2
+  echo '{{"level":"error","msg":"Bisync critical error: Invalid response status! Got 500, expected [200 206]"}}' >&2
+  echo '{{"level":"error","msg":"Bisync aborted. Error is retryable without --resync due to --resilient mode."}}' >&2
+  exit 7
+fi
+if [ ! -f "$R/fail.list" ]; then exec {run} "$@"; fi
+active=""
+while IFS='|' read -r p t m; do
+  [ -z "$p" ] && continue
+  if [ -n "$filters" ] && grep -qxF -- "- /$p" "$filters"; then continue; fi
+  active="$active$p|$t|$m
+"
+done < "$R/fail.list"
+if [ -z "$active" ]; then exec {run} "$@"; fi
+set -- "$@"
+excl=""
+printf '%s' "$active" | while IFS='|' read -r p t m; do [ -n "$p" ] && printf -- '- /%s
+' "$p"; done > "$R/extra-filter.txt"
+cat "$filters" >> "$R/extra-filter.txt"
+{run} "$@" --filter-from "$R/extra-filter.txt"
+code=$?
+if [ $code -ne 0 ]; then exit $code; fi
+for f in "$work"/*.path1.lst "$work"/*.path2.lst; do [ -f "$f" ] && mv "$f" "$f-err"; done
+printf '%s' "$active" | while IFS='|' read -r p t m; do
+  [ -n "$p" ] && echo '{{"level":"error","msg":"Failed to copy: '"$m"'","object":"'"$p"'","objectType":"'"$t"'"}}' >&2
+done
+echo '{{"level":"error","msg":"Bisync aborted. Must run --resync to recover."}}' >&2
+exit 7
+"#
+    );
+    let path = rig.dir.path().join("fake-rclone.sh");
+    std::fs::write(&path, script).ok()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+    let exe = path.clone();
+    rig.app.core.set_engine(|e| e.exe = Some(exe));
+    Some(path)
+}
+
+pub fn set_flag(rig: &Rig, name: &str, content: Option<&str>) {
+    let p = rig.dir.path().join(name);
+    match content {
+        Some(c) => std::fs::write(p, c).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Makes every left-out file due for a retry, as if time had passed.
+pub fn make_retries_due(rig: &Rig, id: &str) {
+    rig.app.core.update_pair(id, |p| {
+        for k in p.skipped.iter_mut() {
+            k.next_retry = 0;
+        }
+    });
 }

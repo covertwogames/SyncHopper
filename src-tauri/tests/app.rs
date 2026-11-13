@@ -121,8 +121,13 @@ async fn settings_changes_are_limited_cleaned_and_restorable() {
     assert_eq!(s.notify_level, "errors");
     assert!(rig.app.update_settings(serde_json::json!({ "transfers": "many" })).await.is_err());
 
+    rig.app.update_settings(serde_json::json!({ "feature_sidebar": false, "auto_update_app": false })).await.unwrap();
+    assert!(!rig.app.core.settings().feature_sidebar && !rig.app.core.settings().auto_update_app);
+
     rig.app.restore_defaults().await.unwrap();
     let s = rig.app.core.settings();
+    assert!(s.auto_update_app, "update checks are an advanced setting, so restore defaults turns them back on");
+    assert!(!s.feature_sidebar, "the sidebar entry is a feature, not an advanced setting");
     assert!(!s.use_http2 && !s.pause_on_battery && s.pause_on_metered);
     assert_eq!(s.conflict_policy, "keep_both");
     assert_eq!(s.upload_limit_mbps, 0.0);

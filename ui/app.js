@@ -387,20 +387,54 @@
         btn: "Pause",
         act: "pause",
       });
+    } else if (p.phase === "waiting") {
+      Object.assign(st, {
+        chip: "info",
+        label: "Waiting for Koofr",
+        sub: (p.waiting || "Koofr is having problems right now.") + " " + retryText(p.retry_at),
+        btn: "Try now",
+        act: "sync",
+      });
     } else if (p.phase === "error") {
       Object.assign(st, { chip: "warn", label: "Needs attention", sub: p.error || "The last sync did not finish", btn: "Review", act: "review" });
-    } else if (p.skipped.length) {
-      Object.assign(st, { chip: "warn", label: plural(p.skipped.length, "file needs", "files need") + " attention", sub: p.skipped[0].reason, btn: "Review", act: "review" });
+    } else if (flaggedFiles(p).length) {
+      const f = flaggedFiles(p);
+      Object.assign(st, { chip: "warn", label: plural(f.length, "file needs", "files need") + " attention", sub: f[0].reason, btn: "Review", act: "review" });
     } else if (p.conflicts.length) {
       Object.assign(st, { chip: "warn", label: plural(p.conflicts.length, "file", "files") + " changed in both places", sub: "See which ones", btn: "Review", act: "review" });
     } else if (hold) {
       Object.assign(st, { label: "Paused", sub: hold });
     } else if (p.phase === "ok" || p.last_sync) {
-      Object.assign(st, { chip: "ok", label: "Up to date", sub: ago(p.last_sync) });
+      Object.assign(st, { chip: "ok", label: "Up to date", sub: [ago(p.last_sync) + ".", quietExtras(p)].filter(Boolean).join(" ") });
     } else {
       Object.assign(st, { label: "Not synced yet", sub: "Waiting for the first sync" });
     }
     return st;
+  }
+
+  // Files left out for long enough, or for good reason, to show the user.
+  function flaggedFiles(p) {
+    return (p.files || []).filter((f) => f.flagged);
+  }
+
+  // Files being retried quietly in the background.
+  function retryingFiles(p) {
+    return (p.files || []).filter((f) => !f.flagged);
+  }
+
+  function quietExtras(p) {
+    const parts = [];
+    const r = retryingFiles(p).length;
+    if (r) parts.push(plural(r, "file", "files") + " will be tried again soon.");
+    if ((p.ignored || []).length) parts.push(plural(p.ignored.length, "file") + " ignored.");
+    return parts.join(" ");
+  }
+
+  function retryText(at) {
+    if (!at) return "Trying again soon.";
+    const secs = Math.max(0, at - Math.floor(Date.now() / 1000));
+    if (secs < 60) return "Trying again in less than a minute.";
+    return "Trying again in " + plural(Math.round(secs / 60), "minute") + ".";
   }
 
   function statusHtml(st) {
@@ -433,6 +467,11 @@
     if (S.test_mode) banners.push('<div class="banner info"><span>Test mode: syncing with a folder on this PC in place of Koofr.</span></div>');
     const eng = engineText();
     if (eng) banners.push('<div class="banner"><span>' + esc(eng) + "</span>" + (S.engine.state === "error" ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : "") + "</div>");
+    const up = S.update || {};
+    if (up.status === "available") banners.push('<div class="banner info"><span>SyncHopper ' + esc(up.version) + ' is available.</span><button type="button" class="btn" data-banner="update">Install and restart</button></div>');
+    else if (up.status === "downloading") banners.push('<div class="banner info"><span>Downloading SyncHopper ' + esc(up.version) + ", " + up.percent + "% done.</span></div>");
+    else if (up.status === "installing") banners.push('<div class="banner info"><span>Installing the update. SyncHopper will close and open again by itself.</span></div>');
+    else if (up.status === "error" && up.version) banners.push('<div class="banner"><span>' + esc(up.message) + '</span><button type="button" class="btn" data-banner="update">Try again</button></div>');
     if (S.sync.paused_all) banners.push('<div class="banner"><span>All syncing is paused.</span><button type="button" class="btn" data-banner="resume">Resume</button></div>');
     else if (S.sync.auto_pause === "battery") banners.push('<div class="banner info"><span>Syncing is paused while this PC is on battery. Use Sync now on a folder to sync it anyway.</span></div>');
     else if (S.sync.auto_pause === "metered") banners.push('<div class="banner info"><span>Syncing is paused on this metered connection. Use Sync now on a folder to sync it anyway.</span></div>');
@@ -518,6 +557,7 @@
     if (!b) return;
     if (b.dataset.banner === "resume") run("set_paused_all", { paused: false });
     if (b.dataset.banner === "engine") run("retry_engine");
+    if (b.dataset.banner === "update") installUpdate();
   });
 
   $("#drive-card").addEventListener("click", (e) => {
@@ -563,6 +603,8 @@
       '<button type="button" role="menuitem" data-m="open">Open folder</button>' +
       '<button type="button" role="menuitem" data-m="sync">Sync now</button>' +
       '<button type="button" role="menuitem" data-m="' + (p.paused ? "resume" : "pause") + '">' + (p.paused ? "Resume syncing" : "Pause syncing") + "</button>" +
+      (retryingFiles(p).length ? '<button type="button" role="menuitem" data-m="retrying">Files waiting to sync (' + retryingFiles(p).length + ")</button>" : "") +
+      ((p.ignored || []).length ? '<button type="button" role="menuitem" data-m="ignored">Ignored files (' + p.ignored.length + ")</button>" : "") +
       '<button type="button" role="menuitem" data-m="repair">Repair</button>' +
       '<button type="button" role="menuitem" class="danger" data-m="remove">Stop syncing this folder</button>';
     menu.dataset.id = id;
@@ -591,6 +633,8 @@
     if (m === "open") run("open_target", { kind: "pair_folder", value: id });
     else if (m === "sync" || m === "pause" || m === "resume") run("pair_action", { id: id, action: m });
     else if (m === "repair") repairPair(p);
+    else if (m === "retrying") openReview(id, "files");
+    else if (m === "ignored") openIgnored(id);
     else if (m === "remove") removePair(p);
   });
 
@@ -615,14 +659,30 @@
 
   // ----- review dialog ----------------------------------------------------
 
-  function reviewKind(p) {
+  function reviewKind(p, wanted) {
     const busy = p.phase === "syncing" || p.phase === "checking" || p.phase === "queued";
     if (p.approval && !busy) return (p.approval.everything ? "empty-" : "deletes-") + p.approval.side;
     if (busy && p.approval) return "working";
     if (p.phase === "error") return "error";
-    if (p.skipped.length) return "skipped";
+    if (p.phase === "waiting" && wanted !== "files") return "waiting";
+    if ((p.files || []).length && (wanted === "files" || flaggedFiles(p).length)) return "skipped";
     if (p.conflicts.length) return "conflicts";
     return busy ? "working" : "fine";
+  }
+
+  function fileItem(f) {
+    let retry;
+    if (f.kind === "permanent") retry = "SyncHopper won't try this one again by itself.";
+    else if (f.next_retry) {
+      const secs = f.next_retry - Math.floor(Date.now() / 1000);
+      retry = secs <= 60 ? "It will be tried again at the next sync." : "It will be tried again in about " + plural(Math.max(1, Math.round(secs / 60)), "minute") + ".";
+    } else retry = "It will be tried again at the next sync.";
+    return (
+      "<li><b>" + esc(f.path) + '</b><br><span class="small muted">' + esc(f.reason) + " " + esc(retry) + "</span>" +
+      (f.detail ? '<details><summary class="small">Technical details</summary><pre>' + esc(f.detail) + "</pre></details>" : "") +
+      (f.can_ignore ? '<div style="margin-top:6px"><button type="button" class="btn small-btn" data-ignore="' + esc(f.path) + '">Ignore this file</button></div>' : "") +
+      "</li>"
+    );
   }
 
   function reviewBody(p, kind) {
@@ -640,6 +700,10 @@
     } else if (kind === "empty-koofr") {
       out.push("<p>Everything in this folder is gone from Koofr, or the folder was renamed or deleted there. This PC still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
       out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to Koofr. If you really want the folder empty, delete the files on this PC yourself and syncing will carry on.</p>");
+    } else if (kind === "waiting") {
+      out.push("<p><b>" + esc(p.waiting || "Koofr is having problems right now.") + "</b></p>");
+      out.push("<p>Nothing is wrong with your files. SyncHopper tries again by itself and catches up once Koofr is back. " + esc(retryText(p.retry_at)) + "</p>");
+      if (p.details.length) out.push("<details><summary>Technical details</summary><pre>" + esc(p.details.join("\n")) + "</pre></details>");
     } else if (kind === "working") {
       out.push("<p>This folder is syncing right now.</p>");
     } else if (kind === "fine") {
@@ -650,9 +714,11 @@
       out.push("<p>SyncHopper tries again by itself. Nothing was deleted.</p>");
       if (p.details.length) out.push("<details><summary>Technical details</summary><pre>" + esc(p.details.join("\n")) + "</pre></details>");
     }
-    if ((kind === "error" || kind === "skipped" || kind === "conflicts") && p.skipped.length) {
-      out.push("<p>" + (p.skipped.length === 1 ? "This file is" : "These files are") + " being left out so the rest of the folder can sync:</p>");
-      out.push('<ul class="plain">' + p.skipped.map((k) => "<li><b>" + esc(k.path) + "</b><br><span class=\"small muted\">" + esc(k.reason) + (k.sticky ? " SyncHopper will not retry this one by itself." : " It is checked again at every sync.") + "</span></li>").join("") + "</ul>");
+    if ((kind === "error" || kind === "skipped" || kind === "conflicts") && (p.files || []).length) {
+      const files = p.files;
+      out.push("<p>" + (files.length === 1 ? "This file is" : "These files are") + " being left out so the rest of the folder can sync:</p>");
+      out.push('<ul class="plain">' + files.map(fileItem).join("") + "</ul>");
+      if (!files.some((f) => f.can_ignore)) out.push('<p class="small muted">If a file keeps failing for a day, you can choose to ignore it.</p>');
     }
     if ((kind === "error" || kind === "skipped" || kind === "conflicts") && p.conflicts.length) {
       const newest = S.settings.conflict_policy === "newest";
@@ -695,10 +761,12 @@
       ];
     }
     if (kind === "working" || kind === "fine") return [{ label: "Close", kind: "primary" }];
+    if (kind === "waiting") return [{ label: "Try now", action: act("sync") }, { label: "Close", kind: "primary" }];
     const buttons = [{ label: "Open folder", left: true, close: false, action: () => run("open_target", { kind: "pair_folder", value: id }).then(() => false) }];
     if (p.conflicts.length) buttons.push({ label: "Clear this list", action: act("dismiss_conflicts") });
-    if (kind === "error" && !p.skipped.length) buttons.push({ label: "Try again now", action: act("sync") });
-    if (p.skipped.length) buttons.push({ label: "Try " + (p.skipped.length === 1 ? "it" : "them") + " again", action: act("retry_skipped") });
+    const nfiles = (p.files || []).length;
+    if (kind === "error" && !nfiles) buttons.push({ label: "Try again now", action: act("sync") });
+    if (nfiles) buttons.push({ label: "Try " + (nfiles === 1 ? "it" : "them") + " again now", action: act("retry_skipped") });
     buttons.push({ label: "Close", kind: "primary" });
     return buttons;
   }
@@ -707,12 +775,13 @@
     if (kind.startsWith("deletes-")) return "Check before deleting from " + p.name;
     if (kind.startsWith("empty-")) return p.name + " was emptied";
     if (kind === "error") return p.name + " could not sync";
+    if (kind === "waiting") return p.name + " is waiting for Koofr";
     if (kind === "skipped") return "Files left out of " + p.name;
     if (kind === "conflicts") return "Changed in both places";
     return p.name;
   }
 
-  function openReview(id) {
+  function openReview(id, wanted) {
     const p = S.pairs.find((x) => x.id === id);
     if (!p) return;
     if (review) {
@@ -720,8 +789,8 @@
       review = null;
       old.modal.close();
     }
-    const kind = reviewKind(p);
-    const entry = { id: id, kind: kind, modal: null };
+    const kind = reviewKind(p, wanted);
+    const entry = { id: id, kind: kind, wanted: wanted, modal: null };
     entry.modal = openModal({
       width: 640,
       title: reviewTitle(p, kind),
@@ -732,22 +801,67 @@
       },
     });
     review = entry;
+    entry.modal.el.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-ignore]");
+      if (!b) return;
+      const path = b.dataset.ignore;
+      const ok = await confirmDialog(
+        "Ignore " + lastPart(path) + "?",
+        "SyncHopper stops trying to sync this file and stops warning you about it. The file stays where it is. You can sync it again from the folder's menu under Ignored files.",
+        "Ignore this file"
+      );
+      if (ok) run("ignore_file", { id: id, path: path });
+    });
   }
+
+  function openIgnored(id) {
+    const render = () => {
+      const p = S.pairs.find((x) => x.id === id);
+      const list = p ? p.ignored || [] : [];
+      if (!list.length) return '<p class="muted">No files are being ignored in this folder.</p>';
+      return (
+        '<p class="small muted">These files are not synced. Choose Sync it again to have SyncHopper pick a file back up.</p>' +
+        '<ul class="plain">' +
+        list.map((path) => '<li class="row" style="justify-content:space-between;gap:12px"><b class="selectable">' + esc(path) + '</b><button type="button" class="btn small-btn" data-unignore="' + esc(path) + '">Sync it again</button></li>').join("") +
+        "</ul>"
+      );
+    };
+    const p = S.pairs.find((x) => x.id === id);
+    const modal = openModal({ title: "Ignored files in " + (p ? p.name : "this folder"), body: render(), buttons: [{ label: "Close", kind: "primary" }], onClose: () => { ignoredModal = null; } });
+    ignoredModal = { modal: modal, render: render };
+    modal.el.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-unignore]");
+      if (b) run("unignore_file", { id: id, path: b.dataset.unignore });
+    });
+  }
+  let ignoredModal = null;
 
   // Keeps an open review dialog in step with what is going on.
   function updateReview() {
-    if (!review || !S) return;
+    if (!S) return;
+    if (ignoredModal) ignoredModal.modal.setBody(ignoredModal.render());
+    if (!review) return;
     const p = S.pairs.find((x) => x.id === review.id);
     if (!p) {
       review.modal.close();
       return;
     }
-    const kind = reviewKind(p);
+    const kind = reviewKind(p, review.wanted);
     if (kind !== review.kind) {
-      openReview(p.id);
+      openReview(p.id, review.wanted);
     } else {
       review.modal.setBody(reviewBody(p, kind));
     }
+  }
+
+  async function installUpdate() {
+    const up = S.update || {};
+    const ok = await confirmDialog(
+      "Install SyncHopper " + up.version + "?",
+      "SyncHopper stops what it's doing, installs the update, and opens again by itself. Your settings and folders stay as they are. Any sync that gets interrupted picks up where it left off.",
+      "Install and restart"
+    );
+    if (ok) run("install_app_update");
   }
 
   // ----- add a folder ------------------------------------------------------
@@ -991,6 +1105,18 @@
         if (pair[1] > 0) input.value = String(pair[1]);
       }
     });
+    $("#st-sidebar").disabled = !S.windows && !s.feature_sidebar;
+    if (!S.windows) setText($("#st-sidebar-note"), "Only available on Windows.");
+    const up = S.update || {};
+    let appNote = "You have SyncHopper " + S.version + ".";
+    if (!up.enabled) appNote += " This copy was built on this PC, so it can't update itself. Install the release version to get updates.";
+    else if (up.status === "checking") appNote += " Checking for updates.";
+    else if (up.status === "current") appNote += " It's the newest version.";
+    else if (up.status === "available") appNote += " Version " + up.version + " is available. Install it from the main window.";
+    else if (up.status === "error") appNote += " " + (up.message || "");
+    setText($("#ad-app-note"), appNote);
+    $("#ad-app-update").disabled = !up.enabled;
+    $("#ad-check").disabled = !up.enabled || up.status === "checking" || up.status === "downloading" || up.status === "installing";
     const e = S.engine;
     setText(
       $("#ad-engine-note"),
@@ -1071,6 +1197,18 @@
   $("#st-rerun").addEventListener("click", () => startWizard(true));
 
   $("#ad-log").addEventListener("click", () => run("open_target", { kind: "log" }));
+
+  $("#ad-check").addEventListener("click", async () => {
+    const before = S.update ? S.update.status : "";
+    await run("check_updates");
+    const fresh = await invoke("get_state").catch(() => null);
+    if (fresh) S = fresh;
+    syncControls(true);
+    const up = S.update || {};
+    if (up.status === "current" && before !== "current") toast("You have the newest version of SyncHopper.");
+    else if (up.status === "current") toast("Still the newest version.");
+    else if (up.status === "available") toast("SyncHopper " + up.version + " is available. Install it from the main window.");
+  });
 
   $("#ad-diag").addEventListener("click", async () => {
     const text = await run("diagnostics");

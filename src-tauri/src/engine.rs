@@ -2,11 +2,11 @@
 //! rclone's two-way sync, with a timer, a file watcher, and recovery from
 //! the ways a sync can fail.
 
-use crate::config::{Pair, Settings, Skipped};
+use crate::config::{same_state, FileState, Pair, Settings, Skipped};
 use crate::core::{Core, Notice};
 use crate::platform;
-use crate::rclone::{friendly_error, LogLine, RunResult, Stats};
-use crate::util::{clean_remote, file_name, glob_match, new_id, norm_local, now_secs, paths_overlap, Cancel};
+use crate::rclone::{friendly_error, LogLine, Rclone, RunResult, Stats};
+use crate::util::{clean_remote, file_name, glob_match, go_unquote, new_id, norm_local, now_secs, parse_time_ns, paths_overlap, Cancel};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -22,6 +22,12 @@ const QUIET: Duration = Duration::from_secs(4);
 const BREATHER: Duration = Duration::from_secs(15);
 /// How often the battery and metered-connection checks run.
 const POWER_CHECK: Duration = Duration::from_secs(120);
+/// How long a failing file is retried quietly before it is shown as
+/// needing attention.
+pub const FLAG_AFTER: u64 = 3 * 3600;
+/// How long a file must keep failing before "Ignore this file" is offered,
+/// unless it is a file that can never sync as it is.
+pub const IGNORE_AFTER: u64 = 24 * 3600;
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +40,8 @@ pub enum Phase {
     Ok,
     Error,
     Approval,
+    /// Koofr is down or out of reach. The folder tries again by itself.
+    Waiting,
 }
 
 /// A sync that stopped because it would delete a large share of a folder.
@@ -82,8 +90,9 @@ struct PairRt {
     last_event: Option<Instant>,
     next_due: Option<Instant>,
     fails: u32,
-    fail_counts: HashMap<String, u32>,
-    retry_skipped: bool,
+    retry_all: bool,
+    waiting: Option<String>,
+    retry_at: Option<u64>,
     summary: String,
     runs: u64,
     last_finished: Option<Instant>,
@@ -97,6 +106,21 @@ struct Inner {
     paused_all: bool,
     auto_pause: Option<String>,
     auto_checked: Option<Instant>,
+    outage_notified: bool,
+}
+
+/// A file that is being left out of syncing, as the screens see it.
+#[derive(Clone, Serialize)]
+pub struct FileView {
+    pub path: String,
+    pub reason: String,
+    pub detail: String,
+    pub kind: String,
+    /// Shown as needing attention rather than being retried quietly.
+    pub flagged: bool,
+    /// "Ignore this file" may be offered.
+    pub can_ignore: bool,
+    pub next_retry: u64,
 }
 
 #[derive(Serialize)]
@@ -112,7 +136,10 @@ pub struct PairView {
     pub error: Option<String>,
     pub details: Vec<String>,
     pub approval: Option<Approval>,
-    pub skipped: Vec<Skipped>,
+    pub files: Vec<FileView>,
+    pub ignored: Vec<String>,
+    pub waiting: Option<String>,
+    pub retry_at: Option<u64>,
     pub conflicts: Vec<String>,
     pub summary: String,
 }
@@ -133,7 +160,16 @@ pub enum Verdict {
     LockFound,
     NeedsResync,
     RemoteMissing,
-    Failed { must_resync: bool, files: Vec<(String, String)>, message: String, details: Vec<String> },
+    Failed { must_resync: bool, files: Vec<FailedFile>, message: String, details: Vec<String> },
+}
+
+/// One file that failed during a sync run.
+#[derive(Debug, PartialEq, Clone)]
+pub struct FailedFile {
+    pub path: String,
+    pub msg: String,
+    /// rclone's object type, which tells which side the file was read from.
+    pub object_type: String,
 }
 
 fn parse_deletes(msg: &str) -> Option<Approval> {
@@ -183,11 +219,11 @@ pub fn classify(res: &RunResult) -> Verdict {
         return Verdict::SideEmpty("koofr".into());
     }
 
-    let mut files: Vec<(String, String)> = Vec::new();
+    let mut files: Vec<FailedFile> = Vec::new();
     for l in &res.errors {
         let file_like = l.object_type.ends_with("Object") || l.msg.starts_with("Failed to copy");
-        if !l.object.is_empty() && file_like && !files.iter().any(|(o, _)| o == &l.object) {
-            files.push((l.object.clone(), l.msg.clone()));
+        if !l.object.is_empty() && file_like && !files.iter().any(|f| f.path == l.object) {
+            files.push(FailedFile { path: l.object.clone(), msg: l.msg.clone(), object_type: l.object_type.clone() });
         }
     }
     let must_resync = find("must run --resync to recover").is_some();
@@ -222,35 +258,143 @@ pub fn classify(res: &RunResult) -> Verdict {
     };
     let message = files
         .first()
-        .map(|(_, m)| m.clone())
+        .map(|f| f.msg.clone())
         .or_else(|| details.first().map(|m| m.trim_start_matches("Bisync critical error: ").to_string()))
         .unwrap_or_else(|| format!("The sync engine stopped unexpectedly (code {}).", res.exit));
     Verdict::Failed { must_resync, files, message, details }
 }
 
-/// How a per-file failure is treated.
-#[derive(PartialEq, Debug)]
-enum FileIssue {
-    /// The file is busy on this PC right now. Checked again every sync.
-    Busy,
-    /// The file can never sync as it is. Left out until the user asks.
-    Stuck,
-    /// Could be anything. Left out only if it keeps failing.
-    Unknown,
-}
-
-fn file_issue(msg: &str) -> FileIssue {
+/// What kind of failure a message describes. Per-file kinds are "server",
+/// "network", "busy", "denied", "permanent" and "unknown". "auth", "quota"
+/// and "disk" are problems for the whole folder, not for one file.
+pub fn issue_kind(msg: &str) -> &'static str {
     let l = msg.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
-    if has(&[
-        "being used by another process", "sharing violation", "failed to open source object",
-        "access is denied", "permission denied", "source file is being updated", "size changed",
+    // An HTTP status code standing on its own, not part of a longer number.
+    let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
+    if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
+        "auth"
+    } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
+        "quota"
+    } else if has(&["not enough space", "no space left", "disk full", "there is not enough space"]) {
+        "disk"
+    } else if has(&["invalid response status! got 5", "internal server error", "bad gateway", "service unavailable", "gateway timeout"])
+        || code("500")
+        || code("502")
+        || code("503")
+        || code("504")
+    {
+        "server"
+    } else if has(&[
+        "no such host", "dial tcp", "connection refused", "i/o timeout", "network is unreachable",
+        "tls handshake", "connection reset", "unexpected eof", "context deadline exceeded", "broken pipe",
+        "took too long", "could not reach koofr",
     ]) {
-        FileIssue::Busy
-    } else if has(&["too long", "syntax is incorrect", "cannot find the path specified", "invalid argument"]) {
-        FileIssue::Stuck
+        "network"
+    } else if has(&["being used by another process", "sharing violation", "source file is being updated", "size changed"]) {
+        "busy"
+    } else if has(&["access is denied", "permission denied"]) {
+        "denied"
+    } else if has(&["too long", "syntax is incorrect", "invalid argument", "illegal characters", "name is not allowed"]) {
+        "permanent"
     } else {
-        FileIssue::Unknown
+        "unknown"
+    }
+}
+
+fn outage_kind(kind: &str) -> bool {
+    kind == "server" || kind == "network"
+}
+
+/// Seconds to wait before trying a left-out file again.
+fn retry_delay(kind: &str, tries: u32) -> u64 {
+    match kind {
+        "permanent" => u64::MAX / 4,
+        // Cheap to check: the file is looked at locally before anything is sent.
+        "busy" | "denied" => 120,
+        _ => match tries {
+            0 | 1 => 5 * 60,
+            2 => 15 * 60,
+            3 => 30 * 60,
+            _ => 60 * 60,
+        },
+    }
+}
+
+/// Plain-language reason for a file that could not sync.
+pub fn file_reason(kind: &str, object_type: &str, raw: &str) -> String {
+    let from_koofr = object_type.to_lowercase().contains("koofr");
+    match kind {
+        "server" if from_koofr => "Koofr couldn't send this file. This is usually a temporary problem on Koofr's side.".into(),
+        "server" => "Koofr had a problem with this file. This is usually a temporary problem on Koofr's side.".into(),
+        "network" => "The connection to Koofr dropped while this file was syncing.".into(),
+        "busy" => {
+            if raw.to_lowercase().contains("being updated") || raw.to_lowercase().contains("size changed") {
+                "This file was still being written while it synced.".into()
+            } else {
+                "This file is open in another program.".into()
+            }
+        }
+        "denied" => "Windows wouldn't let SyncHopper read or write this file.".into(),
+        "permanent" => {
+            if raw.to_lowercase().contains("too long") {
+                "This file's name or path is too long for Windows.".into()
+            } else {
+                "This file's name can't be used on Windows or in Koofr.".into()
+            }
+        }
+        _ => friendly_error(raw),
+    }
+}
+
+/// Reads one side's sync record into path and file state.
+fn read_listing(work: &Path, suffix: &str) -> HashMap<String, FileState> {
+    let mut map = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(work) else { return map };
+    for e in entries.flatten() {
+        if !e.file_name().to_string_lossy().ends_with(suffix) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            // Example: -        5 - - 2026-11-13T15:10:34.650367249+0000 "sub dir/f1.txt"
+            let Some(q) = line.find('"') else { continue };
+            let quoted = line[q..].trim_end();
+            if quoted.len() < 2 || !quoted.ends_with('"') {
+                continue;
+            }
+            let path = go_unquote(&quoted[1..quoted.len() - 1]);
+            let fields: Vec<&str> = line[..q].split_whitespace().collect();
+            if fields.len() < 3 {
+                continue;
+            }
+            let size = fields[1].parse::<u64>().ok();
+            let mtime = fields.last().and_then(|t| parse_time_ns(t));
+            if let (Some(size), Some(mtime_ns)) = (size, mtime) {
+                map.insert(path, FileState { size, mtime_ns });
+            }
+        }
+    }
+    map
+}
+
+fn local_state(path: &Path) -> Result<Option<FileState>, String> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {
+            let mtime_ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            Ok(Some(FileState { size: m.len(), mtime_ns }))
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -265,15 +409,19 @@ fn escape_glob(path: &str) -> String {
     out
 }
 
-/// The rclone filter file for a folder: the ignore list plus any files that
-/// are being left out because they could not sync.
+/// The rclone filter file for a folder: the ignore list, then the files
+/// that are being left out (because they could not sync, or because the user
+/// chose to ignore them).
 pub fn filters_text(s: &Settings, pair: &Pair) -> String {
     let mut out = String::from("# Written by SyncHopper. Change the ignore list in Advanced settings.\n");
     for p in &s.ignore_patterns {
         out.push_str(&format!("- {p}\n"));
     }
-    for k in &pair.skipped {
-        out.push_str(&format!("- /{}\n", escape_glob(&k.path)));
+    let mut paths: Vec<&str> = pair.skipped.iter().chain(pair.ignored.iter()).map(|k| k.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    for path in paths {
+        out.push_str(&format!("- /{}\n", escape_glob(path)));
     }
     out
 }
@@ -360,6 +508,22 @@ fn clear_locks(work: &Path) {
     }
 }
 
+/// How a left-out file is shown, worked out from how long it has failed.
+pub fn file_view(k: &Skipped) -> FileView {
+    let now = now_secs();
+    let age = now.saturating_sub(k.first_failed);
+    let permanent = k.kind == "permanent";
+    FileView {
+        path: k.path.clone(),
+        reason: k.reason.clone(),
+        detail: k.detail.clone(),
+        kind: k.kind.clone(),
+        flagged: permanent || age >= FLAG_AFTER,
+        can_ignore: permanent || age >= IGNORE_AFTER,
+        next_retry: k.next_retry,
+    }
+}
+
 pub struct Engine {
     core: Arc<Core>,
     inner: Mutex<Inner>,
@@ -402,7 +566,10 @@ impl Engine {
                     error: rt.and_then(|r| r.error.clone()),
                     details: rt.map(|r| r.details.clone()).unwrap_or_default(),
                     approval: rt.and_then(|r| r.approval.clone()),
-                    skipped: p.skipped.clone(),
+                    files: p.skipped.iter().map(file_view).collect(),
+                    ignored: p.ignored.iter().map(|k| k.path.clone()).collect(),
+                    waiting: rt.and_then(|r| r.waiting.clone()),
+                    retry_at: rt.and_then(|r| r.retry_at),
                     conflicts: rt.map(|r| r.conflicts.clone()).unwrap_or_default(),
                     summary: rt.map(|r| r.summary.clone()).unwrap_or_default(),
                 }
@@ -422,8 +589,14 @@ impl Engine {
     }
 
     pub fn has_problems(&self) -> bool {
+        let flagged = self.core.settings().pairs.iter().any(|p| p.skipped.iter().any(|k| file_view(k).flagged));
         let inner = self.inner.lock().unwrap();
-        inner.rt.values().any(|r| matches!(r.phase, Phase::Error | Phase::Approval))
+        flagged || inner.rt.values().any(|r| matches!(r.phase, Phase::Error | Phase::Approval))
+    }
+
+    /// True while any folder is waiting for Koofr to come back.
+    pub fn waiting_for_koofr(&self) -> bool {
+        self.inner.lock().unwrap().rt.values().any(|r| r.phase == Phase::Waiting)
     }
 
     /// How many sync runs a folder has had since the app started.
@@ -565,14 +738,65 @@ impl Engine {
             rt.error = None;
             rt.details.clear();
             rt.fails = 0;
-            rt.retry_skipped = true;
+            rt.retry_all = true;
         });
         self.enqueue(Job { pair_id: id.to_string(), resync: true, manual: true, create_remote: true, ..Default::default() });
     }
 
+    /// Tries every left-out file again now, including ones that would not
+    /// otherwise be retried.
     pub fn retry_skipped(&self, id: &str) {
-        self.with_rt(id, |rt| rt.retry_skipped = true);
+        self.with_rt(id, |rt| rt.retry_all = true);
         self.enqueue(Job { pair_id: id.to_string(), manual: true, ..Default::default() });
+    }
+
+    /// Stops syncing one left-out file until the user says otherwise.
+    pub fn ignore_file(&self, id: &str, path: &str) -> Result<(), String> {
+        let mut found = false;
+        self.core.update_pair(id, |p| {
+            if let Some(i) = p.skipped.iter().position(|k| k.path == path) {
+                let k = p.skipped.remove(i);
+                if !p.ignored.iter().any(|x| x.path == k.path) {
+                    p.ignored.push(k);
+                }
+                found = true;
+            }
+        });
+        if found {
+            self.core.log(&format!("Ignoring {path} at the user's request"));
+            Ok(())
+        } else {
+            Err("That file is no longer in the list.".into())
+        }
+    }
+
+    /// Starts syncing an ignored file again. It is handled like a left-out
+    /// file that is due for a retry, so changes made meanwhile are carried
+    /// across correctly.
+    pub fn unignore_file(&self, id: &str, path: &str) -> Result<(), String> {
+        let mut found = false;
+        self.core.update_pair(id, |p| {
+            if let Some(i) = p.ignored.iter().position(|k| k.path == path) {
+                let mut k = p.ignored.remove(i);
+                k.next_retry = 0;
+                k.tries = 0;
+                k.first_failed = now_secs();
+                k.notified = false;
+                if k.kind == "permanent" {
+                    k.kind = "unknown".into();
+                }
+                if !p.skipped.iter().any(|x| x.path == k.path) {
+                    p.skipped.push(k);
+                }
+                found = true;
+            }
+        });
+        if !found {
+            return Err("That file is no longer ignored.".into());
+        }
+        self.core.log(&format!("No longer ignoring {path}"));
+        self.enqueue(Job { pair_id: id.to_string(), manual: true, ..Default::default() });
+        Ok(())
     }
 
     pub fn dismiss_conflicts(&self, id: &str) {
@@ -846,6 +1070,13 @@ impl Engine {
             rt.last_finished = Some(Instant::now());
             f(rt);
             let wait = match rt.phase {
+                Phase::Waiting => match rt.fails {
+                    0 | 1 => 120,
+                    2 => 300,
+                    3 => 600,
+                    _ => 900,
+                }
+                .min(interval_min as u64 * 60),
                 Phase::Error => match rt.fails {
                     0 | 1 => 60,
                     2 => 120,
@@ -856,8 +1087,43 @@ impl Engine {
                 _ => interval_min as u64 * 60,
             };
             rt.next_due = Some(Instant::now() + Duration::from_secs(wait.max(5)));
+            rt.retry_at = (rt.phase == Phase::Waiting).then(|| now_secs() + wait.max(5));
+            if rt.phase != Phase::Waiting {
+                rt.waiting = None;
+            }
         }
         self.core.host.state_changed();
+    }
+
+    /// Koofr is down or out of reach. Nothing is blamed on any file; the
+    /// folder simply tries again later.
+    fn wait_outage(&self, pair: &Pair, interval_min: u32, kind: &str, raw: String, details: Vec<String>) {
+        let msg = if kind == "network" {
+            "Can't connect to Koofr right now."
+        } else {
+            "Koofr is having problems right now."
+        };
+        self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+        let mut fails = 0;
+        self.finish(&pair.id, interval_min, |rt| {
+            rt.phase = Phase::Waiting;
+            rt.fails += 1;
+            fails = rt.fails;
+            rt.waiting = Some(msg.to_string());
+            rt.error = None;
+            rt.details = details;
+        });
+        let first_notice = {
+            let mut inner = self.inner.lock().unwrap();
+            let due = fails >= 3 && !inner.outage_notified;
+            if due {
+                inner.outage_notified = true;
+            }
+            due
+        };
+        if first_notice {
+            self.core.notify(Notice::Problem, msg, "SyncHopper will keep trying and catch up once Koofr is back.");
+        }
     }
 
     fn fail(&self, pair: &Pair, interval_min: u32, message: String, details: Vec<String>) {
@@ -867,9 +1133,7 @@ impl Engine {
         self.finish(&pair.id, interval_min, |rt| {
             rt.phase = Phase::Error;
             rt.fails += 1;
-            // A network hiccup (for example right after signing in to
-            // Windows) only earns a notification if it lasts.
-            first = if friendly.starts_with("Could not reach Koofr") { rt.fails == 3 } else { rt.fails == 1 };
+            first = rt.fails == 1;
             rt.error = Some(friendly.clone());
             rt.details = details;
         });
@@ -901,40 +1165,52 @@ impl Engine {
         }
     }
 
-    /// Adds files that failed to the folder's skip list when the rules say
-    /// so. Returns true when the list grew.
-    fn update_skips(&self, pair: &Pair, files: &[(String, String)], rebuild: bool) -> bool {
+    /// Leaves the files that failed out of syncing, so the rest of the folder
+    /// can finish, and remembers how both sides last agreed on each file.
+    /// Returns true when the list grew.
+    fn update_skips(&self, pair: &Pair, files: &[FailedFile], work: &Path, rebuild: bool, recent: &[Skipped]) -> bool {
+        let now = now_secs();
+        let base_pc = read_listing(work, ".path1.lst");
+        let base_koofr = read_listing(work, ".path2.lst");
         let mut add: Vec<Skipped> = Vec::new();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            let rt = inner.rt.entry(pair.id.clone()).or_default();
-            for (object, msg) in files {
-                let path = object.replace('\\', "/");
-                if pair.skipped.iter().any(|k| k.path == path) {
-                    continue;
-                }
-                let count = rt.fail_counts.entry(path.clone()).or_insert(0);
-                *count += 1;
-                let issue = file_issue(msg);
-                let skip = match issue {
-                    FileIssue::Busy | FileIssue::Stuck => true,
-                    FileIssue::Unknown => *count >= 3,
-                };
-                if skip {
-                    add.push(Skipped {
-                        path,
-                        reason: friendly_error(msg),
-                        sticky: issue == FileIssue::Stuck || *count >= 3,
-                        tries: *count,
-                    });
-                }
+        for f in files {
+            let path = f.path.replace('\\', "/");
+            if pair.skipped.iter().chain(pair.ignored.iter()).any(|k| k.path == path) || add.iter().any(|k| k.path == path) {
+                continue;
             }
+            let kind = issue_kind(&f.msg);
+            // A file that was just put back for a retry and failed again keeps
+            // its history, so long-running trouble is still noticed.
+            if let Some(prev) = recent.iter().find(|k| k.path == path) {
+                let tries = prev.tries.saturating_add(1);
+                add.push(Skipped {
+                    reason: file_reason(kind, &f.object_type, &f.msg),
+                    detail: f.msg.clone(),
+                    kind: kind.to_string(),
+                    next_retry: now.saturating_add(retry_delay(kind, tries)),
+                    tries,
+                    ..prev.clone()
+                });
+                continue;
+            }
+            add.push(Skipped {
+                reason: file_reason(kind, &f.object_type, &f.msg),
+                detail: f.msg.clone(),
+                kind: kind.to_string(),
+                first_failed: now,
+                next_retry: now.saturating_add(retry_delay(kind, 1)),
+                tries: 1,
+                base_pc: base_pc.get(&path).copied(),
+                base_koofr: base_koofr.get(&path).copied(),
+                notified: false,
+                path,
+            });
         }
         if add.is_empty() {
             return false;
         }
         for k in &add {
-            self.core.log(&format!("[{}] Leaving out {} for now: {}", pair.local, k.path, k.reason));
+            self.core.log(&format!("[{}] Leaving out {} for now ({}): {}", pair.local, k.path, k.kind, k.detail));
         }
         self.core.update_pair(&pair.id, |p| {
             p.skipped.extend(add);
@@ -945,41 +1221,188 @@ impl Engine {
         true
     }
 
-    /// Puts skipped files back into syncing when they look ready. Returns
-    /// how many were put back.
-    fn unskip_ready(&self, pair: &Pair) -> usize {
-        if pair.skipped.is_empty() {
-            self.with_rt(&pair.id, |rt| rt.retry_skipped = false);
-            return 0;
+    /// The full Koofr path of a file inside a synced folder. Unlike
+    /// `Core::remote`, the file name is kept exactly as it is.
+    fn remote_file(&self, pair: &Pair, rel: &str) -> String {
+        let base = self.core.remote(&pair.remote);
+        if base.ends_with(':') || base.ends_with('/') {
+            format!("{base}{rel}")
+        } else {
+            format!("{base}/{rel}")
         }
-        let all = self.with_rt(&pair.id, |rt| std::mem::take(&mut rt.retry_skipped));
-        let keep: Vec<Skipped> = pair
-            .skipped
-            .iter()
-            .filter(|k| {
-                if all {
-                    return false;
+    }
+
+    fn local_file(pair: &Pair, rel: &str) -> PathBuf {
+        Path::new(&pair.local).join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
+    }
+
+    fn engine_flags(s: &Settings) -> Vec<String> {
+        let mut a: Vec<String> = vec!["--retries".into(), "2".into(), "--use-json-log".into(), "--log-level".into(), "INFO".into(), "--color".into(), "NEVER".into()];
+        if !s.use_http2 {
+            a.push("--disable-http2".into());
+        }
+        if let Some(limit) = s.bwlimit() {
+            a.push("--bwlimit".into());
+            a.push(limit);
+        }
+        a
+    }
+
+    async fn remote_state(&self, rc: &Rclone, s: &Settings, pair: &Pair, rel: &str) -> Result<Option<FileState>, String> {
+        let target = self.remote_file(pair, rel);
+        let mut args: Vec<&str> = vec!["lsjson", "--stat", "--no-mimetype", &target];
+        if !s.use_http2 {
+            args.push("--disable-http2");
+        }
+        match rc.capture(&args, Duration::from_secs(120)).await {
+            Ok(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+                if v.get("IsDir").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    return Ok(None);
                 }
-                if k.sticky {
-                    return true;
-                }
-                let p = Path::new(&pair.local).join(k.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                // Still there and still unreadable: keep leaving it out.
-                p.exists() && std::fs::File::open(&p).is_err()
-            })
-            .cloned()
-            .collect();
-        let removed = pair.skipped.len() - keep.len();
-        if removed > 0 {
-            if all {
-                self.with_rt(&pair.id, |rt| rt.fail_counts.clear());
+                let size = v.get("Size").and_then(|x| x.as_u64()).unwrap_or(0);
+                let mtime_ns = v.get("ModTime").and_then(|x| x.as_str()).and_then(parse_time_ns).unwrap_or(0);
+                Ok(Some(FileState { size, mtime_ns }))
             }
-            self.core.update_pair(&pair.id, |p| {
-                p.skipped = keep;
-                p.needs_resync = true;
-            });
+            Err(e) if e.to_lowercase().contains("not found") => Ok(None),
+            Err(e) => Err(e),
         }
-        removed
+    }
+
+    async fn run_quiet(rc: &Rclone, args: Vec<String>, cancel: &Cancel) -> Result<(), String> {
+        let res = rc.run_logged(&args, cancel, |_| {}).await;
+        if res.cancelled {
+            return Err("cancelled".into());
+        }
+        if res.exit == 0 {
+            return Ok(());
+        }
+        Err(res
+            .spawn_error
+            .clone()
+            .or_else(|| res.errors.iter().rev().find(|l| !l.msg.starts_with("Attempt ")).map(|l| l.msg.clone()))
+            .or_else(|| res.errors.last().map(|l| l.msg.clone()))
+            .unwrap_or_else(|| format!("The sync engine stopped (code {}).", res.exit)))
+    }
+
+    /// Finishes the job for one left-out file, the way a normal sync would
+    /// have: whichever side changed since both last agreed wins, and a delete
+    /// on one side is passed on if the other side was left alone. Files that
+    /// were never synced, or that changed on both sides, are left for the
+    /// next sync to handle with the usual rules.
+    async fn resolve(&self, rc: &Rclone, s: &Settings, pair: &Pair, k: &Skipped, cancel: &Cancel) -> Result<(), String> {
+        if k.base_pc.is_none() && k.base_koofr.is_none() {
+            return Ok(());
+        }
+        let local = Self::local_file(pair, &k.path);
+        let pc = local_state(&local)?;
+        let koofr = self.remote_state(rc, s, pair, &k.path).await?;
+        let pc_changed = !same_state(&pc, &k.base_pc);
+        let koofr_changed = !same_state(&koofr, &k.base_koofr);
+        let flags = Self::engine_flags(s);
+        let remote = self.remote_file(pair, &k.path);
+        let local_text = local.to_string_lossy().to_string();
+        match (pc_changed, koofr_changed) {
+            (true, false) if pc.is_some() => {
+                self.core.log(&format!("[{}] Retry: sending {} to Koofr", pair.local, k.path));
+                let mut args = vec!["copyto".to_string(), local_text, remote];
+                args.extend(flags);
+                Self::run_quiet(rc, args, cancel).await
+            }
+            (true, false) => {
+                if koofr.is_some() {
+                    self.core.log(&format!("[{}] Retry: {} was deleted on this PC, deleting it in Koofr", pair.local, k.path));
+                    let mut args = vec!["deletefile".to_string(), remote];
+                    args.extend(flags);
+                    Self::run_quiet(rc, args, cancel).await?;
+                }
+                Ok(())
+            }
+            (false, true) if koofr.is_some() => {
+                self.core.log(&format!("[{}] Retry: getting {} from Koofr", pair.local, k.path));
+                let mut args = vec!["copyto".to_string(), remote, local_text];
+                args.extend(flags);
+                Self::run_quiet(rc, args, cancel).await
+            }
+            (false, true) => {
+                if pc.is_some() {
+                    self.core.log(&format!("[{}] Retry: {} was deleted in Koofr, deleting it on this PC", pair.local, k.path));
+                    std::fs::remove_file(&local).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Tries the left-out files whose turn has come. Returns whether any were
+    /// put back into syncing, and the kind of problem if Koofr turned out to
+    /// be unavailable.
+    async fn retry_due(&self, rc: &Rclone, s: &Settings, pair: &Pair, cancel: &Cancel) -> (Vec<Skipped>, Option<(String, String)>) {
+        if pair.skipped.is_empty() {
+            self.with_rt(&pair.id, |rt| rt.retry_all = false);
+            return (Vec::new(), None);
+        }
+        let all = self.with_rt(&pair.id, |rt| std::mem::take(&mut rt.retry_all));
+        let now = now_secs();
+        let mut cleared: Vec<String> = Vec::new();
+        let mut updated: Vec<Skipped> = Vec::new();
+        let mut outage: Option<(String, String)> = None;
+        for k in &pair.skipped {
+            if outage.is_some() || cancel.is_cancelled() {
+                break;
+            }
+            if !all && (k.kind == "permanent" || now < k.next_retry) {
+                continue;
+            }
+            // A file that is still locked on this PC can't sync yet, so there
+            // is no point sending anything.
+            let local = Self::local_file(pair, &k.path);
+            let still_locked = local.is_file() && std::fs::File::open(&local).is_err();
+            let result = if still_locked {
+                Err("The file is still open in another program (being used by another process).".to_string())
+            } else {
+                self.resolve(rc, s, pair, k, cancel).await
+            };
+            match result {
+                Ok(()) => cleared.push(k.path.clone()),
+                Err(e) if e == "cancelled" => break,
+                Err(e) => {
+                    let mut kind = issue_kind(&e);
+                    if outage_kind(kind) && !still_locked {
+                        outage = Some((kind.to_string(), e.clone()));
+                    }
+                    if matches!(kind, "auth" | "quota" | "disk") {
+                        kind = "unknown";
+                    }
+                    let mut next = k.clone();
+                    next.tries = next.tries.saturating_add(1);
+                    next.next_retry = now.saturating_add(retry_delay(kind, next.tries));
+                    if !still_locked {
+                        next.kind = kind.to_string();
+                        next.reason = file_reason(kind, "", &e);
+                        next.detail = e;
+                    }
+                    updated.push(next);
+                }
+            }
+        }
+        if cleared.is_empty() && updated.is_empty() {
+            return (Vec::new(), outage);
+        }
+        for path in &cleared {
+            self.core.log(&format!("[{}] {} can sync again", pair.local, path));
+        }
+        let put_back: Vec<Skipped> = pair.skipped.iter().filter(|k| cleared.contains(&k.path)).cloned().collect();
+        self.core.update_pair(&pair.id, |p| {
+            p.skipped.retain(|k| !cleared.contains(&k.path));
+            for u in updated {
+                if let Some(k) = p.skipped.iter_mut().find(|k| k.path == u.path) {
+                    *k = u;
+                }
+            }
+        });
+        (put_back, outage)
     }
 
     /// Runs one folder sync from start to finish, including the automatic
@@ -1020,12 +1443,21 @@ impl Engine {
             return self.fail(&first, interval, format!("Could not create the sync record folder: {e}"), vec![]);
         }
 
+        // Files whose retry time has come are dealt with first, one by one,
+        // so the folder sync itself never has to start over for them.
+        let (put_back, outage) = self.retry_due(&rc, &s, &first, &cancel).await;
+        if let Some((kind, raw)) = outage {
+            return self.wait_outage(&first, interval, &kind, raw.clone(), vec![raw]);
+        }
+        if cancel.is_cancelled() {
+            return self.finish(&first.id, interval, |rt| rt.phase = Phase::Idle);
+        }
+
         let mut want_resync = job.resync;
-        let mut force = job.force;
-        let mut unskip_done = false;
-        // Set when files were just left out and the last good record was put
-        // back, so the next pass can be a normal sync instead of a rebuild.
-        let mut soft_filters = false;
+        let force = job.force;
+        // Set when the list of left-out files changed in a way rclone can
+        // take without a full rebuild of the sync record.
+        let mut soft_filters = !put_back.is_empty() && listing_ready(&work);
         let mut conflicts: Vec<String> = Vec::new();
         let mut moved: u64 = 0;
 
@@ -1053,6 +1485,10 @@ impl Engine {
 
             if resync && (pair.last_sync == 0 || job.create_remote) {
                 if let Err(e) = rc.mkdir(&self.core.remote(&pair.remote)).await {
+                    let kind = issue_kind(&e);
+                    if outage_kind(kind) {
+                        return self.wait_outage(&pair, interval, kind, e.clone(), vec![e]);
+                    }
                     return self.fail(&pair, interval, e.clone(), vec![e]);
                 }
             }
@@ -1099,16 +1535,6 @@ impl Engine {
                         p.needs_resync = false;
                         p.last_sync = now_secs();
                     });
-                    want_resync = false;
-                    force = false;
-                    if !unskip_done {
-                        unskip_done = true;
-                        let fresh = self.core.pair(&pair.id).unwrap_or(pair.clone());
-                        if self.unskip_ready(&fresh) > 0 {
-                            continue;
-                        }
-                    }
-                    let left_out = self.core.pair(&pair.id).map(|p| p.skipped.len()).unwrap_or(0);
                     let summary = match moved {
                         0 => String::new(),
                         1 => "1 change synced".to_string(),
@@ -1127,12 +1553,11 @@ impl Engine {
                                 rt.conflicts.push(c);
                             }
                         }
-                        if left_out == 0 {
-                            rt.fail_counts.clear();
-                        }
                     });
+                    self.inner.lock().unwrap().outage_notified = false;
                     self.core.log(&format!("[{}] Sync finished. {}", pair.local, summary));
                     let name = file_name(&pair.local);
+                    self.notify_flagged(&pair.id, &name);
                     if conflict_count > 0 && s.conflict_policy != "newest" {
                         self.core.notify(
                             Notice::Problem,
@@ -1209,8 +1634,35 @@ impl Engine {
                     if must_resync && !restored {
                         self.core.update_pair(&pair.id, |p| p.needs_resync = true);
                     }
-                    if self.update_skips(&pair, &files, !restored) && pass < 4 && !cancel.is_cancelled() {
-                        if restored {
+                    // Problems with the account, Koofr's storage or this PC's
+                    // disk are not about any one file.
+                    let folder_problem = std::iter::once(message.as_str())
+                        .chain(files.iter().map(|f| f.msg.as_str()))
+                        .find(|m| matches!(issue_kind(m), "auth" | "quota" | "disk"))
+                        .map(|m| m.to_string());
+                    if let Some(m) = folder_problem {
+                        return self.fail(&pair, interval, m, details);
+                    }
+                    // Koofr itself is down: nothing could be read or sent, so
+                    // no file is to blame.
+                    let transferred = res.stats.as_ref().map(|st| st.transfers).unwrap_or(0);
+                    // If only the same few files keep failing for about an
+                    // hour, Koofr itself is clearly up, so treat them as
+                    // problem files instead of waiting forever.
+                    let long_wait = self.with_rt(&pair.id, |rt| rt.waiting.is_some() && rt.fails >= 6);
+                    let outage = if files.is_empty() {
+                        Some(issue_kind(&message)).filter(|k| outage_kind(k))
+                    } else if !long_wait && files.len() >= 3 && transferred == 0 && files.iter().all(|f| outage_kind(issue_kind(&f.msg))) {
+                        Some(issue_kind(&files[0].msg))
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = outage {
+                        return self.wait_outage(&pair, interval, kind, message, details);
+                    }
+                    let soft_ok = !resync && (restored || (!must_resync && listing_ready(&work)));
+                    if self.update_skips(&pair, &files, &work, !soft_ok, &put_back) && pass < 4 && !cancel.is_cancelled() {
+                        if soft_ok {
                             soft_filters = true;
                         } else {
                             want_resync = true;
@@ -1228,6 +1680,34 @@ impl Engine {
         if let Some(pair) = self.core.pair(&job.pair_id) {
             self.fail(&pair, interval, "The sync kept having to start over. It will be tried again.".into(), vec![]);
         }
+    }
+
+    /// Shows one notification when files in a folder start needing
+    /// attention, instead of one per file or per sync.
+    fn notify_flagged(&self, id: &str, name: &str) {
+        let Some(pair) = self.core.pair(id) else { return };
+        let fresh: Vec<String> = pair
+            .skipped
+            .iter()
+            .filter(|k| !k.notified && file_view(k).flagged)
+            .map(|k| k.path.clone())
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        self.core.update_pair(id, |p| {
+            for k in p.skipped.iter_mut() {
+                if fresh.contains(&k.path) {
+                    k.notified = true;
+                }
+            }
+        });
+        let title = if fresh.len() == 1 {
+            format!("{name}: 1 file needs attention")
+        } else {
+            format!("{name}: {} files need attention", fresh.len())
+        };
+        self.core.notify(Notice::Problem, &title, "Open SyncHopper to see which ones and why.");
     }
 
     fn on_stats(&self, id: &str, st: &Stats) {
@@ -1289,7 +1769,8 @@ mod tests {
             Verdict::Failed { must_resync, files, .. } => {
                 assert!(must_resync);
                 assert_eq!(files.len(), 1);
-                assert_eq!(files[0].0, "bad.txt");
+                assert_eq!(files[0].path, "bad.txt");
+                assert_eq!(files[0].object_type, "*local.Object");
             }
             v => panic!("unexpected {v:?}"),
         }
@@ -1310,9 +1791,18 @@ mod tests {
 
     #[test]
     fn issues() {
-        assert_eq!(file_issue("open x: The process cannot access the file because it is being used by another process."), FileIssue::Busy);
-        assert_eq!(file_issue("The filename or extension is too long."), FileIssue::Stuck);
-        assert_eq!(file_issue("unexpected EOF"), FileIssue::Unknown);
+        assert_eq!(issue_kind("open x: The process cannot access the file because it is being used by another process."), "busy");
+        assert_eq!(issue_kind("Failed to copy: failed to open source object: Invalid response status! Got 500, expected [200 206]; headers: map[]"), "server");
+        assert_eq!(issue_kind("Get \"https:/api/v2/mounts\": dial tcp: lookup app.koofr.net: no such host"), "network");
+        assert_eq!(issue_kind("The filename or extension is too long."), "permanent");
+        assert_eq!(issue_kind("failed to open source object: open /a/b: permission denied"), "denied");
+        assert_eq!(issue_kind("unexpected status code 401"), "auth");
+        assert_eq!(issue_kind("insufficient storage (507)"), "quota");
+        assert_eq!(issue_kind("Failed to copy IMG_15001.jpg: odd"), "unknown");
+        assert_eq!(retry_delay("server", 1), 300);
+        assert_eq!(retry_delay("server", 9), 3600);
+        assert!(retry_delay("permanent", 1) > 10 * 365 * 86_400);
+        assert!(file_reason("server", "*koofr.Object", "x").starts_with("Koofr couldn't send"));
     }
 
     struct NoHost;
@@ -1331,46 +1821,72 @@ mod tests {
     #[test]
     fn skip_list_rules() {
         let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("pc");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::write(local.join("readable.txt"), "x").unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("a..b.path1.lst"),
+            "# bisync listing v1 from x\n-        5 - - 2026-11-13T15:10:34.650367249+0000 \"sub dir/we\\\"ird.txt\"\n",
+        )
+        .unwrap();
+        std::fs::write(work.join("a..b.path2.lst"), "# bisync listing v1 from x\n-        7 - - 2026-11-13T15:10:35.000000000+0000 \"sub dir/we\\\"ird.txt\"\n").unwrap();
         let core = Core::new(dir.path().join("data"), "koofr:".into(), true, Arc::new(NoHost));
         let engine = Engine::new(core.clone());
-        let pair = Pair { id: "p1".into(), local: local.to_string_lossy().to_string(), remote: "Docs".into(), ..Default::default() };
+        let pair = Pair { id: "p1".into(), local: dir.path().to_string_lossy().to_string(), remote: "Docs".into(), ..Default::default() };
         core.update(|s| s.pairs.push(pair.clone()));
         let get = || core.pair("p1").unwrap();
 
-        // A busy file is left out at once and is not sticky.
-        let busy = vec![("readable.txt".to_string(), "open x: The process cannot access the file because it is being used by another process.".to_string())];
-        assert!(engine.update_skips(&get(), &busy, true));
-        assert_eq!(get().skipped.len(), 1);
-        assert!(!get().skipped[0].sticky);
-        assert!(get().needs_resync);
-        // Seeing the same failure again does not add it twice.
-        assert!(!engine.update_skips(&get(), &busy, true));
+        let failed = vec![
+            FailedFile { path: "sub dir/we\"ird.txt".into(), msg: "Failed to copy: failed to open source object: Invalid response status! Got 500".into(), object_type: "*koofr.Object".into() },
+            FailedFile { path: "new.txt".into(), msg: "open x: being used by another process".into(), object_type: "*local.Object".into() },
+        ];
+        assert!(engine.update_skips(&get(), &failed, &work, false, &[]));
+        let p = get();
+        assert!(!p.needs_resync, "a soft update must not force a rebuild");
+        let a = p.skipped.iter().find(|k| k.path == "sub dir/we\"ird.txt").unwrap();
+        assert_eq!(a.kind, "server");
+        assert_eq!(a.base_pc, Some(FileState { size: 5, mtime_ns: 1_794_582_634_650_367_249 }));
+        assert_eq!(a.base_koofr.map(|b| b.size), Some(7));
+        assert!(a.reason.starts_with("Koofr couldn't send"));
+        let b = p.skipped.iter().find(|k| k.path == "new.txt").unwrap();
+        assert_eq!(b.kind, "busy");
+        assert!(b.base_pc.is_none() && b.base_koofr.is_none(), "never synced, so no shared state");
+        // The same failure again does not add a second entry.
+        assert!(!engine.update_skips(&get(), &failed, &work, true, &[]));
 
-        // An unknown failure is only left out the third time, and then stays out.
-        let odd = vec![("sub/odd.bin".to_string(), "Failed to copy: unexpected EOF".to_string())];
-        assert!(!engine.update_skips(&get(), &odd, true));
-        assert!(!engine.update_skips(&get(), &odd, true));
-        assert!(engine.update_skips(&get(), &odd, true));
-        let odd_entry = get().skipped.iter().find(|k| k.path == "sub/odd.bin").cloned().unwrap();
-        assert!(odd_entry.sticky);
+        // Freshly failed files are retried quietly; old or hopeless ones are flagged.
+        let v = file_view(a);
+        assert!(!v.flagged && !v.can_ignore);
+        let mut old = a.clone();
+        old.first_failed = now_secs() - FLAG_AFTER - 1;
+        assert!(file_view(&old).flagged && !file_view(&old).can_ignore);
+        old.first_failed = now_secs() - IGNORE_AFTER - 1;
+        assert!(file_view(&old).can_ignore);
+        let mut hopeless = b.clone();
+        hopeless.kind = "permanent".into();
+        assert!(file_view(&hopeless).flagged && file_view(&hopeless).can_ignore);
 
-        // A name Windows cannot store is left out at once and stays out.
-        let long = vec![("deep/name.txt".to_string(), "The filename or extension is too long.".to_string())];
-        assert!(engine.update_skips(&get(), &long, false));
-        assert!(get().skipped.iter().find(|k| k.path == "deep/name.txt").unwrap().sticky);
+        // Ignoring moves the entry without changing the filter file; un-ignoring
+        // brings it back as due for a retry.
+        let before = filters_text(&core.settings(), &get());
+        engine.ignore_file("p1", "new.txt").unwrap();
+        assert_eq!(get().ignored.len(), 1);
+        assert_eq!(filters_text(&core.settings(), &get()), before);
+        assert!(engine.ignore_file("p1", "nope.txt").is_err());
+    }
 
-        // The busy file can be opened now, so it goes back in. Sticky ones stay.
-        assert_eq!(engine.unskip_ready(&get()), 1);
-        let left: Vec<String> = get().skipped.iter().map(|k| k.path.clone()).collect();
-        assert_eq!(left, vec!["sub/odd.bin".to_string(), "deep/name.txt".to_string()]);
-
-        // "Try again" puts everything back in.
-        engine.with_rt("p1", |rt| rt.retry_skipped = true);
-        assert_eq!(engine.unskip_ready(&get()), 2);
-        assert!(get().skipped.is_empty());
+    #[test]
+    fn listings_are_read_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("x..y.path1.lst"),
+            "# bisync listing v1 from 2026-11-13T15:10:38.619499381+0000\n-        5 - - 2026-11-13T15:10:34.650367249+0000 \"f1.txt\"\n-        2 - - 2026-11-13T15:10:34.650367249+0000 \"sub dir/we\\\"ird [x].txt\"\n",
+        )
+        .unwrap();
+        let m = read_listing(dir.path(), ".path1.lst");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["f1.txt"].size, 5);
+        assert!(m.contains_key("sub dir/we\"ird [x].txt"));
+        assert!(read_listing(dir.path(), ".path2.lst").is_empty());
     }
 
     #[test]

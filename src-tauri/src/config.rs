@@ -3,8 +3,34 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Size and modification time of a file, as recorded in a sync record.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FileState {
+    pub size: u64,
+    /// Nanoseconds since 1970.
+    pub mtime_ns: i64,
+}
+
+impl FileState {
+    /// Same size and modified within a second of each other.
+    pub fn same_as(&self, other: &FileState) -> bool {
+        self.size == other.size && (self.mtime_ns - other.mtime_ns).abs() <= 1_000_000_000
+    }
+}
+
+/// True when two optional file states describe the same thing: both missing,
+/// or both present and the same.
+pub fn same_state(a: &Option<FileState>, b: &Option<FileState>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.same_as(y),
+        _ => false,
+    }
+}
+
 /// A file the sync engine could not handle. It is left out of syncing so the
-/// rest of the folder keeps working.
+/// rest of the folder keeps working, and tried again on its own schedule.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Skipped {
@@ -12,9 +38,21 @@ pub struct Skipped {
     pub path: String,
     /// Plain-language reason shown to the user.
     pub reason: String,
-    /// Sticky entries are only retried when the user asks.
-    pub sticky: bool,
+    /// The sync engine's own message, shown under "Technical details".
+    pub detail: String,
+    /// "server", "network", "busy", "denied", "permanent" or "unknown".
+    pub kind: String,
+    /// Unix time of the first failure in this run of failures.
+    pub first_failed: u64,
+    /// Unix time after which the file is tried again.
+    pub next_retry: u64,
     pub tries: u32,
+    /// The file as both sides last agreed on it, if it had been synced
+    /// before. Used to finish the job correctly once the file can sync.
+    pub base_pc: Option<FileState>,
+    pub base_koofr: Option<FileState>,
+    /// A notification was already shown for this file.
+    pub notified: bool,
 }
 
 /// One synced folder: a folder on this PC paired with a folder in Koofr.
@@ -30,6 +68,9 @@ pub struct Pair {
     /// Unix time of the last successful sync, 0 when never synced.
     pub last_sync: u64,
     pub skipped: Vec<Skipped>,
+    /// Files the user chose to stop syncing. Kept with their sync state so
+    /// syncing them again later picks up where it left off.
+    pub ignored: Vec<Skipped>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +84,7 @@ pub struct Settings {
     pub feature_drive: bool,
     pub drive_letter: String,
     pub feature_context_menu: bool,
+    pub feature_sidebar: bool,
     pub autostart: bool,
 
     // Syncing
@@ -63,6 +105,7 @@ pub struct Settings {
     /// "errors", "all" or "none".
     pub notify_level: String,
     pub auto_update_engine: bool,
+    pub auto_update_app: bool,
 
     // State
     pub base_folder: String,
@@ -88,6 +131,7 @@ impl Default for Settings {
             feature_drive: false,
             drive_letter: "K".into(),
             feature_context_menu: true,
+            feature_sidebar: true,
             autostart: true,
             check_interval_min: 10,
             transfers: 8,
@@ -101,6 +145,7 @@ impl Default for Settings {
             pause_on_metered: true,
             notify_level: "errors".into(),
             auto_update_engine: true,
+            auto_update_app: true,
             base_folder: String::new(),
             upload_dest: String::new(),
             engine_checked_at: 0,
@@ -124,6 +169,7 @@ impl Settings {
         self.pause_on_metered = d.pause_on_metered;
         self.notify_level = d.notify_level;
         self.auto_update_engine = d.auto_update_engine;
+        self.auto_update_app = d.auto_update_app;
     }
 
     /// Keeps values inside the ranges the app supports.
@@ -182,6 +228,19 @@ pub fn load(path: &Path) -> Settings {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     s.sanitize();
+    // Entries saved by version 0.1.0 have no kind or timing yet. Give them
+    // one and let them be tried again soon.
+    let now = crate::util::now_secs();
+    for pair in s.pairs.iter_mut() {
+        for k in pair.skipped.iter_mut().chain(pair.ignored.iter_mut()) {
+            if k.kind.is_empty() {
+                k.kind = "unknown".into();
+            }
+            if k.first_failed == 0 {
+                k.first_failed = now;
+            }
+        }
+    }
     s
 }
 
@@ -217,6 +276,34 @@ mod tests {
         assert_eq!(s.transfers, 8);
         assert!(!s.use_http2);
         assert_eq!(s.ignore_patterns, default_ignores());
+    }
+
+    #[test]
+    fn settings_from_version_0_1_0_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let old = r#"{"setup_complete":true,"account_email":"a@b.c","pairs":[{"id":"p1","local":"/x","remote":"Docs","skipped":[{"path":"a.txt","reason":"r","sticky":true,"tries":3}]}]}"#;
+        std::fs::write(&path, old).unwrap();
+        let s = load(&path);
+        assert!(s.feature_sidebar && s.auto_update_app);
+        let k = &s.pairs[0].skipped[0];
+        assert_eq!(k.path, "a.txt");
+        assert_eq!(k.kind, "unknown");
+        assert!(k.first_failed > 0);
+        assert_eq!(k.next_retry, 0);
+        assert!(s.pairs[0].ignored.is_empty());
+    }
+
+    #[test]
+    fn file_states_compare_with_a_second_of_slack() {
+        let a = FileState { size: 5, mtime_ns: 1_000_000_000_000 };
+        let b = FileState { size: 5, mtime_ns: 1_500_000_000_000 };
+        let c = FileState { size: 6, mtime_ns: 1_000_000_000_000 };
+        assert!(!a.same_as(&b), "500 seconds apart is a change");
+        assert!(a.same_as(&FileState { size: 5, mtime_ns: 1_000_000_000_999 }));
+        assert!(!a.same_as(&c));
+        assert!(same_state(&None, &None));
+        assert!(!same_state(&Some(a), &None));
     }
 
     #[test]

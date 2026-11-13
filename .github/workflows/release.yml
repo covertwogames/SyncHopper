@@ -1,0 +1,113 @@
+# Builds the Windows installer and publishes it as a GitHub release whenever
+# a version tag like v0.2.0 is pushed. The release carries:
+#   - SyncHopper_<version>_x64-setup.exe  the installer for this version
+#   - SyncHopper-setup.exe                the same installer under a fixed name,
+#                                         so .../releases/latest/download/SyncHopper-setup.exe
+#                                         always points at the newest one
+#   - SyncHopper_<version>_x64-setup.exe.sig  the update signature
+#   - latest.json                         what installed copies check for updates
+#
+# One-time setup in the repository's Settings > Secrets and variables > Actions:
+#   secret   TAURI_SIGNING_PRIVATE_KEY           contents of the private key file
+#   secret   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the key's password
+#   variable SYNCHOPPER_UPDATER_PUBKEY           contents of the .pub file
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+          if ("v$version" -ne $tag) {
+            Write-Error "The tag $tag does not match the app version $version in src-tauri/tauri.conf.json."
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace("${{ vars.SYNCHOPPER_UPDATER_PUBKEY }}")) {
+            Write-Error "The SYNCHOPPER_UPDATER_PUBKEY variable is not set in the repository settings."
+            exit 1
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install build tools
+        run: npm ci
+
+      - name: Add the update key to the build settings
+        shell: pwsh
+        env:
+          PUBKEY: ${{ vars.SYNCHOPPER_UPDATER_PUBKEY }}
+        run: |
+          $config = @{
+            bundle  = @{ createUpdaterArtifacts = $true }
+            plugins = @{ updater = @{ pubkey = $env:PUBKEY.Trim() } }
+          }
+          $config | ConvertTo-Json -Depth 5 | Set-Content -Path release.conf.json -Encoding utf8NoBOM
+
+      - name: Build the installer
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --config release.conf.json
+
+      - name: Prepare the release files
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          $setup = "SyncHopper_${env:VERSION}_x64-setup.exe"
+          if (-not (Test-Path "$dir/$setup")) { Write-Error "Installer $setup was not built."; exit 1 }
+          if (-not (Test-Path "$dir/$setup.sig")) { Write-Error "Update signature $setup.sig was not built."; exit 1 }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "$dir/$setup" "release/$setup"
+          Copy-Item "$dir/$setup.sig" "release/$setup.sig"
+          Copy-Item "$dir/$setup" "release/SyncHopper-setup.exe"
+          $manifest = [ordered]@{
+            version   = $env:VERSION
+            notes     = "SyncHopper $env:VERSION"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content "$dir/$setup.sig" -Raw).Trim()
+                url       = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$setup"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path release/latest.json -Encoding utf8NoBOM
+          Get-ChildItem release
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag (Get-ChildItem release).FullName --clobber
+          } else {
+            gh release create $tag (Get-ChildItem release).FullName --title "SyncHopper $env:VERSION" --notes "Download SyncHopper-setup.exe to install. Installed copies update themselves." --latest
+          }

@@ -111,6 +111,75 @@ pub async fn set_context_menu(enabled: bool, exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The ID of SyncHopper's entry in File Explorer's sidebar. It never changes,
+/// so the uninstaller (src-tauri/windows/hooks.nsh) can find and remove it.
+pub const SIDEBAR_CLSID: &str = "{09F3086A-BAFB-4D17-ABA8-5765ABD60793}";
+
+async fn reg(args: &[&str]) -> Result<(), String> {
+    let (ok, _, err) = run("reg", args, Duration::from_secs(15)).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(err.trim().to_string())
+    }
+}
+
+/// Asks File Explorer to pick up changes to its sidebar.
+async fn refresh_explorer() {
+    let _ = powershell(
+        "Add-Type -Namespace SyncHopper -Name Shell -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int e, uint f, System.IntPtr a, System.IntPtr b);'; [SyncHopper.Shell]::SHChangeNotify(0x08000000, 0, [System.IntPtr]::Zero, [System.IntPtr]::Zero)",
+    )
+    .await;
+}
+
+/// Adds a "Koofr" entry to File Explorer's sidebar that opens `target`, or
+/// removes it when `target` is None. Uses the registry steps Microsoft
+/// documents for cloud storage providers, for the current user only.
+pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let clsid_key = format!(r"HKCU\Software\Classes\CLSID\{SIDEBAR_CLSID}");
+    let namespace_key = format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{SIDEBAR_CLSID}");
+    let hide_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+    match target {
+        Some(folder) => {
+            let folder = folder.to_string_lossy().to_string();
+            let icon = format!("{},0", exe.to_string_lossy());
+            let icon_key = format!(r"{clsid_key}\DefaultIcon");
+            let server_key = format!(r"{clsid_key}\InProcServer32");
+            let instance_key = format!(r"{clsid_key}\Instance");
+            let bag_key = format!(r"{clsid_key}\Instance\InitPropertyBag");
+            let folder_key = format!(r"{clsid_key}\ShellFolder");
+            let steps: Vec<Vec<&str>> = vec![
+                vec!["add", &clsid_key, "/ve", "/t", "REG_SZ", "/d", "Koofr", "/f"],
+                vec!["add", &icon_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", &icon, "/f"],
+                vec!["add", &clsid_key, "/v", "System.IsPinnedToNameSpaceTree", "/t", "REG_DWORD", "/d", "0x1", "/f"],
+                vec!["add", &clsid_key, "/v", "SortOrderIndex", "/t", "REG_DWORD", "/d", "0x42", "/f"],
+                vec!["add", &server_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", r"%SystemRoot%\system32\shell32.dll", "/f"],
+                vec!["add", &instance_key, "/v", "CLSID", "/t", "REG_SZ", "/d", "{0E5AAE11-A475-4c5b-AB00-C66DE400274E}", "/f"],
+                vec!["add", &bag_key, "/v", "Attributes", "/t", "REG_DWORD", "/d", "0x11", "/f"],
+                vec!["add", &bag_key, "/v", "TargetFolderPath", "/t", "REG_EXPAND_SZ", "/d", &folder, "/f"],
+                vec!["add", &folder_key, "/v", "FolderValueFlags", "/t", "REG_DWORD", "/d", "0x28", "/f"],
+                vec!["add", &folder_key, "/v", "Attributes", "/t", "REG_DWORD", "/d", "0xF080004D", "/f"],
+                vec!["add", &namespace_key, "/ve", "/t", "REG_SZ", "/d", "Koofr", "/f"],
+                vec!["add", hide_key, "/v", SIDEBAR_CLSID, "/t", "REG_DWORD", "/d", "0x1", "/f"],
+            ];
+            for args in steps {
+                reg(&args).await.map_err(|e| format!("Windows would not add the File Explorer entry: {e}"))?;
+            }
+        }
+        None => {
+            // Missing keys are fine, so results are not checked.
+            let _ = reg(&["delete", &namespace_key, "/f"]).await;
+            let _ = reg(&["delete", hide_key, "/v", SIDEBAR_CLSID, "/f"]).await;
+            let _ = reg(&["delete", &clsid_key, "/f"]).await;
+        }
+    }
+    refresh_explorer().await;
+    Ok(())
+}
+
 /// True when the WinFsp driver that the Koofr drive needs is installed.
 pub async fn winfsp_installed() -> bool {
     if !cfg!(windows) {
