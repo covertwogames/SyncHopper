@@ -5,8 +5,8 @@
 use crate::config::{same_state, FileState, Pair, Settings, Skipped};
 use crate::core::{Core, Notice};
 use crate::platform;
-use crate::rclone::{friendly_error, LogLine, Rclone, RunResult, Stats};
-use crate::util::{clean_remote, file_name, glob_match, go_unquote, new_id, norm_local, now_secs, parse_time_ns, paths_overlap, Cancel};
+use crate::rclone::{friendly_error, friendly_known, is_network_error, LogLine, Rclone, RunResult, Stats};
+use crate::util::{clean_remote, file_name, glob_match, go_unquote, new_id, norm_local, now_secs, parse_time_ns, paths_overlap, system_folder_reason, Cancel};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -20,8 +20,14 @@ const QUIET: Duration = Duration::from_secs(4);
 /// Shortest pause between two syncs of one folder that were set off by
 /// local changes, so a busy folder does not hammer Koofr.
 const BREATHER: Duration = Duration::from_secs(15);
+/// How long a synced PC folder may be missing before it counts as a problem.
+/// A folder that was just renamed disappears for a moment before SyncHopper
+/// catches up with the new name.
+pub const MISSING_GRACE: Duration = Duration::from_secs(90);
 /// How often the battery and metered-connection checks run.
 const POWER_CHECK: Duration = Duration::from_secs(120);
+/// The headline for a folder error SyncHopper does not recognise.
+pub const UNEXPECTED: &str = "Something unexpected stopped this folder from syncing.";
 /// How long a failing file is retried quietly before it is shown as
 /// needing attention.
 pub const FLAG_AFTER: u64 = 3 * 3600;
@@ -96,6 +102,7 @@ struct PairRt {
     summary: String,
     runs: u64,
     last_finished: Option<Instant>,
+    missing_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -285,11 +292,7 @@ pub fn issue_kind(msg: &str) -> &'static str {
         || code("504")
     {
         "server"
-    } else if has(&[
-        "no such host", "dial tcp", "connection refused", "i/o timeout", "network is unreachable",
-        "tls handshake", "connection reset", "unexpected eof", "context deadline exceeded", "broken pipe",
-        "took too long", "could not reach koofr",
-    ]) {
+    } else if is_network_error(msg) {
         "network"
     } else if has(&["being used by another process", "sharing violation", "source file is being updated", "size changed"]) {
         "busy"
@@ -538,6 +541,7 @@ impl Engine {
 
     /// Starts the background work. Call from inside the async runtime.
     pub fn start(self: &Arc<Self>) {
+        self.fill_local_ids();
         let me = self.clone();
         self.core.spawn(async move { me.run_loop().await });
         let me = self.clone();
@@ -816,6 +820,9 @@ impl Engine {
         if lp.parent().is_none() {
             return Err("Pick a folder, not a whole drive.".into());
         }
+        if let Some(why) = system_folder_reason(&local, cfg!(windows), &|name| std::env::var(name).ok()) {
+            return Err(why);
+        }
         let ln = norm_local(&local);
         let sep = std::path::MAIN_SEPARATOR;
         if paths_overlap(&ln, &norm_local(&self.core.data.to_string_lossy()), sep) {
@@ -834,7 +841,8 @@ impl Engine {
             }
         }
         std::fs::create_dir_all(lp).map_err(|e| format!("Could not create {local}: {e}"))?;
-        let pair = Pair { id: new_id("p"), local, remote, needs_resync: true, ..Default::default() };
+        let local_id = platform::folder_id(lp).unwrap_or_default();
+        let pair = Pair { id: new_id("p"), local, remote, needs_resync: true, local_id, ..Default::default() };
         let saved = pair.clone();
         self.core.update(|s| s.pairs.push(saved));
         self.rewatch();
@@ -854,6 +862,102 @@ impl Engine {
             me.wait_idle().await;
             let _ = std::fs::remove_dir_all(me.core.pair_dir(&id));
         });
+    }
+
+    /// For tests: acts as if the folder went missing longer ago than the
+    /// grace period.
+    #[doc(hidden)]
+    pub fn expire_missing_grace(&self, id: &str) {
+        self.with_rt(id, |rt| {
+            rt.missing_since = Instant::now().checked_sub(MISSING_GRACE + Duration::from_secs(1));
+        });
+    }
+
+    /// Notes the identity of every synced PC folder that doesn't have one
+    /// yet, for example folders added before SyncHopper kept track of it.
+    pub fn fill_local_ids(&self) {
+        let missing: Vec<(String, String)> = self
+            .core
+            .settings()
+            .pairs
+            .iter()
+            .filter(|p| p.local_id.is_empty())
+            .filter_map(|p| platform::folder_id(Path::new(&p.local)).map(|id| (p.id.clone(), id)))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.core.update(|s| {
+            for p in s.pairs.iter_mut() {
+                if let Some((_, id)) = missing.iter().find(|(pid, _)| pid == &p.id) {
+                    p.local_id = id.clone();
+                }
+            }
+        });
+    }
+
+    /// Points a synced folder at its new PC location after it was renamed,
+    /// and renames the Koofr folder too when `new_remote` is given. If Koofr
+    /// can't be renamed, the folder keeps syncing under its old Koofr name
+    /// and the error is returned so it can be shown.
+    pub async fn rename_pair(self: &Arc<Self>, id: &str, new_local: &str, new_remote: Option<&str>) -> Result<(), String> {
+        let Some(pair) = self.core.pair(id) else { return Err("That folder is no longer synced.".into()) };
+        let was_paused = pair.paused;
+        // Hold the folder still while it is being moved around.
+        self.core.update_pair(id, |p| p.paused = true);
+        self.cancel_pair(id);
+        for _ in 0..300 {
+            let busy = self.inner.lock().unwrap().current.as_ref().is_some_and(|(cur, _)| cur == id);
+            if !busy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut result = Ok(());
+        let mut remote = pair.remote.clone();
+        if let Some(target) = new_remote.map(clean_remote).filter(|t| !t.is_empty() && *t != pair.remote) {
+            match self.core.rclone() {
+                Ok(rc) => {
+                    let from = self.core.remote(&pair.remote);
+                    let to = self.core.remote(&target);
+                    match rc.capture(&["moveto", &from, &to], Duration::from_secs(600)).await.map(|_| ()) {
+                        Ok(()) => {
+                            self.core.log(&format!("Renamed {from} to {to} in Koofr to match the folder on this PC"));
+                            remote = target;
+                        }
+                        Err(e) => {
+                            self.core.log(&format!("Could not rename {from} to {to} in Koofr: {e}"));
+                            result = Err(e);
+                        }
+                    }
+                }
+                Err(e) => result = Err(e),
+            }
+        }
+        let new_local = new_local.to_string();
+        let local_id = platform::folder_id(Path::new(&new_local)).unwrap_or(pair.local_id.clone());
+        self.core.update_pair(id, |p| {
+            p.local = new_local.clone();
+            p.remote = remote.clone();
+            p.local_id = local_id.clone();
+            p.paused = was_paused;
+            p.needs_resync = true;
+        });
+        self.with_rt(id, |rt| {
+            rt.missing_since = None;
+            rt.error = None;
+            rt.details.clear();
+            if rt.phase == Phase::Error {
+                rt.phase = Phase::Idle;
+                rt.fails = 0;
+            }
+        });
+        self.rewatch();
+        if !was_paused {
+            self.enqueue(Job { pair_id: id.to_string(), manual: true, ..Default::default() });
+        }
+        self.core.host.state_changed();
+        result
     }
 
     /// Call when the ignore list changed.
@@ -1126,8 +1230,24 @@ impl Engine {
         }
     }
 
+    /// Stops a folder with one of SyncHopper's own messages.
     fn fail(&self, pair: &Pair, interval_min: u32, message: String, details: Vec<String>) {
         let friendly = friendly_error(&message);
+        self.fail_with(pair, interval_min, friendly, &message, details);
+    }
+
+    /// Stops a folder with an error from the sync engine. Errors SyncHopper
+    /// does not recognise get a plain headline, with the engine's own words
+    /// kept under the technical details.
+    fn fail_raw(&self, pair: &Pair, interval_min: u32, raw: String, mut details: Vec<String>) {
+        let headline = friendly_known(&raw).unwrap_or_else(|| UNEXPECTED.to_string());
+        if !details.iter().any(|d| d == &raw) {
+            details.insert(0, raw.clone());
+        }
+        self.fail_with(pair, interval_min, headline, &raw, details);
+    }
+
+    fn fail_with(&self, pair: &Pair, interval_min: u32, friendly: String, message: &str, details: Vec<String>) {
         self.core.log(&format!("[{}] FAILED: {}", pair.local, message));
         let mut first = false;
         self.finish(&pair.id, interval_min, |rt| {
@@ -1433,9 +1553,25 @@ impl Engine {
             Err(e) => return self.fail(&first, interval, e, vec![]),
         };
         if !Path::new(&first.local).is_dir() {
+            let early = self.with_rt(&first.id, |rt| rt.missing_since.get_or_insert_with(Instant::now).elapsed() < MISSING_GRACE);
+            if early {
+                // Most likely renamed a moment ago. Look again shortly
+                // instead of reporting it as missing straight away.
+                self.core.log(&format!("[{}] The folder is not there right now. Checking again shortly.", first.local));
+                let synced_before = first.last_sync > 0;
+                self.finish(&first.id, interval, |rt| {
+                    if rt.phase == Phase::Checking {
+                        rt.phase = if synced_before { Phase::Ok } else { Phase::Idle };
+                    }
+                });
+                self.with_rt(&first.id, |rt| rt.next_due = Some(Instant::now() + Duration::from_secs(30)));
+                self.core.host.state_changed();
+                return;
+            }
             let msg = format!("This folder is missing on this PC: {}. Nothing was changed in Koofr.", first.local);
             return self.fail(&first, interval, msg, vec![]);
         }
+        self.with_rt(&first.id, |rt| rt.missing_since = None);
         let pdir = self.core.pair_dir(&first.id);
         let work = pdir.join("work");
         let filters = pdir.join("filters.txt");
@@ -1489,7 +1625,7 @@ impl Engine {
                     if outage_kind(kind) {
                         return self.wait_outage(&pair, interval, kind, e.clone(), vec![e]);
                     }
-                    return self.fail(&pair, interval, e.clone(), vec![e]);
+                    return self.fail_raw(&pair, interval, e.clone(), vec![e]);
                 }
             }
             if cancel.is_cancelled() {
@@ -1641,7 +1777,7 @@ impl Engine {
                         .find(|m| matches!(issue_kind(m), "auth" | "quota" | "disk"))
                         .map(|m| m.to_string());
                     if let Some(m) = folder_problem {
-                        return self.fail(&pair, interval, m, details);
+                        return self.fail_raw(&pair, interval, m, details);
                     }
                     // Koofr itself is down: nothing could be read or sent, so
                     // no file is to blame.
@@ -1669,7 +1805,7 @@ impl Engine {
                         }
                         continue;
                     }
-                    return self.fail(&pair, interval, message, details);
+                    return self.fail_raw(&pair, interval, message, details);
                 }
                 other => {
                     let msg = format!("The sync could not get going ({other:?}).");

@@ -3957,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "synchopper"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "md-5",
  "notify",
@@ -3975,6 +3975,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tokio",
+ "winapi-util",
  "zip 2.6.1",
 ]
 

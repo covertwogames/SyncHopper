@@ -287,24 +287,18 @@ async fn version_of(exe: &Path) -> Option<(String, (u32, u32))> {
 pub struct Located {
     pub exe: PathBuf,
     pub version: String,
-    /// True when this is the copy the app downloaded and keeps up to date.
-    pub managed: bool,
 }
 
-/// Finds a usable rclone: the app's own copy first, then one on the PATH.
+/// Finds the app's own copy of rclone. A copy installed some other way is
+/// never used, so every install runs the version SyncHopper downloaded and
+/// keeps up to date.
 pub async fn locate(data: &Path) -> Option<Located> {
     let own = managed_path(data);
     if own.is_file() {
         if let Some((version, num)) = version_of(&own).await {
             if num >= MIN_VERSION {
-                return Some(Located { exe: own, version, managed: true });
+                return Some(Located { exe: own, version });
             }
-        }
-    }
-    let on_path = PathBuf::from(if cfg!(windows) { "rclone.exe" } else { "rclone" });
-    if let Some((version, num)) = version_of(&on_path).await {
-        if num >= MIN_VERSION {
-            return Some(Located { exe: on_path, version, managed: false });
         }
     }
     None
@@ -449,41 +443,91 @@ fn extract(zip_bytes: &[u8], dest: &Path) -> Result<(), String> {
 }
 
 /// Turns raw rclone error text into something a person can act on.
-pub fn friendly_error(raw: &str) -> String {
+/// Wordings that mean the connection to Koofr failed or dropped, rather
+/// than anything being wrong with a file. Windows words several of these
+/// differently from Linux and macOS, for example after the PC wakes from
+/// sleep and a connection opened before it slept turns out to be dead.
+pub const NETWORK_WORDS: &[&str] = &[
+    "no such host",
+    "dial tcp",
+    "connection refused",
+    "i/o timeout",
+    "network is unreachable",
+    "tls handshake",
+    "connection reset",
+    "unexpected eof",
+    "context deadline exceeded",
+    "broken pipe",
+    "took too long",
+    "could not reach koofr",
+    "temporary failure in name resolution",
+    "use of closed network connection",
+    "server closed idle connection",
+    "client connection lost",
+    "client connection force closed",
+    // Windows socket errors, as Go reports them.
+    "wsasend:",
+    "wsarecv:",
+    "connectex:",
+    "getaddrinfow",
+    "forcibly closed by the remote host",
+    "aborted by the software in your host machine",
+    "no connection could be made",
+    "did not properly respond after a period of time",
+    "unreachable network",
+    "unreachable host",
+    "network name is no longer available",
+    "semaphore timeout period has expired",
+];
+
+/// True when the text describes a dropped or failed connection.
+pub fn is_network_error(raw: &str) -> bool {
     let l = raw.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
-    // An HTTP status code standing on its own, not part of a longer number.
-    let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
-    if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
-        "Koofr did not accept the saved email and app password. Open Settings and run setup again to reconnect.".into()
-    } else if has(&["being used by another process", "sharing violation"]) {
-        "A file is open in another program. It will sync once that program closes it.".into()
-    } else if has(&["source file is being updated", "size changed"]) {
-        "A file was still being written while it synced. It will be tried again.".into()
-    } else if has(&["too long"]) {
-        "A file name is too long for Windows.".into()
-    } else if has(&["not enough space", "no space left", "disk full"]) {
-        "This PC is out of disk space.".into()
-    } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
-        "Your Koofr storage is full.".into()
-    } else if has(&["access is denied", "permission denied"]) {
-        "Windows would not let the app read or write a file.".into()
-    } else if has(&["no such host", "dial tcp", "connection refused", "i/o timeout", "network is unreachable", "tls handshake", "connection reset", "unexpected eof", "context deadline exceeded", "took too long", "bad gateway", "service unavailable", "gateway timeout"])
-        || code("502")
-        || code("503")
-        || code("504")
-     {
-        "Could not reach Koofr. It will be tried again automatically.".into()
-    } else if has(&["directory not found"]) {
-        "A folder was not found.".into()
-    } else {
+    NETWORK_WORDS.iter().any(|w| l.contains(w))
+}
+
+/// A plain-language version of an error from the sync engine. Text it does
+/// not recognise is passed through, shortened if very long.
+pub fn friendly_error(raw: &str) -> String {
+    friendly_known(raw).unwrap_or_else(|| {
         let t = raw.trim();
         if t.chars().count() > 220 {
             format!("{}...", t.chars().take(220).collect::<String>())
         } else {
             t.to_string()
         }
-    }
+    })
+}
+
+/// A plain-language version of an error, or None when it is not one SyncHopper
+/// recognises.
+pub fn friendly_known(raw: &str) -> Option<String> {
+    let l = raw.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
+    // An HTTP status code standing on its own, not part of a longer number.
+    let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
+    let text = if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
+        "Koofr did not accept the saved email and app password. Open Settings and run setup again to reconnect."
+    } else if has(&["being used by another process", "sharing violation"]) {
+        "A file is open in another program. It will sync once that program closes it."
+    } else if has(&["source file is being updated", "size changed"]) {
+        "A file was still being written while it synced. It will be tried again."
+    } else if has(&["too long"]) {
+        "A file name is too long for Windows."
+    } else if has(&["not enough space", "no space left", "disk full"]) {
+        "This PC is out of disk space."
+    } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
+        "Your Koofr storage is full."
+    } else if has(&["access is denied", "permission denied"]) {
+        "Windows would not let the app read or write a file."
+    } else if is_network_error(raw) || has(&["bad gateway", "service unavailable", "gateway timeout"]) || code("502") || code("503") || code("504") {
+        "Could not reach Koofr. It will be tried again automatically."
+    } else if has(&["directory not found"]) {
+        "A folder was not found."
+    } else {
+        return None;
+    };
+    Some(text.to_string())
 }
 
 #[cfg(test)]
@@ -524,5 +568,11 @@ mod tests {
         assert!(friendly_error("Failed to create file system: unexpected status code 401").contains("did not accept"));
         assert_eq!(friendly_error("Failed to copy IMG_14012.jpg: odd"), "Failed to copy IMG_14012.jpg: odd");
         assert!(friendly_error("HTTP error 503 returned").contains("Could not reach Koofr"));
+        // What Windows says when a connection opened before sleep is dead.
+        let woke = r#"error reading destination directory: Get "https://app.koofr.net/api/v2/mounts/x/files/list?path=%2FApps": write tcp 192.168.1.76:51559->176.9.109.126:443: wsasend: An existing connection was forcibly closed by the remote host."#;
+        assert!(friendly_error(woke).contains("Could not reach Koofr"));
+        assert!(is_network_error("read tcp 10.0.0.2:1->1.2.3.4:443: wsarecv: An established connection was aborted by the software in your host machine."));
+        assert!(is_network_error("dial tcp 1.2.3.4:443: connectex: A connection attempt failed because the connected party did not properly respond after a period of time"));
+        assert!(friendly_known("something odd").is_none());
     }
 }

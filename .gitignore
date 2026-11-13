@@ -1,6 +1,8 @@
 node_modules/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/menu-build/
+shell/target/
 *.log
 .DS_Store
 Thumbs.db

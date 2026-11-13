@@ -8,6 +8,7 @@ pub mod config;
 pub mod core;
 pub mod engine;
 pub mod mount;
+pub mod newfolders;
 pub mod platform;
 pub mod rclone;
 pub mod uploads;
@@ -53,6 +54,18 @@ impl Host for TauriHost {
         let _ = self.handle.notification().builder().title(title).body(body).show();
     }
 
+    fn notify_folder(&self, title: &str, body: &str, folder: &str) {
+        let _ = self
+            .handle
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .action_type_id(FOLDER_ACTIONS)
+            .extra("folder", folder)
+            .show();
+    }
+
     fn set_autostart(&self, on: bool) -> Result<(), String> {
         let auto = self.handle.autolaunch();
         let result = if on { auto.enable() } else { auto.disable() };
@@ -71,6 +84,35 @@ impl Host for TauriHost {
     fn show_window(&self, view: Option<&str>) {
         show_main(&self.handle, view);
     }
+}
+
+/// The notification type that carries a "Sync it" button.
+const FOLDER_ACTIONS: &str = "folder";
+
+/// Sets up the "Sync it" button on notifications about folders and what a
+/// click on a notification does. Windows only reports clicks while the
+/// notification is on screen; the main window shows the same choices.
+fn setup_notification_actions(handle: &AppHandle) {
+    use tauri_plugin_notification::{Action, ActionType};
+    let notes = handle.notification();
+    let _ = notes.register_action_types(vec![ActionType::builder(FOLDER_ACTIONS)
+        .actions(vec![Action::builder("sync", "Sync it").build()])
+        .build()]);
+    let handle = handle.clone();
+    let _ = notes.on_action(move |performed| {
+        let folder = performed
+            .notification()
+            .and_then(|n| n.extra().get("folder").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        let app = handle.state::<Arc<App>>().inner().clone();
+        let handle = handle.clone();
+        let action = performed.action_id().to_string();
+        tauri::async_runtime::spawn(async move {
+            match (action.as_str(), folder) {
+                ("sync", Some(folder)) => app.request_add_folder(&folder),
+                _ => show_main(&handle, None),
+            }
+        });
+    });
 }
 
 struct Tray {
@@ -290,6 +332,21 @@ fn get_state(handle: AppHandle) -> serde_json::Value {
 }
 
 #[tauri::command]
+fn request_add_folder(app: Ctx<'_>, folder: String) {
+    app.request_add_folder(&folder);
+}
+
+#[tauri::command]
+fn clear_add_request(app: Ctx<'_>) {
+    app.clear_add_request();
+}
+
+#[tauri::command]
+fn dismiss_folder_notice(app: Ctx<'_>, id: String) {
+    app.folders.dismiss(&id);
+}
+
+#[tauri::command]
 async fn check_updates(handle: AppHandle) -> Result<(), String> {
     check_for_update(&handle, true).await
 }
@@ -495,6 +552,13 @@ fn open_target(app: Ctx<'_>, handle: AppHandle, kind: String, value: Option<Stri
             opener.open_path(path.to_string_lossy(), None::<&str>)
         }
         "drive" => opener.open_path(format!("{}:\\", s.drive_letter), None::<&str>),
+        "base_folder" => {
+            let base = s.base_folder.trim().to_string();
+            if base.is_empty() {
+                return Err("There is no Koofr folder on this PC yet.".into());
+            }
+            opener.open_path(base, None::<&str>)
+        }
         "pair_folder" => {
             let id = value.unwrap_or_default();
             match s.pairs.iter().find(|p| p.id == id) {
@@ -670,6 +734,7 @@ pub fn run() {
                 host,
             );
             handle.manage(app.clone());
+            setup_notification_actions(&handle);
             build_tray(&handle)?;
 
             let args: Vec<String> = std::env::args().collect();
@@ -747,6 +812,9 @@ pub fn run() {
             install_app_update,
             ignore_file,
             unignore_file,
+            request_add_folder,
+            clear_add_request,
+            dismiss_folder_notice,
         ])
         .run(context)
         .expect("error while running SyncHopper");

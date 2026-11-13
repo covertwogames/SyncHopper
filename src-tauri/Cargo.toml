@@ -1,6 +1,6 @@
 [package]
 name = "synchopper"
-version = "0.2.0"
+version = "0.3.0"
 description = "Two-way sync for Koofr"
 authors = ["Cover Two Games"]
 edition = "2021"
@@ -28,6 +28,9 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 sha2 = "0.10"
 md-5 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -325,8 +325,10 @@
   function onState(state) {
     S = state;
     if (view === "loading") {
-      if (S.setup_complete) go("main");
-      else startWizard(false);
+      if (S.setup_complete) {
+        go("main");
+        takeAddRequest();
+      } else startWizard(false);
       return;
     }
     if (!S.setup_complete && view !== "wizard") {
@@ -335,6 +337,25 @@
       return;
     }
     render();
+    takeAddRequest();
+  }
+
+  // A folder sent here from outside the window, such as with "Sync folder to
+  // Koofr" in File Explorer. Shown once, then handed back.
+  let takingRequest = false;
+  function takeAddRequest() {
+    const req = S.add_request;
+    if (!req || takingRequest || !S.setup_complete || view === "wizard") return;
+    // An update can arrive before the request is handed back; don't open
+    // the same dialog twice.
+    takingRequest = true;
+    run("clear_add_request").finally(() => (takingRequest = false));
+    if (view !== "main") go("main");
+    if (req.blocked) {
+      openModal({ title: "Sync folder to Koofr", body: "<p>" + esc(req.blocked) + "</p>", buttons: [{ label: "OK", kind: "primary" }] });
+      return;
+    }
+    addFolderDialog(req);
   }
 
   document.addEventListener("click", (e) => {
@@ -475,6 +496,13 @@
     if (S.sync.paused_all) banners.push('<div class="banner"><span>All syncing is paused.</span><button type="button" class="btn" data-banner="resume">Resume</button></div>');
     else if (S.sync.auto_pause === "battery") banners.push('<div class="banner info"><span>Syncing is paused while this PC is on battery. Use Sync now on a folder to sync it anyway.</span></div>');
     else if (S.sync.auto_pause === "metered") banners.push('<div class="banner info"><span>Syncing is paused on this metered connection. Use Sync now on a folder to sync it anyway.</span></div>');
+    (S.folder_notices || []).forEach((n) => {
+      let buttons = "";
+      if (n.kind === "clash" || n.kind === "not_synced" || n.kind === "failed") buttons += '<button type="button" class="btn" data-banner="fsync" data-local="' + esc(n.local) + '">Sync it</button>';
+      if (n.kind === "files") buttons += '<button type="button" class="btn" data-banner="fopen">Open folder</button>';
+      buttons += '<button type="button" class="btn" data-banner="fdismiss" data-id="' + esc(n.id) + '">Dismiss</button>';
+      banners.push('<div class="banner info"><span>' + esc(n.message) + "</span>" + buttons + "</div>");
+    });
     setHtml($("#main-banners"), banners.join(""));
 
     // Folder cards, updated in place so buttons stay clickable.
@@ -558,6 +586,9 @@
     if (b.dataset.banner === "resume") run("set_paused_all", { paused: false });
     if (b.dataset.banner === "engine") run("retry_engine");
     if (b.dataset.banner === "update") installUpdate();
+    if (b.dataset.banner === "fsync") run("request_add_folder", { folder: b.dataset.local });
+    if (b.dataset.banner === "fopen") run("open_target", { kind: "base_folder" });
+    if (b.dataset.banner === "fdismiss") run("dismiss_folder_notice", { id: b.dataset.id });
   });
 
   $("#drive-card").addEventListener("click", (e) => {
@@ -866,11 +897,13 @@
 
   // ----- add a folder ------------------------------------------------------
 
-  $("#add-folder").addEventListener("click", addFolderDialog);
+  $("#add-folder").addEventListener("click", () => addFolderDialog());
 
-  async function addFolderDialog() {
+  // `prefill`, when given, holds a folder on this PC to start from: local,
+  // remote (the suggested Koofr folder) and an optional note.
+  async function addFolderDialog(prefill) {
     const base = await invoke("default_base_folder").catch(() => "");
-    let localTouched = false;
+    let localTouched = !!(prefill && prefill.local);
     let token = 0;
     const modal = openModal({
       title: "Add a folder",
@@ -879,6 +912,7 @@
         '<p class="muted small">Pick a folder in Koofr and where to keep it on this PC. The two are then kept the same.</p>' +
         '<div class="field"><label for="af-remote">Koofr folder</label><div class="row gap8"><input id="af-remote" type="text" class="grow" autocomplete="off" spellcheck="false" placeholder="For example Documents"><button type="button" class="btn" id="af-rbrowse">Browse</button></div></div>' +
         '<div class="field"><label for="af-local">Folder on this PC</label><div class="row gap8"><input id="af-local" type="text" class="grow" autocomplete="off" spellcheck="false"><button type="button" class="btn" id="af-lbrowse">Browse</button></div></div>' +
+        (prefill && prefill.note ? '<p class="banner info"><span>' + esc(prefill.note) + "</span></p>" : "") +
         '<p id="af-preview" class="small muted" role="status"></p>' +
         '<p class="small muted">Files missing on either side are copied across. Nothing is deleted. If the same file is in both places, the newer one is kept.</p>',
       buttons: [
@@ -908,6 +942,10 @@
     const remoteEl = $("#af-remote", modal.el);
     const localEl = $("#af-local", modal.el);
     const previewEl = $("#af-preview", modal.el);
+    if (prefill && prefill.local) {
+      remoteEl.value = prefill.remote || "";
+      localEl.value = prefill.local;
+    }
 
     function suggestLocal() {
       if (localTouched || !base) return;
@@ -959,6 +997,7 @@
       localTouched = true;
       preview();
     });
+    if (prefill && prefill.local) preview();
   }
 
   function previewText(pv) {
@@ -1106,6 +1145,7 @@
       }
     });
     $("#st-sidebar").disabled = !S.windows && !s.feature_sidebar;
+    $("#st-auto").disabled = !s.feature_sync;
     if (!S.windows) setText($("#st-sidebar-note"), "Only available on Windows.");
     const up = S.update || {};
     let appNote = "You have SyncHopper " + S.version + ".";
@@ -1122,7 +1162,7 @@
       $("#ad-engine-note"),
       e.state !== "ready"
         ? engineText()
-        : "The engine is rclone " + e.version + "." + (e.managed ? "" : " This copy was already installed on this PC, so SyncHopper does not update it.")
+        : "The engine is rclone " + e.version + "."
     );
   }
 

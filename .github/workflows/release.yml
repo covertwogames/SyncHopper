@@ -1,5 +1,5 @@
-# Builds the Windows installer and publishes it as a GitHub release whenever
-# a version tag like v0.2.0 is pushed. The release carries:
+# Builds the Windows installer, signs it, and publishes it as a GitHub release
+# whenever a version tag like v0.3.0 is pushed. The release carries:
 #   - SyncHopper_<version>_x64-setup.exe  the installer for this version
 #   - SyncHopper-setup.exe                the same installer under a fixed name,
 #                                         so .../releases/latest/download/SyncHopper-setup.exe
@@ -7,10 +7,24 @@
 #   - SyncHopper_<version>_x64-setup.exe.sig  the update signature
 #   - latest.json                         what installed copies check for updates
 #
-# One-time setup in the repository's Settings > Secrets and variables > Actions:
-#   secret   TAURI_SIGNING_PRIVATE_KEY           contents of the private key file
-#   secret   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the key's password
-#   variable SYNCHOPPER_UPDATER_PUBKEY           contents of the .pub file
+# Two kinds of signing happen here:
+#   - Code signing with Cover Two's Azure Artifact Signing certificate, so
+#     Windows (Smart App Control, SmartScreen) shows Cover Two Strategies LLC
+#     as the publisher. It covers the program, the installer, the uninstaller
+#     and the Windows 11 right-click entry with its identity package.
+#   - The update signature, which installed copies check before updating.
+#
+# One-time setup in the repository's Settings:
+#   Environments: an environment named "release"
+#   Secrets and variables > Actions:
+#     secret   TAURI_SIGNING_PRIVATE_KEY           contents of the update key file
+#     secret   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the update key's password
+#     variable SYNCHOPPER_UPDATER_PUBKEY           contents of the update key's .pub file
+#     variable AZURE_CLIENT_ID                     the app registration's client ID
+#     variable AZURE_TENANT_ID                     the Azure tenant (directory) ID
+# The app registration signs in without a stored password (a federated
+# credential for this repository's "release" environment) and has the
+# "Artifact Signing Certificate Profile Signer" role on the signing account.
 
 name: Release
 
@@ -19,12 +33,18 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   windows:
     runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      SIGN_ENDPOINT: https://eus.codesigning.azure.net/
+      SIGN_ACCOUNT: CoverTwoSigning
+      SIGN_PROFILE: CoverTwo
+      TIMESTAMP_URL: http://timestamp.digicert.com
     steps:
       - uses: actions/checkout@v4
 
@@ -32,13 +52,19 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: |
+            src-tauri
+            shell
 
-      - name: Check the tag matches the app version
+      - name: Check the tag and the settings
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
@@ -47,32 +73,127 @@ jobs:
             Write-Error "The tag $tag does not match the app version $version in src-tauri/tauri.conf.json."
             exit 1
           }
-          if ([string]::IsNullOrWhiteSpace("${{ vars.SYNCHOPPER_UPDATER_PUBKEY }}")) {
-            Write-Error "The SYNCHOPPER_UPDATER_PUBKEY variable is not set in the repository settings."
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace("${{ vars.SYNCHOPPER_UPDATER_PUBKEY }}")) { $missing += "SYNCHOPPER_UPDATER_PUBKEY" }
+          if ([string]::IsNullOrWhiteSpace("${{ vars.AZURE_CLIENT_ID }}")) { $missing += "AZURE_CLIENT_ID" }
+          if ([string]::IsNullOrWhiteSpace("${{ vars.AZURE_TENANT_ID }}")) { $missing += "AZURE_TENANT_ID" }
+          if ($missing.Count -gt 0) {
+            Write-Error "These variables are not set in the repository settings: $($missing -join ', ')"
             exit 1
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install build tools
-        run: npm ci
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dotnet tool install --tool-path "$env:RUNNER_TEMP\sign" --prerelease sign
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "SIGN_EXE=$env:RUNNER_TEMP\sign\sign.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Add the update key to the build settings
+      - name: Write the release build settings
         shell: pwsh
         env:
           PUBKEY: ${{ vars.SYNCHOPPER_UPDATER_PUBKEY }}
         run: |
+          $signArgs = @(
+            "code", "artifact-signing",
+            "--verbosity", "warning",
+            "--timestamp-url", $env:TIMESTAMP_URL,
+            "--artifact-signing-endpoint", $env:SIGN_ENDPOINT,
+            "--artifact-signing-account", $env:SIGN_ACCOUNT,
+            "--artifact-signing-certificate-profile", $env:SIGN_PROFILE,
+            "--azure-credential-type", "azure-cli",
+            "%1"
+          )
           $config = @{
-            bundle  = @{ createUpdaterArtifacts = $true }
+            bundle  = @{
+              createUpdaterArtifacts = $true
+              resources = @{
+                "menu-build/synchopper_shell.dll" = "synchopper_shell.dll"
+                "menu-build/SyncHopper.msix"      = "SyncHopper.msix"
+              }
+              windows = @{ signCommand = @{ cmd = $env:SIGN_EXE; args = $signArgs } }
+            }
             plugins = @{ updater = @{ pubkey = $env:PUBKEY.Trim() } }
           }
-          $config | ConvertTo-Json -Depth 5 | Set-Content -Path release.conf.json -Encoding utf8NoBOM
+          $config | ConvertTo-Json -Depth 8 | Set-Content -Path release.conf.json -Encoding utf8NoBOM
+          # The right-click entry's files are made after the program is built,
+          # but the build wants them to exist, so start with empty ones.
+          New-Item -ItemType Directory -Force -Path src-tauri/menu-build | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri/menu-build/synchopper_shell.dll | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri/menu-build/SyncHopper.msix | Out-Null
 
-      - name: Build the installer
+      - name: Build the program
+        shell: pwsh
+        run: |
+          npx tauri build --no-bundle --config release.conf.json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build the Windows 11 right-click entry
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path shell/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item shell/target/release/synchopper_shell.dll src-tauri/menu-build/synchopper_shell.dll -Force
+
+      # Signed in just before signing starts: the sign-in is only good for a
+      # limited time.
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Sign the right-click entry and package its identity
+        shell: pwsh
+        run: |
+          az account get-access-token --scope "https://codesigning.azure.net/.default" --output none
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not get permission to sign from Azure."; exit 1 }
+          function Sign-File($path) {
+            & $env:SIGN_EXE code artifact-signing --verbosity warning --timestamp-url $env:TIMESTAMP_URL `
+              --artifact-signing-endpoint $env:SIGN_ENDPOINT --artifact-signing-account $env:SIGN_ACCOUNT `
+              --artifact-signing-certificate-profile $env:SIGN_PROFILE --azure-credential-type azure-cli $path
+            if ($LASTEXITCODE -ne 0) { Write-Error "Signing $path failed."; exit 1 }
+          }
+          $dll = Resolve-Path src-tauri/menu-build/synchopper_shell.dll
+          Sign-File $dll
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne "Valid") { Write-Error "The right-click entry's signature is not valid: $($sig.StatusMessage)"; exit 1 }
+          # The identity package must name exactly the certificate it is signed with.
+          $publisher = $sig.SignerCertificate.Subject
+          Write-Host "Signing certificate: $publisher"
+          $stage = Join-Path $env:RUNNER_TEMP "menu"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Copy-Item src-tauri/windows/menu $stage -Recurse
+          $manifest = Join-Path $stage "AppxManifest.xml"
+          $text = Get-Content $manifest -Raw
+          $text = $text.Replace("{{PUBLISHER}}", [System.Security.SecurityElement]::Escape($publisher)).Replace("{{VERSION}}", "$env:VERSION.0")
+          Set-Content -Path $manifest -Value $text -Encoding utf8NoBOM
+          $makeappx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" |
+            Sort-Object { try { [version]$_.Directory.Parent.Name } catch { [version]"0.0" } } -Descending | Select-Object -First 1
+          if (-not $makeappx) { Write-Error "MakeAppx was not found."; exit 1 }
+          $msix = Join-Path (Resolve-Path src-tauri/menu-build) "SyncHopper.msix"
+          & $makeappx.FullName pack /d $stage /p $msix /nv /o
+          if ($LASTEXITCODE -ne 0) { Write-Error "Packing the identity package failed."; exit 1 }
+          Sign-File $msix
+
+      - name: Build and sign the installer
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --config release.conf.json
+        run: |
+          npx tauri bundle --config release.conf.json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The program inside the installer was signed on the way in; the
+          # copy left in the build folder is the unsigned original.
+          $setup = "src-tauri/target/release/bundle/nsis/SyncHopper_${env:VERSION}_x64-setup.exe"
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Host "$setup : $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { Write-Error "The installer is not properly signed: $($sig.StatusMessage)"; exit 1 }
 
       - name: Prepare the release files
         shell: pwsh

@@ -68,6 +68,9 @@ pub struct Pair {
     /// Unix time of the last successful sync, 0 when never synced.
     pub last_sync: u64,
     pub skipped: Vec<Skipped>,
+    /// Identifies the PC folder itself, so a rename can be recognised. Empty
+    /// when not known yet.
+    pub local_id: String,
     /// Files the user chose to stop syncing. Kept with their sync state so
     /// syncing them again later picks up where it left off.
     pub ignored: Vec<Skipped>,
@@ -91,6 +94,9 @@ pub struct Settings {
     pub check_interval_min: u32,
     pub transfers: u32,
     pub max_delete_percent: u32,
+    /// New folders put straight into the base folder become synced folders
+    /// by themselves. When off, SyncHopper only points them out.
+    pub auto_add_folders: bool,
 
     // Advanced
     pub use_http2: bool,
@@ -112,6 +118,12 @@ pub struct Settings {
     pub upload_dest: String,
     pub engine_checked_at: u64,
     pub tray_hint_shown: bool,
+    /// Names of the folders and files directly in the base folder that
+    /// SyncHopper has already seen, so only new ones are acted on.
+    pub base_known: Vec<String>,
+    /// False until the base folder was looked at for the first time. What is
+    /// there at that point is never treated as new.
+    pub base_known_ready: bool,
     pub pairs: Vec<Pair>,
 }
 
@@ -136,6 +148,7 @@ impl Default for Settings {
             check_interval_min: 10,
             transfers: 8,
             max_delete_percent: 50,
+            auto_add_folders: true,
             use_http2: false,
             upload_limit_mbps: 0.0,
             download_limit_mbps: 0.0,
@@ -150,6 +163,8 @@ impl Default for Settings {
             upload_dest: String::new(),
             engine_checked_at: 0,
             tray_hint_shown: false,
+            base_known: Vec::new(),
+            base_known_ready: false,
             pairs: Vec::new(),
         }
     }

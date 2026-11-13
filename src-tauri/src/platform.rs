@@ -75,40 +75,158 @@ pub async fn metered() -> Option<bool> {
     }
 }
 
+/// The classic right-click entries: one for files, one for folders.
 const MENU_KEYS: [&str; 2] = [
     r"HKCU\Software\Classes\*\shell\SyncHopper",
     r"HKCU\Software\Classes\Directory\shell\SyncHopper",
 ];
 
-/// Adds or removes the "Send to Koofr" entry in File Explorer's right-click
-/// menu for the current user.
-pub async fn set_context_menu(enabled: bool, exe: &Path) -> Result<(), String> {
+/// Where SyncHopper tells its Windows 11 menu entry (shell/src/lib.rs) which
+/// items to show and where SyncHopper is.
+const MENU_SETTINGS_KEY: &str = r"HKCU\Software\SyncHopper\Menu";
+
+/// The name of the package that gives SyncHopper's Windows 11 menu entry its
+/// identity (src-tauri/windows/menu/AppxManifest.xml).
+pub const MENU_PACKAGE: &str = "CoverTwoGames.SyncHopper";
+
+/// Adds or removes the classic right-click entries: a "SyncHopper" submenu
+/// with "Send to Koofr" and, for folders, "Sync folder to Koofr". On Windows
+/// 11 these sit under "Show more options"; they are used when the Windows 11
+/// entry can't be.
+pub async fn set_legacy_menu(enabled: bool, add_folder: bool, exe: &Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    // Start clean, so entries from older versions or items that should no
+    // longer be there go away. A missing key is fine.
+    for key in MENU_KEYS {
+        let _ = run("reg", &["delete", key, "/f"], Duration::from_secs(15)).await;
+    }
+    if !enabled {
+        return Ok(());
+    }
+    let exe = exe.to_string_lossy().to_string();
+    let icon = format!("\"{exe}\"");
+    let send = format!("\"{exe}\" --upload \"%1\"");
+    let add = format!("\"{exe}\" --add-folder \"%1\"");
+    for (key, folders) in [(MENU_KEYS[0], false), (MENU_KEYS[1], true)] {
+        let send_key = format!(r"{key}\shell\1send");
+        let send_cmd = format!(r"{send_key}\command");
+        let add_key = format!(r"{key}\shell\2add");
+        let add_cmd = format!(r"{add_key}\command");
+        let mut steps: Vec<Vec<&str>> = vec![
+            vec!["add", key, "/v", "MUIVerb", "/d", "SyncHopper", "/f"],
+            vec!["add", key, "/v", "SubCommands", "/d", "", "/f"],
+            vec!["add", key, "/v", "Icon", "/d", &icon, "/f"],
+            vec!["add", &send_key, "/ve", "/d", "Send to Koofr", "/f"],
+            vec!["add", &send_cmd, "/ve", "/d", &send, "/f"],
+        ];
+        if folders && add_folder {
+            steps.push(vec!["add", &add_key, "/ve", "/d", "Sync folder to Koofr", "/f"]);
+            steps.push(vec!["add", &add_cmd, "/ve", "/d", &add, "/f"]);
+        }
+        for args in steps {
+            let (ok, _, err) = run("reg", &args, Duration::from_secs(15)).await?;
+            if !ok {
+                return Err(format!("Windows would not add the right-click entry: {}", err.trim()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tells the Windows 11 menu entry which items to show and where SyncHopper
+/// is. It reads these every time the menu opens.
+pub async fn set_menu_flags(upload: bool, add_folder: bool, exe: &Path) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
     let exe = exe.to_string_lossy().to_string();
-    for key in MENU_KEYS {
-        if enabled {
-            let command_key = format!(r"{key}\command");
-            let icon = format!("\"{exe}\"");
-            let command = format!("\"{exe}\" --upload \"%1\"");
-            let steps: [Vec<&str>; 3] = [
-                vec!["add", key, "/ve", "/d", "Send to Koofr", "/f"],
-                vec!["add", key, "/v", "Icon", "/d", &icon, "/f"],
-                vec!["add", &command_key, "/ve", "/d", &command, "/f"],
-            ];
-            for args in steps {
-                let (ok, _, err) = run("reg", &args, Duration::from_secs(15)).await?;
-                if !ok {
-                    return Err(format!("Windows would not add the right-click entry: {}", err.trim()));
-                }
-            }
-        } else {
-            // A missing key is fine, so the result is not checked.
-            let _ = run("reg", &["delete", key, "/f"], Duration::from_secs(15)).await;
-        }
+    let on = |b: bool| if b { "1" } else { "0" };
+    for args in [
+        vec!["add", MENU_SETTINGS_KEY, "/v", "Upload", "/t", "REG_DWORD", "/d", on(upload), "/f"],
+        vec!["add", MENU_SETTINGS_KEY, "/v", "AddFolder", "/t", "REG_DWORD", "/d", on(add_folder), "/f"],
+        vec!["add", MENU_SETTINGS_KEY, "/v", "Exe", "/t", "REG_SZ", "/d", &exe, "/f"],
+    ] {
+        reg(&args).await?;
     }
     Ok(())
+}
+
+/// The Windows build number, such as 26100. Windows 11 starts at 22000.
+pub async fn windows_build() -> Option<u32> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let (ok, out, _) = run(
+        "reg",
+        &["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "/v", "CurrentBuildNumber"],
+        Duration::from_secs(15),
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    out.lines().find(|l| l.contains("CurrentBuildNumber"))?.split_whitespace().last()?.parse().ok()
+}
+
+fn ps_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+async fn powershell_checked(script: &str, timeout: Duration) -> Result<String, String> {
+    let (ok, out, err) = run("powershell", &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], timeout).await?;
+    if ok {
+        Ok(out.trim().to_string())
+    } else {
+        let msg = err.lines().map(str::trim).filter(|l| !l.is_empty()).take(3).collect::<Vec<_>>().join(" ");
+        Err(if msg.is_empty() { "PowerShell reported a problem.".into() } else { msg })
+    }
+}
+
+/// The version of the menu package that is registered, if any.
+pub async fn menu_package_version() -> Option<String> {
+    let script = format!("(Get-AppxPackage -Name {} | Select-Object -First 1).Version", ps_quote(MENU_PACKAGE));
+    powershell_checked(&script, Duration::from_secs(30)).await.ok().filter(|v| !v.is_empty())
+}
+
+pub async fn unregister_menu_package() {
+    let script = format!("Get-AppxPackage -Name {} | Remove-AppxPackage", ps_quote(MENU_PACKAGE));
+    let _ = powershell_checked(&script, Duration::from_secs(60)).await;
+}
+
+/// Makes sure the Windows 11 menu entry is registered for this copy of
+/// SyncHopper. Returns false when it can't be used here: older Windows, or
+/// a copy built without it (the package only comes with signed releases).
+pub async fn ensure_menu_package(exe: &Path, version: &str) -> Result<bool, String> {
+    if !cfg!(windows) {
+        return Ok(false);
+    }
+    let Some(dir) = exe.parent() else { return Ok(false) };
+    let msix = dir.join("SyncHopper.msix");
+    let dll = dir.join("synchopper_shell.dll");
+    let have = menu_package_version().await;
+    let usable = windows_build().await.unwrap_or(0) >= 22000 && msix.is_file() && dll.is_file();
+    if !usable {
+        if have.is_some() {
+            unregister_menu_package().await;
+        }
+        return Ok(false);
+    }
+    let want = format!("{version}.0");
+    if have.as_deref() == Some(want.as_str()) {
+        return Ok(true);
+    }
+    if have.is_some() {
+        unregister_menu_package().await;
+    }
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Add-AppxPackage -Path {} -ExternalLocation {}",
+        ps_quote(&msix.to_string_lossy()),
+        ps_quote(&dir.to_string_lossy())
+    );
+    powershell_checked(&script, Duration::from_secs(120)).await.map(|_| true)
 }
 
 /// The ID of SyncHopper's entry in File Explorer's sidebar. It never changes,
@@ -277,3 +395,41 @@ pub fn default_base_folder() -> String {
     PathBuf::from(home).join("Koofr").to_string_lossy().to_string()
 }
 
+/// A value that stays the same for a folder when it is renamed or moved on
+/// the same drive, so a renamed synced folder can be recognised.
+pub fn folder_id(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let handle = winapi_util::Handle::from_path_any(path).ok()?;
+        let info = winapi_util::file::information(&handle).ok()?;
+        Some(format!("{:x}-{:x}", info.volume_serial_number(), info.file_index()))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(format!("{:x}-{:x}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// True for entries people don't see in File Explorer: hidden or system
+/// files on Windows, dot files elsewhere.
+pub fn hidden_entry(name: &str, meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const HIDDEN: u32 = 0x2;
+        const SYSTEM: u32 = 0x4;
+        if meta.file_attributes() & (HIDDEN | SYSTEM) != 0 {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = meta;
+    name.starts_with('.')
+}

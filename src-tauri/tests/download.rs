@@ -87,8 +87,18 @@ async fn a_good_download_is_verified_and_installed() {
     assert!(path.is_file());
     assert_eq!(seen.lock().unwrap().last().copied(), Some(100));
     let found = rclone::locate(&data).await.expect("the downloaded copy should be found");
-    assert!(found.managed);
+    assert_eq!(found.exe, rclone::managed_path(&data));
     assert_eq!(found.version, "9.9.9");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_installed_some_other_way_is_never_used() {
+    // This test machine has rclone installed on its own. SyncHopper must not
+    // pick it up: only the copy it downloaded counts.
+    let on_path = std::process::Command::new("rclone").arg("version").output().map(|o| o.status.success()).unwrap_or(false);
+    assert!(on_path, "this test needs rclone installed on the test machine");
+    let dir = tempfile::tempdir().unwrap();
+    assert!(rclone::locate(&dir.path().join("data")).await.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -14,6 +14,12 @@ pub trait Host: Send + Sync {
     /// Something the screens show has changed.
     fn state_changed(&self);
     fn notify(&self, title: &str, body: &str);
+    /// A notification with a "Sync it" button for a folder on this PC.
+    /// Hosts without buttons show a plain notification.
+    fn notify_folder(&self, title: &str, body: &str, folder: &str) {
+        let _ = folder;
+        self.notify(title, body);
+    }
     fn set_autostart(&self, on: bool) -> Result<(), String>;
     fn exe_path(&self) -> Option<PathBuf>;
     /// Brings the window forward, optionally on a named screen.
@@ -35,7 +41,7 @@ pub struct EngineInfo {
     pub version: String,
     pub percent: u8,
     pub message: String,
-    pub managed: bool,
+
     #[serde(skip)]
     pub exe: Option<PathBuf>,
 }
@@ -187,14 +193,24 @@ impl Core {
 
     /// Shows a notification if the user's notification choice allows it.
     pub fn notify(&self, kind: Notice, title: &str, body: &str) {
+        if self.notice_allowed(kind) {
+            self.host.notify(title, body);
+        }
+    }
+
+    /// Like `notify`, with a "Sync it" button for `folder`.
+    pub fn notify_folder(&self, kind: Notice, title: &str, body: &str, folder: &str) {
+        if self.notice_allowed(kind) {
+            self.host.notify_folder(title, body, folder);
+        }
+    }
+
+    fn notice_allowed(&self, kind: Notice) -> bool {
         let level = self.settings.lock().unwrap().notify_level.clone();
-        let allowed = match level.as_str() {
+        match level.as_str() {
             "none" => false,
             "all" => true,
             _ => kind == Notice::Problem,
-        };
-        if allowed {
-            self.host.notify(title, body);
         }
     }
 }

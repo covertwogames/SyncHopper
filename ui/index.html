@@ -111,7 +111,7 @@
         </div>
         <div class="check">
           <input id="st-menu" type="checkbox" data-set="feature_context_menu">
-          <label for="st-menu"><span>Send to Koofr in the right-click menu</span><span class="small muted">Adds an entry to File Explorer's menu. On Windows 11 it is under "Show more options".</span></label>
+          <label for="st-menu"><span>SyncHopper in the right-click menu</span><span class="small muted">Adds Send to Koofr and Sync folder to Koofr to File Explorer's right-click menu.</span></label>
         </div>
         <div class="check">
           <input id="st-sidebar" type="checkbox" data-set="feature_sidebar">
@@ -136,6 +136,10 @@
           <div class="setting">
             <label for="st-del">Ask before deleting more than</label>
             <select id="st-del" data-set="max_delete_percent" data-num></select>
+          </div>
+          <div class="check">
+            <input id="st-auto" type="checkbox" data-set="auto_add_folders">
+            <label for="st-auto"><span>Automatically sync new folders added to your Koofr folder</span><span class="small muted">New folders you put there get a matching folder in Koofr. If Koofr already has one with that name, SyncHopper asks first. When this is off, SyncHopper tells you about new folders instead.</span></label>
           </div>
         </section>
         <section aria-labelledby="st-h-account" class="col gap8">

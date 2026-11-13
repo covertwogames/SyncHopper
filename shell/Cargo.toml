@@ -1,0 +1,33 @@
+# SyncHopper's entry in the Windows 11 right-click menu. Windows loads this
+# small library when someone right-clicks in File Explorer; it shows the menu
+# items and starts SyncHopper when one is picked. It is only built for the
+# release installer (see .github/workflows/release.yml).
+[package]
+name = "synchopper_shell"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows-registry = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

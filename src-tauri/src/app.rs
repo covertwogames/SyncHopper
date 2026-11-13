@@ -5,10 +5,11 @@ use crate::config::Settings;
 use crate::core::{Core, Host};
 use crate::engine::Engine;
 use crate::mount::Drive;
+use crate::newfolders::NewFolders;
 use crate::platform;
 use crate::rclone::{self, friendly_error, About, Rclone};
 use crate::uploads::Uploads;
-use crate::util::{clean_remote, now_secs};
+use crate::util::{clean_remote, file_name, norm_local, now_secs, system_folder_reason};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -19,14 +20,36 @@ use std::time::Duration;
 pub const KOOFR_PASSWORD_URL: &str = "https://app.koofr.net/app/admin/preferences/password";
 pub const WINFSP_URL: &str = "https://winfsp.dev/rel/";
 
+/// How often a failed engine download is tried again on its own.
+const ENGINE_RETRY: Duration = Duration::from_secs(5 * 60);
+
 pub struct App {
     pub core: Arc<Core>,
     pub engine: Arc<Engine>,
     pub uploads: Arc<Uploads>,
     pub drive: Arc<Drive>,
+    pub folders: Arc<NewFolders>,
     about: Mutex<Option<About>>,
+    add_request: Mutex<Option<AddRequest>>,
+    /// Whether the Windows 11 right-click entry is in use. Worked out once.
+    menu_modern: Mutex<Option<bool>>,
     started: AtomicBool,
     download_base: String,
+}
+
+/// A folder someone asked to sync from outside the main window, for example
+/// with "Sync folder to Koofr" in File Explorer. The window picks it up and
+/// opens the Add a folder dialog with it filled in.
+#[derive(Clone, Debug, Serialize)]
+pub struct AddRequest {
+    pub local: String,
+    /// Suggested Koofr folder.
+    pub remote: String,
+    /// Shown in the dialog, for example that Koofr already has this folder.
+    pub note: Option<String>,
+    /// Set when the folder can't be synced. The window shows this instead of
+    /// the dialog.
+    pub blocked: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,12 +125,16 @@ impl App {
         download_base: String,
     ) -> Arc<App> {
         let core = Core::new(data, remote_root, test_mode, host);
+        let engine = Engine::new(core.clone());
         Arc::new(App {
-            engine: Engine::new(core.clone()),
+            folders: NewFolders::new(core.clone(), engine.clone()),
+            engine,
             uploads: Uploads::new(core.clone()),
             drive: Drive::new(core.clone()),
             core,
             about: Mutex::new(None),
+            add_request: Mutex::new(None),
+            menu_modern: Mutex::new(None),
             started: AtomicBool::new(false),
             download_base,
         })
@@ -120,6 +147,7 @@ impl App {
         let mut settings = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
         if let Some(obj) = settings.as_object_mut() {
             obj.remove("pairs");
+            obj.remove("base_known");
         }
         json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -134,6 +162,8 @@ impl App {
             "drive": self.drive.view(),
             "uploads": self.uploads.views(),
             "default_ignores": crate::config::default_ignores(),
+            "folder_notices": self.folders.notices(),
+            "add_request": self.add_request.lock().unwrap().clone(),
             "now": now_secs(),
         })
     }
@@ -179,7 +209,7 @@ impl App {
         if let Some(loc) = &found {
             let s = self.core.settings();
             let due = now_secs().saturating_sub(s.engine_checked_at) > 24 * 3600;
-            if loc.managed && s.auto_update_engine && due && !self.core.test_mode {
+            if s.auto_update_engine && due && !self.core.test_mode {
                 self.core.update(|s| s.engine_checked_at = now_secs());
                 if let Ok(latest) = rclone::latest_version(&self.download_base).await {
                     let newer = rclone::version_triple(&latest) > rclone::version_triple(&loc.version);
@@ -199,7 +229,6 @@ impl App {
                 self.core.set_engine(|e| {
                     e.state = "ready".into();
                     e.version = loc.version.clone();
-                    e.managed = loc.managed;
                     e.exe = Some(loc.exe.clone());
                     e.message.clear();
                 });
@@ -211,7 +240,6 @@ impl App {
                         self.core.set_engine(|e| {
                             e.state = "ready".into();
                             e.version = loc.version.clone();
-                            e.managed = true;
                             e.exe = Some(loc.exe.clone());
                             e.message.clear();
                         });
@@ -263,6 +291,18 @@ impl App {
         self.core.log(&format!("SyncHopper {} starting", env!("CARGO_PKG_VERSION")));
         platform::kill_orphans(&self.core.config_path()).await;
         self.ensure_engine().await;
+        // If the engine could not be downloaded (for example the PC was
+        // offline), keep trying in the background instead of waiting for
+        // someone to press Try again.
+        let me = self.clone();
+        self.core.spawn(async move {
+            loop {
+                tokio::time::sleep(ENGINE_RETRY).await;
+                if me.core.engine_info().state == "error" {
+                    me.ensure_engine().await;
+                }
+            }
+        });
         if self.core.settings().setup_complete {
             self.start_services().await;
         }
@@ -272,6 +312,7 @@ impl App {
     async fn start_services(self: &Arc<Self>) {
         if !self.started.swap(true, Ordering::SeqCst) {
             self.engine.start();
+            self.folders.start();
             let me = self.clone();
             self.core.spawn(async move {
                 loop {
@@ -281,6 +322,7 @@ impl App {
             });
         } else {
             self.engine.rewatch();
+            self.folders.rewatch();
         }
         // Applied at every start so both always point at the current program
         // file, for example after an update moved it.
@@ -288,15 +330,45 @@ impl App {
         if let Err(e) = self.core.host.set_autostart(s.autostart) {
             self.core.log(&format!("Could not apply the start with Windows setting: {e}"));
         }
-        if let Some(exe) = self.core.host.exe_path() {
-            if let Err(e) = platform::set_context_menu(s.feature_context_menu, &exe).await {
-                self.core.log(&e);
-            }
+        if let Err(e) = self.apply_menu().await {
+            self.core.log(&e);
         }
         if let Err(e) = self.apply_sidebar().await {
             self.core.log(&e);
         }
         self.drive.apply().await;
+    }
+
+    /// Puts File Explorer's right-click entries in line with the settings.
+    /// On Windows 11 with a signed release the entry is in the main menu;
+    /// otherwise the classic entries are used.
+    pub async fn apply_menu(&self) -> Result<(), String> {
+        let s = self.core.settings();
+        let Some(exe) = self.core.host.exe_path() else { return Ok(()) };
+        if !cfg!(windows) || self.core.test_mode {
+            return Ok(());
+        }
+        let wanted = s.setup_complete && s.feature_context_menu;
+        let add_folder = wanted && s.feature_sync;
+        if let Err(e) = platform::set_menu_flags(wanted, add_folder, &exe).await {
+            self.core.log(&format!("Could not save the right-click menu settings: {e}"));
+        }
+        let cached = *self.menu_modern.lock().unwrap();
+        let modern = match cached {
+            Some(m) => m,
+            None => {
+                let m = match platform::ensure_menu_package(&exe, env!("CARGO_PKG_VERSION")).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        self.core.log(&format!("The Windows 11 right-click entry could not be set up, using the classic one: {e}"));
+                        false
+                    }
+                };
+                *self.menu_modern.lock().unwrap() = Some(m);
+                m
+            }
+        };
+        platform::set_legacy_menu(wanted && !modern, add_folder, &exe).await
     }
 
     /// Adds or removes the Koofr entry in File Explorer's sidebar to match
@@ -391,15 +463,18 @@ impl App {
         *self.about.lock().unwrap() = None;
         let _ = self.core.host.set_autostart(false);
         if let Some(exe) = self.core.host.exe_path() {
-            let _ = platform::set_context_menu(false, &exe).await;
             let _ = platform::set_sidebar(None, &exe).await;
         }
         self.core.update(|s| {
             s.setup_complete = false;
             s.account_email.clear();
             s.pairs.clear();
+            s.base_known.clear();
+            s.base_known_ready = false;
         });
+        let _ = self.apply_menu().await;
         self.engine.rewatch();
+        self.folders.rewatch();
         self.core.log("Disconnected from Koofr");
     }
 
@@ -424,6 +499,11 @@ impl App {
             s.feature_drive = c.feature_drive;
             s.autostart = c.autostart;
             if !base.is_empty() {
+                if norm_local(&s.base_folder) != norm_local(&base) {
+                    // A different Koofr folder: what is in it now is not new.
+                    s.base_known.clear();
+                    s.base_known_ready = false;
+                }
                 s.base_folder = base.clone();
             }
             s.setup_complete = true;
@@ -464,9 +544,9 @@ impl App {
 
     /// Saves changed settings and applies what follows from them.
     pub async fn update_settings(self: &Arc<Self>, patch: serde_json::Value) -> Result<(), String> {
-        const EDITABLE: [&str; 19] = [
+        const EDITABLE: [&str; 20] = [
             "feature_sync", "feature_drive", "drive_letter", "feature_context_menu", "feature_sidebar", "autostart",
-            "check_interval_min", "transfers", "max_delete_percent", "use_http2", "upload_limit_mbps",
+            "check_interval_min", "transfers", "max_delete_percent", "auto_add_folders", "use_http2", "upload_limit_mbps",
             "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery",
             "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app",
         ];
@@ -481,8 +561,23 @@ impl App {
         }
         let mut new: Settings = serde_json::from_value(value).map_err(|e| format!("That setting could not be read: {e}"))?;
         new.sanitize();
-        let applied = new.clone();
-        self.core.update(move |s| *s = applied);
+        // Only the editable settings are written back, so anything changed in
+        // the meantime (such as the list of folders) is kept.
+        let applied = serde_json::to_value(&new).map_err(|e| e.to_string())?;
+        self.core.update(move |s| {
+            if let Ok(mut current) = serde_json::to_value(&*s) {
+                if let (Some(target), Some(source)) = (current.as_object_mut(), applied.as_object()) {
+                    for key in EDITABLE {
+                        if let Some(v) = source.get(key) {
+                            target.insert(key.to_string(), v.clone());
+                        }
+                    }
+                }
+                if let Ok(merged) = serde_json::from_value::<Settings>(current) {
+                    *s = merged;
+                }
+            }
+        });
         let mut problems: Vec<String> = Vec::new();
 
         if old.autostart != new.autostart {
@@ -491,12 +586,11 @@ impl App {
                 problems.push(format!("Could not change the start with Windows setting: {e}"));
             }
         }
-        if old.feature_context_menu != new.feature_context_menu {
-            if let Some(exe) = self.core.host.exe_path() {
-                if let Err(e) = platform::set_context_menu(new.feature_context_menu, &exe).await {
-                    self.core.update(|s| s.feature_context_menu = old.feature_context_menu);
-                    problems.push(e);
-                }
+        if old.feature_context_menu != new.feature_context_menu || old.feature_sync != new.feature_sync {
+            if let Err(e) = self.apply_menu().await {
+                self.core.update(|s| s.feature_context_menu = old.feature_context_menu);
+                let _ = self.apply_menu().await;
+                problems.push(e);
             }
         }
         if old.feature_sync != new.feature_sync {
@@ -504,6 +598,7 @@ impl App {
                 self.engine.stop_all();
             }
             self.engine.rewatch();
+            self.folders.rewatch();
         }
         if old.feature_sidebar != new.feature_sidebar || old.feature_sync != new.feature_sync {
             if let Err(e) = self.apply_sidebar().await {
@@ -586,13 +681,20 @@ impl App {
     /// right-click entry sends. Returns true when uploads were queued.
     pub fn handle_args(self: &Arc<Self>, args: &[String]) -> bool {
         let mut paths = Vec::new();
+        let mut add = None;
         let mut iter = args.iter();
         while let Some(a) = iter.next() {
             if a == "--upload" {
                 if let Some(p) = iter.next() {
                     paths.push(p.clone());
                 }
+            } else if a == "--add-folder" {
+                add = iter.next().cloned();
             }
+        }
+        if let Some(folder) = add {
+            self.request_add_folder(&folder);
+            return true;
         }
         if paths.is_empty() {
             return false;
@@ -605,6 +707,60 @@ impl App {
         self.uploads.add(paths, &s.upload_dest);
         self.core.host.show_window(Some("upload"));
         true
+    }
+
+    /// Asks the window to offer syncing `folder`, with the Add a folder
+    /// dialog filled in, or to explain why it can't be synced.
+    pub fn request_add_folder(self: &Arc<Self>, folder: &str) {
+        let s = self.core.settings();
+        if !s.setup_complete {
+            self.core.host.show_window(None);
+            return;
+        }
+        let local = folder.trim().to_string();
+        let name = file_name(&local);
+        let nl = norm_local(&local);
+        let sep = std::path::MAIN_SEPARATOR;
+        let holds = |outer: &str, inner: &str| inner == outer || (inner.starts_with(outer) && inner[outer.len()..].starts_with(sep));
+        let base = s.base_folder.trim();
+        let blocked = if !s.feature_sync {
+            Some("Syncing folders is turned off. Turn it on in Settings first.".to_string())
+        } else if !base.is_empty() && norm_local(base) == nl {
+            Some(if s.auto_add_folders {
+                "This is your Koofr folder, where your synced folders live. New folders you put in it sync by themselves.".to_string()
+            } else {
+                "This is your Koofr folder, where your synced folders live. Pick a folder inside it to sync.".to_string()
+            })
+        } else if let Some(p) = s.pairs.iter().find(|p| holds(&norm_local(&p.local), &nl)) {
+            Some(if norm_local(&p.local) == nl {
+                format!("\"{name}\" is already synced with Koofr.")
+            } else {
+                format!("This folder is inside \"{}\", which is already synced with Koofr.", file_name(&p.local))
+            })
+        } else if let Some(p) = s.pairs.iter().find(|p| holds(&nl, &norm_local(&p.local))) {
+            Some(format!("This folder holds \"{}\", which is already synced with Koofr. Pick a folder that doesn't overlap it.", file_name(&p.local)))
+        } else if let Some(why) = system_folder_reason(&local, cfg!(windows), &|n| std::env::var(n).ok()) {
+            Some(why)
+        } else if !Path::new(&local).is_dir() {
+            Some("That folder doesn't exist any more.".to_string())
+        } else {
+            None
+        };
+        let note = self
+            .folders
+            .notices()
+            .into_iter()
+            .find(|n| n.kind == "clash" && norm_local(&n.local) == nl)
+            .map(|n| n.message);
+        *self.add_request.lock().unwrap() = Some(AddRequest { local, remote: name, note, blocked });
+        self.core.host.show_window(None);
+        self.core.host.state_changed();
+    }
+
+    /// The window took the request.
+    pub fn clear_add_request(&self) {
+        *self.add_request.lock().unwrap() = None;
+        self.core.host.state_changed();
     }
 
     pub fn set_upload_dest(&self, dest: &str) {
@@ -623,7 +779,7 @@ impl App {
         let mut out = String::new();
         out.push_str(&format!("SyncHopper {}\n", env!("CARGO_PKG_VERSION")));
         out.push_str(&format!("System: {} {}\n", std::env::consts::OS, std::env::consts::ARCH));
-        out.push_str(&format!("Sync engine: rclone {} ({}, {})\n", e.version, e.state, if e.managed { "app copy" } else { "found on this PC" }));
+        out.push_str(&format!("Sync engine: rclone {} ({})\n", e.version, e.state));
         out.push_str(&format!("Account: {}\n", mask_email(&s.account_email)));
         out.push_str(&format!(
             "Features: sync {}, drive {} ({}), right-click {}, sidebar {}, start with Windows {}, app updates {}\n",

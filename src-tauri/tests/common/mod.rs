@@ -154,6 +154,8 @@ pub async fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
 ///   would touch one of these paths (because it is not left out yet) syncs
 ///   everything else, then reports these files as failed.
 /// - `locked.list`: absolute paths made unreadable to the engine.
+/// - `listing_error`: every two-way sync fails with this message (written
+///   JSON-escaped), as when a folder listing fails.
 ///
 /// Returns None when the test machine can't run it.
 #[cfg(unix)]
@@ -187,6 +189,13 @@ done
 if [ -f "$R/outage" ]; then
   echo '{{"level":"error","msg":"error reading destination root directory: Invalid response status! Got 500, expected [200 206]"}}' >&2
   echo '{{"level":"error","msg":"Bisync critical error: Invalid response status! Got 500, expected [200 206]"}}' >&2
+  echo '{{"level":"error","msg":"Bisync aborted. Error is retryable without --resync due to --resilient mode."}}' >&2
+  exit 7
+fi
+if [ -f "$R/listing_error" ]; then
+  m=$(cat "$R/listing_error")
+  echo '{{"level":"error","msg":"'"$m"'"}}' >&2
+  echo '{{"level":"error","msg":"Bisync critical error: '"$m"'"}}' >&2
   echo '{{"level":"error","msg":"Bisync aborted. Error is retryable without --resync due to --resilient mode."}}' >&2
   exit 7
 fi

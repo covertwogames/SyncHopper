@@ -237,6 +237,13 @@ async fn a_missing_pc_folder_is_an_error_and_koofr_is_untouched() {
     write(&rig.pc("Docs/b.txt"), "b");
     let id = rig.pair("Docs").await;
     std::fs::rename(rig.pc("Docs"), rig.pc("Docs-moved")).unwrap();
+    let notes_before = rig.host.notes.lock().unwrap().len();
+    // Right after it disappears it may just have been renamed, so it isn't
+    // reported straight away.
+    rig.sync(&id).await;
+    assert_eq!(rig.phase(&id), Phase::Ok, "{}", rig.dump(&id));
+    assert_eq!(rig.host.notes.lock().unwrap().len(), notes_before);
+    rig.app.engine.expire_missing_grace(&id);
     rig.sync(&id).await;
     assert_eq!(rig.phase(&id), Phase::Error);
     assert!(rig.view(&id).error.unwrap().contains("missing on this PC"));

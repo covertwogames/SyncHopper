@@ -225,6 +225,75 @@ pub fn go_unquote(text: &str) -> String {
     out
 }
 
+/// Why a folder must not be synced, or None when it is fine. Covers Windows'
+/// own folders, program folders and the folders that hold program settings.
+/// `windows` and `env` are passed in so the rules can be tested anywhere.
+pub fn system_folder_reason(path: &str, windows: bool, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let sep = if windows { '\\' } else { '/' };
+    let norm = |p: &str| {
+        let mut p = if windows { p.replace('/', "\\").to_lowercase() } else { p.to_string() };
+        while p.len() > 1 && p.ends_with(sep) {
+            p.pop();
+        }
+        p
+    };
+    let path = norm(path);
+    let inside = |outer: &str| path == outer || (path.starts_with(outer) && path[outer.len()..].starts_with(sep));
+    const SYSTEM: &str = "That's a Windows system folder. Syncing it could break programs or Windows itself. Pick a folder of your own.";
+    const PROGRAMS: &str = "That folder holds installed programs. Syncing it could break them. Pick a folder of your own.";
+    const SETTINGS: &str = "That folder holds settings files that programs keep open all the time. Pick a folder of your own instead.";
+    const PROFILE: &str = "That's your whole user folder, which includes settings files Windows keeps locked. Pick a folder inside it instead, like Documents.";
+    const USERS: &str = "That folder holds every user account on this PC. Pick a folder of your own.";
+    if windows {
+        let var = |name: &str| env(name).map(|v| norm(&v)).filter(|v| v.len() > 3);
+        if let Some(dir) = var("SystemRoot").or_else(|| var("windir")) {
+            if inside(&dir) {
+                return Some(SYSTEM.into());
+            }
+        }
+        for name in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+            if let Some(dir) = var(name) {
+                if inside(&dir) {
+                    return Some(PROGRAMS.into());
+                }
+            }
+        }
+        if let Some(home) = var("USERPROFILE") {
+            if path == home {
+                return Some(PROFILE.into());
+            }
+            let app_data = format!("{home}\\appdata");
+            for exact in [app_data.clone(), format!("{app_data}\\local"), format!("{app_data}\\locallow"), format!("{app_data}\\roaming")] {
+                if path == exact {
+                    return Some(SETTINGS.into());
+                }
+            }
+            if let Some(users) = home.rfind('\\').map(|i| home[..i].to_string()).filter(|u| u.len() > 3) {
+                if path == users {
+                    return Some(USERS.into());
+                }
+            }
+        }
+        for name in ["APPDATA", "LOCALAPPDATA"] {
+            if var(name).is_some_and(|dir| path == dir) {
+                return Some(SETTINGS.into());
+            }
+        }
+    } else {
+        for dir in ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/sbin", "/sys", "/usr", "/var", "/System", "/Library", "/Applications"] {
+            if inside(dir) {
+                return Some("That's a system folder. Syncing it could break programs. Pick a folder of your own.".into());
+            }
+        }
+        if let Some(home) = env("HOME").map(|h| norm(&h)).filter(|h| h.len() > 1) {
+            if path == home {
+                return Some("That's your whole home folder, which includes settings files programs keep open. Pick a folder inside it instead, like Documents.".into());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +346,40 @@ mod tests {
     #[test]
     fn ansi() {
         assert_eq!(strip_ansi("\u{1b}[31mBisync aborted.\u{1b}[0m"), "Bisync aborted.");
+    }
+
+    #[test]
+    fn system_folders() {
+        let env = |name: &str| match name {
+            "SystemRoot" => Some(r"C:\Windows".to_string()),
+            "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+            "ProgramFiles(x86)" => Some(r"C:\Program Files (x86)".to_string()),
+            "ProgramData" => Some(r"C:\ProgramData".to_string()),
+            "USERPROFILE" => Some(r"C:\Users\Robert".to_string()),
+            "APPDATA" => Some(r"C:\Users\Robert\AppData\Roaming".to_string()),
+            "LOCALAPPDATA" => Some(r"C:\Users\Robert\AppData\Local".to_string()),
+            _ => None,
+        };
+        let why = |p: &str| system_folder_reason(p, true, &env);
+        assert!(why(r"C:\Windows").is_some());
+        assert!(why(r"c:\windows\System32\").is_some());
+        assert!(why(r"C:\Program Files\SyncHopper").is_some());
+        assert!(why(r"C:\Program Files (x86)").is_some());
+        assert!(why(r"C:\ProgramData\Thing").is_some());
+        assert!(why(r"C:\Users\Robert").unwrap().contains("whole user folder"));
+        assert!(why(r"C:\Users").is_some());
+        assert!(why(r"C:\Users\Robert\AppData").is_some());
+        assert!(why(r"C:\Users\Robert\AppData\Roaming").is_some());
+        assert!(why(r"C:\Users\Robert\AppData\Local\").is_some());
+        // Ordinary folders, including ones that only start with the same letters.
+        assert!(why(r"C:\Users\Robert\Documents").is_none());
+        assert!(why(r"C:\Users\Robert\AppData\Roaming\SomeGame\Saves").is_none());
+        assert!(why(r"C:\WindowsStuff").is_none());
+        assert!(why(r"D:\Program Files backup").is_none());
+        assert!(why(r"C:\Users\Robert\Koofr\Taxes").is_none());
+        let unix = |name: &str| if name == "HOME" { Some("/home/robert".to_string()) } else { None };
+        assert!(system_folder_reason("/etc/ssh", false, &unix).is_some());
+        assert!(system_folder_reason("/home/robert/", false, &unix).is_some());
+        assert!(system_folder_reason("/home/robert/Documents", false, &unix).is_none());
     }
 }

@@ -121,8 +121,10 @@ async fn settings_changes_are_limited_cleaned_and_restorable() {
     assert_eq!(s.notify_level, "errors");
     assert!(rig.app.update_settings(serde_json::json!({ "transfers": "many" })).await.is_err());
 
-    rig.app.update_settings(serde_json::json!({ "feature_sidebar": false, "auto_update_app": false })).await.unwrap();
+    assert!(rig.app.core.settings().auto_add_folders, "new folders sync by themselves unless turned off");
+    rig.app.update_settings(serde_json::json!({ "feature_sidebar": false, "auto_update_app": false, "auto_add_folders": false })).await.unwrap();
     assert!(!rig.app.core.settings().feature_sidebar && !rig.app.core.settings().auto_update_app);
+    assert!(!rig.app.core.settings().auto_add_folders);
 
     rig.app.restore_defaults().await.unwrap();
     let s = rig.app.core.settings();
@@ -132,6 +134,7 @@ async fn settings_changes_are_limited_cleaned_and_restorable() {
     assert_eq!(s.conflict_policy, "keep_both");
     assert_eq!(s.upload_limit_mbps, 0.0);
     assert_eq!(s.check_interval_min, 30, "basic sync options are not part of restore defaults");
+    assert!(!s.auto_add_folders, "neither is syncing new folders by themselves");
 
     // Saved to disk, so it survives a restart.
     let saved = synchopper_lib::config::load(&rig.app.core.data.join("settings.json"));

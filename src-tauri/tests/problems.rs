@@ -223,3 +223,42 @@ async fn a_failed_transfer_is_retried_without_undoing_deletes() {
     let log = std::fs::read_to_string(rig.app.core.log_path()).unwrap();
     assert_eq!(log.matches("rebuilding the sync record").count(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_dropped_while_the_pc_slept_just_waits_for_koofr() {
+    let rig = Rig::new();
+    write(&rig.pc("Apps/a.txt"), "a");
+    let id = rig.pair("Apps").await;
+    let Some(_) = fake_engine(&rig, false) else { return };
+    let notes_before = rig.host.notes.lock().unwrap().len();
+    // What Windows reported after the laptop woke up.
+    set_flag(
+        &rig,
+        "listing_error",
+        Some(r#"error reading destination directory: Get \"https://app.koofr.net/api/v2/mounts/x/files/list?path=%2FApps\": write tcp 192.168.1.76:51559->176.9.109.126:443: wsasend: An existing connection was forcibly closed by the remote host."#),
+    );
+    rig.sync(&id).await;
+    let v = rig.view(&id);
+    assert_eq!(v.phase, Phase::Waiting, "{}", rig.dump(&id));
+    assert_eq!(v.waiting.as_deref(), Some("Can't connect to Koofr right now."));
+    assert!(v.error.is_none());
+    assert_eq!(rig.host.notes.lock().unwrap().len(), notes_before, "no notification for a single dropped connection");
+    assert_eq!(rig.app.status_line(), "SyncHopper: waiting for Koofr");
+    set_flag(&rig, "listing_error", None);
+    rig.sync(&id).await;
+    assert_eq!(rig.phase(&id), Phase::Ok, "{}", rig.dump(&id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_error_nobody_recognises_gets_a_plain_headline() {
+    let rig = Rig::new();
+    write(&rig.pc("Docs/a.txt"), "a");
+    let id = rig.pair("Docs").await;
+    let Some(_) = fake_engine(&rig, false) else { return };
+    set_flag(&rig, "listing_error", Some("the flux capacitor ran out of jiggawatts"));
+    rig.sync(&id).await;
+    let v = rig.view(&id);
+    assert_eq!(v.phase, Phase::Error, "{}", rig.dump(&id));
+    assert_eq!(v.error.as_deref(), Some(synchopper_lib::engine::UNEXPECTED));
+    assert!(v.details.iter().any(|d| d.contains("flux capacitor")), "the engine's own words stay under the technical details: {:?}", v.details);
+}
