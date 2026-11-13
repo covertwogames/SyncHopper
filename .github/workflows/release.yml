@@ -52,9 +52,13 @@ jobs:
         with:
           node-version: 22
 
+      # The sign tool runs on .NET 10; Microsoft's signing plug-in for
+      # SignTool may want .NET 8.
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -147,6 +151,9 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
+      # The identity package is signed with SignTool and Microsoft's Artifact
+      # Signing plug-in. The sign tool used everywhere else unpacks and repacks
+      # packages, which fails for this kind (it points at files outside it).
       - name: Sign the right-click entry and package its identity
         shell: pwsh
         run: |
@@ -172,13 +179,35 @@ jobs:
           $text = Get-Content $manifest -Raw
           $text = $text.Replace("{{PUBLISHER}}", [System.Security.SecurityElement]::Escape($publisher)).Replace("{{VERSION}}", "$env:VERSION.0")
           Set-Content -Path $manifest -Value $text -Encoding utf8NoBOM
-          $makeappx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" |
-            Sort-Object { try { [version]$_.Directory.Parent.Name } catch { [version]"0.0" } } -Descending | Select-Object -First 1
-          if (-not $makeappx) { Write-Error "MakeAppx was not found."; exit 1 }
+          function Find-SdkTool($name) {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\$name" |
+              Sort-Object { try { [version]$_.Directory.Parent.Name } catch { [version]"0.0" } } -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          $makeappx = Find-SdkTool "makeappx.exe"
+          $signtool = Find-SdkTool "signtool.exe"
+          if (-not $makeappx -or -not $signtool) { Write-Error "MakeAppx or SignTool was not found."; exit 1 }
           $msix = Join-Path (Resolve-Path src-tauri/menu-build) "SyncHopper.msix"
-          & $makeappx.FullName pack /d $stage /p $msix /nv /o
+          & $makeappx pack /d $stage /p $msix /nv /o
           if ($LASTEXITCODE -ne 0) { Write-Error "Packing the identity package failed."; exit 1 }
-          Sign-File $msix
+          $client = Join-Path $env:RUNNER_TEMP "signing-client"
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ArtifactSigning.Client/1.0.151" -OutFile "$client.zip"
+          Expand-Archive -Path "$client.zip" -DestinationPath $client -Force
+          $dlib = Join-Path $client "bin\x64\Azure.CodeSigning.Dlib.dll"
+          if (-not (Test-Path $dlib)) { Write-Error "The Artifact Signing plug-in was not found in the download."; exit 1 }
+          $metadata = Join-Path $env:RUNNER_TEMP "signing-metadata.json"
+          @{
+            Endpoint               = $env:SIGN_ENDPOINT.TrimEnd("/")
+            CodeSigningAccountName = $env:SIGN_ACCOUNT
+            CertificateProfileName = $env:SIGN_PROFILE
+            ExcludeCredentials     = @(
+              "ManagedIdentityCredential", "WorkloadIdentityCredential", "SharedTokenCacheCredential",
+              "VisualStudioCredential", "VisualStudioCodeCredential", "AzurePowerShellCredential",
+              "AzureDeveloperCliCredential", "InteractiveBrowserCredential"
+            )
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8NoBOM
+          & $signtool sign /v /fd SHA256 /tr "http://timestamp.acs.microsoft.com" /td SHA256 /dlib $dlib /dmdf $metadata $msix
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing the identity package failed."; exit 1 }
 
       - name: Build and sign the installer
         shell: pwsh
