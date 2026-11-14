@@ -5,7 +5,7 @@
 use crate::config::{same_state, FileState, Pair, Settings, Skipped};
 use crate::core::{Core, Notice};
 use crate::platform;
-use crate::rclone::{friendly_error, friendly_known, is_network_error, LogLine, Rclone, RunResult, Stats};
+use crate::rclone::{friendly_error, friendly_known, is_blocked_message, is_network_error, LogLine, Rclone, RunResult, Stats};
 use crate::util::{clean_remote, file_name, glob_match, go_unquote, new_id, norm_local, now_secs, parse_time_ns, paths_overlap, system_folder_reason, Cancel};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -279,7 +279,10 @@ pub fn issue_kind(msg: &str) -> &'static str {
     let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
     // An HTTP status code standing on its own, not part of a longer number.
     let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
-    if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
+    if is_blocked_message(msg) {
+        // The system won't run the engine. Not about any file or folder.
+        "blocked"
+    } else if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
         "auth"
     } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
         "quota"
@@ -1202,6 +1205,9 @@ impl Engine {
     /// Koofr is down or out of reach. Nothing is blamed on any file; the
     /// folder simply tries again later.
     fn wait_outage(&self, pair: &Pair, interval_min: u32, kind: &str, raw: String, details: Vec<String>) {
+        if kind == "blocked" || is_blocked_message(&raw) {
+            return self.engine_blocked(pair, interval_min, &raw);
+        }
         let msg = if kind == "network" {
             "Can't connect to Koofr right now."
         } else {
@@ -1230,6 +1236,38 @@ impl Engine {
         }
     }
 
+    /// The system refused to run the sync engine. That is not this folder's
+    /// fault: the folder keeps the state it had, and the app reports the
+    /// block once for everything (see `Core::engine_blocked`).
+    fn engine_blocked(&self, pair: &Pair, interval_min: u32, raw: &str) {
+        self.core.log(&format!("[{}] Not synced: the sync engine was blocked", pair.local));
+        self.core.engine_blocked(raw);
+        let synced_before = pair.last_sync > 0;
+        self.finish(&pair.id, interval_min, |rt| {
+            if rt.phase != Phase::Approval {
+                rt.phase = if rt.error.is_some() {
+                    Phase::Error
+                } else if synced_before {
+                    Phase::Ok
+                } else {
+                    Phase::Idle
+                };
+            }
+        });
+    }
+
+    /// The sync engine runs again after being unavailable, so every folder
+    /// is checked soon instead of at its usual time.
+    pub fn engine_back(&self) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for rt in inner.rt.values_mut() {
+                rt.next_due = None;
+            }
+        }
+        self.core.host.state_changed();
+    }
+
     /// Stops a folder with one of SyncHopper's own messages.
     fn fail(&self, pair: &Pair, interval_min: u32, message: String, details: Vec<String>) {
         let friendly = friendly_error(&message);
@@ -1248,6 +1286,9 @@ impl Engine {
     }
 
     fn fail_with(&self, pair: &Pair, interval_min: u32, friendly: String, message: &str, details: Vec<String>) {
+        if is_blocked_message(message) || is_blocked_message(&friendly) {
+            return self.engine_blocked(pair, interval_min, message);
+        }
         self.core.log(&format!("[{}] FAILED: {}", pair.local, message));
         let mut first = false;
         self.finish(&pair.id, interval_min, |rt| {
@@ -1489,6 +1530,11 @@ impl Engine {
                 Err(e) if e == "cancelled" => break,
                 Err(e) => {
                     let mut kind = issue_kind(&e);
+                    if kind == "blocked" {
+                        // Nothing to do with this file: leave it as it was.
+                        outage = Some((kind.to_string(), e));
+                        continue;
+                    }
                     if outage_kind(kind) && !still_locked {
                         outage = Some((kind.to_string(), e.clone()));
                     }
@@ -1762,6 +1808,11 @@ impl Engine {
                     return self.fail(&pair, interval, msg, vec![]);
                 }
                 Verdict::Failed { must_resync, files, message, details } => {
+                    // The system refused to run the engine: nothing happened
+                    // to this folder, so nothing about it is changed.
+                    if is_blocked_message(&message) {
+                        return self.engine_blocked(&pair, interval, &message);
+                    }
                     // rclone locks a folder after most failures and wants a
                     // full rebuild. After an ordinary sync the last good
                     // record can be put back instead, so nothing that was
@@ -1935,6 +1986,11 @@ mod tests {
         assert_eq!(issue_kind("unexpected status code 401"), "auth");
         assert_eq!(issue_kind("insufficient storage (507)"), "quota");
         assert_eq!(issue_kind("Failed to copy IMG_15001.jpg: odd"), "unknown");
+        // A blocked engine is never taken for a file or Koofr problem, even
+        // though the system's wording can sound like one.
+        let blocked = format!("{} (/x/rclone): Permission denied (os error 13)", crate::rclone::BLOCKED_PREFIX);
+        assert_eq!(issue_kind(&blocked), "blocked");
+        assert_eq!(issue_kind(crate::rclone::BLOCKED_TEXT), "blocked");
         assert_eq!(retry_delay("server", 1), 300);
         assert_eq!(retry_delay("server", 9), 3600);
         assert!(retry_delay("permanent", 1) > 10 * 365 * 86_400);

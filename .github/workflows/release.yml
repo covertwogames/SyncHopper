@@ -14,6 +14,10 @@
 #     and the Windows 11 right-click entry with its identity package.
 #   - The update signature, which installed copies check before updating.
 #
+# Release builds download the sync engine (rclone) signed by Cover Two from
+# the "engine" release, which engine.yml publishes and keeps current. This
+# workflow stops early if that isn't published yet.
+#
 # One-time setup in the repository's Settings:
 #   Environments: an environment named "release"
 #   Secrets and variables > Actions:
@@ -86,6 +90,27 @@ jobs:
             exit 1
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Release builds only download the signed sync engine (engine.yml
+      # publishes it), so make sure it is there before releasing.
+      - name: Check the signed sync engine is published
+        shell: pwsh
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/engine"
+          $help = "The signed sync engine isn't published yet. Run the Sync engine workflow first (Actions > Sync engine > Run workflow), then run this one again."
+          $check = Join-Path $env:RUNNER_TEMP "engine-check"
+          New-Item -ItemType Directory -Force -Path $check | Out-Null
+          try {
+            Invoke-WebRequest -Uri "$base/engine.json" -OutFile "$check/engine.json"
+            Invoke-WebRequest -Uri "$base/engine.json.sig" -OutFile "$check/engine.json.sig"
+          } catch {
+            Write-Error "$help ($($_.Exception.Message))"
+            exit 1
+          }
+          $list = Get-Content "$check/engine.json" -Raw | ConvertFrom-Json
+          $file = $list.files."windows-amd64"
+          if (-not $file -or -not $file.name) { Write-Error "The published engine list has no Windows engine. $help"; exit 1 }
+          Write-Host "Signed sync engine: rclone $($list.version) ($($file.name))"
 
       - name: Install build tools
         shell: pwsh

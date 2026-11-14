@@ -2,7 +2,7 @@
 //! saved settings, the sync engine program and the log file.
 
 use crate::config::{self, Pair, Settings};
-use crate::rclone::Rclone;
+use crate::rclone::{self, Rclone};
 use crate::util::now_secs;
 use serde::Serialize;
 use std::io::Write;
@@ -36,9 +36,12 @@ pub enum Notice {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct EngineInfo {
-    /// "checking", "ready", "missing", "downloading" or "error".
+    /// "checking", "ready", "missing", "downloading", "error" or "blocked"
+    /// (Windows refuses to run it).
     pub state: String,
     pub version: String,
+    /// True for a copy signed by Cover Two, from the signed engine channel.
+    pub signed: bool,
     pub percent: u8,
     pub message: String,
 
@@ -54,6 +57,9 @@ pub struct Core {
     pub host: Arc<dyn Host>,
     settings: Mutex<Settings>,
     engine: Mutex<EngineInfo>,
+    /// Set once the user has been told the engine is blocked, until it runs
+    /// again, so they hear it once and not every time it is retried.
+    blocked_told: std::sync::atomic::AtomicBool,
     log_lock: Mutex<()>,
     runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
@@ -69,6 +75,7 @@ impl Core {
             host,
             settings: Mutex::new(settings),
             engine: Mutex::new(EngineInfo { state: "checking".into(), ..Default::default() }),
+            blocked_told: std::sync::atomic::AtomicBool::new(false),
             log_lock: Mutex::new(()),
             runtime: std::sync::OnceLock::new(),
         })
@@ -137,6 +144,32 @@ impl Core {
         self.host.state_changed();
     }
 
+    /// The system refused to run the sync engine. Nothing syncs until it
+    /// runs again, and the user is told once, not once per folder.
+    pub fn engine_blocked(&self, raw: &str) {
+        let changed = {
+            let mut e = self.engine.lock().unwrap();
+            let changed = e.state != "blocked";
+            e.state = "blocked".into();
+            e.exe = None;
+            e.percent = 0;
+            e.message = rclone::BLOCKED_TEXT.into();
+            changed
+        };
+        if changed {
+            self.log(&format!("The sync engine can't run: {raw}"));
+        }
+        if !self.blocked_told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.notify(Notice::Problem, "SyncHopper can't sync", rclone::BLOCKED_TEXT);
+        }
+        self.host.state_changed();
+    }
+
+    /// The engine runs again, so a later block is worth telling about.
+    pub fn engine_runs_again(&self) {
+        self.blocked_told.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn config_path(&self) -> PathBuf {
         self.data.join("rclone.conf")
     }
@@ -146,13 +179,12 @@ impl Core {
     }
 
     pub fn rclone(&self) -> Result<Rclone, String> {
-        let exe = self
-            .engine
-            .lock()
-            .unwrap()
-            .exe
-            .clone()
-            .ok_or_else(|| "The sync engine is not installed yet.".to_string())?;
+        let info = self.engine.lock().unwrap().clone();
+        let exe = match info.exe {
+            Some(exe) => exe,
+            None if info.state == "blocked" => return Err(info.message),
+            None => return Err("The sync engine is not installed yet.".to_string()),
+        };
         Ok(Rclone { exe, config: self.config_path(), cache: self.cache_dir() })
     }
 

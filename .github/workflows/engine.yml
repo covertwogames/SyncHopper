@@ -1,0 +1,255 @@
+# Publishes the sync engine SyncHopper uses: rclone, signed with Cover Two's
+# Azure Artifact Signing certificate. rclone itself isn't code signed, and
+# Windows Smart App Control blocks programs that aren't, so SyncHopper only
+# runs these signed copies.
+#
+# Runs every day. When rclone has a new release it:
+#   1. downloads it from rclone.org and checks it against rclone's own
+#      checksums, which rclone signs with its release key (PGP, fingerprint
+#      below; see https://rclone.org/release_signing/)
+#   2. signs rclone.exe with Cover Two's certificate
+#   3. publishes it to the "engine" release of this repository, with
+#      rclone's license and engine.json, the list SyncHopper reads.
+#      engine.json is signed with the same key as SyncHopper's own updates,
+#      and SyncHopper checks that signature and each file's checksum.
+#
+# Installed copies of SyncHopper pick up a new engine by themselves within a
+# day; no app update is needed.
+#
+# To run it by hand: Actions > Sync engine > Run workflow. Tick "force" to
+# sign and publish the current rclone version again.
+#
+# Uses the same settings as release.yml: the "release" environment, the
+# AZURE_CLIENT_ID and AZURE_TENANT_ID variables, and the
+# TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets.
+
+name: Sync engine
+
+on:
+  schedule:
+    - cron: "41 9 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Sign and publish again even if this rclone version is already published"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-engine
+  cancel-in-progress: false
+
+env:
+  ENGINE_TAG: engine
+  RCLONE_KEY: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.find.outputs.publish }}
+      version: ${{ steps.find.outputs.version }}
+    steps:
+      - name: Find the newest rclone release
+        id: find
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsSL --retry 3 https://downloads.rclone.org/version.txt | tr -d '\r\n')
+          version=${latest#rclone v}
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::rclone.org reported an unexpected version: $latest"
+            exit 1
+          fi
+          published=none
+          if curl -fsSL --retry 3 -o published.json "https://github.com/${GITHUB_REPOSITORY}/releases/download/${ENGINE_TAG}/engine.json"; then
+            published=$(jq -r '.version // "none"' published.json)
+          fi
+          echo "rclone.org has $version. Published: $published."
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$published" = "$version" ] && [ "${FORCE:-false}" != "true" ]; then
+            echo "Already published. Nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download rclone and check it against rclone's signed checksums
+        if: steps.find.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.find.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip="rclone-v${VERSION}-windows-amd64.zip"
+          base="https://downloads.rclone.org/v${VERSION}"
+          curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          curl -fsSL --retry 3 -o "$zip" "$base/$zip"
+          curl -fsSL --retry 3 -o KEYS https://rclone.org/KEYS
+
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          gpg --batch --quiet --import KEYS
+          # Only the part covered by the signature is written out, so nothing
+          # added to the file outside the signature can slip through.
+          gpg --batch --status-file gpg-status.txt --output SHA256SUMS.verified --decrypt SHA256SUMS
+          cat gpg-status.txt
+          # VALIDSIG <signing key> ... <primary key>: the signature must be
+          # good and made with rclone's release key.
+          if ! awk -v key="$RCLONE_KEY" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == key || $NF == key) { found = 1 } END { exit !found }' gpg-status.txt; then
+            echo "::error::SHA256SUMS is not signed with rclone's release key $RCLONE_KEY."
+            exit 1
+          fi
+
+          expected=$(awk -v f="$zip" '$2 == f { print $1 }' SHA256SUMS.verified)
+          if ! [[ "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::$zip is not listed in rclone's signed checksums."
+            exit 1
+          fi
+          echo "${expected}  ${zip}" | sha256sum -c -
+
+          mkdir -p out
+          unzip -j -o "$zip" "rclone-v${VERSION}-windows-amd64/rclone.exe" -d out
+          test -s out/rclone.exe
+          curl -fsSL --retry 3 -o out/rclone-COPYING.txt "https://raw.githubusercontent.com/rclone/rclone/v${VERSION}/COPYING"
+          test -s out/rclone-COPYING.txt
+          sha256sum out/*
+
+      - name: Hand the checked files to the signing job
+        if: steps.find.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-checked
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  sign:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      SIGN_ENDPOINT: https://eus.codesigning.azure.net/
+      SIGN_ACCOUNT: CoverTwoSigning
+      SIGN_PROFILE: CoverTwo
+      TIMESTAMP_URL: http://timestamp.digicert.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Check the settings
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace("${{ vars.AZURE_CLIENT_ID }}")) { $missing += "AZURE_CLIENT_ID" }
+          if ([string]::IsNullOrWhiteSpace("${{ vars.AZURE_TENANT_ID }}")) { $missing += "AZURE_TENANT_ID" }
+          if ($missing.Count -gt 0) {
+            Write-Error "These variables are not set in the repository settings: $($missing -join ', ')"
+            exit 1
+          }
+
+      - name: Install tools
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dotnet tool install --tool-path "$env:RUNNER_TEMP\sign" --prerelease sign
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "SIGN_EXE=$env:RUNNER_TEMP\sign\sign.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rclone-checked
+          path: engine
+
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Sign rclone
+        shell: pwsh
+        run: |
+          az account get-access-token --scope "https://codesigning.azure.net/.default" --output none
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not get permission to sign from Azure."; exit 1 }
+          $exe = (Resolve-Path engine/rclone.exe).Path
+          & $env:SIGN_EXE code artifact-signing --verbosity warning --timestamp-url $env:TIMESTAMP_URL `
+            --artifact-signing-endpoint $env:SIGN_ENDPOINT --artifact-signing-account $env:SIGN_ACCOUNT `
+            --artifact-signing-certificate-profile $env:SIGN_PROFILE --azure-credential-type azure-cli $exe
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing rclone failed."; exit 1 }
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "rclone.exe: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { Write-Error "rclone's signature is not valid: $($sig.StatusMessage)"; exit 1 }
+          if ($sig.SignerCertificate.Subject -notlike "*Cover Two*") { Write-Error "rclone was signed with an unexpected certificate."; exit 1 }
+          # Still the real rclone, and the version it claims to be.
+          $out = & $exe version
+          if ($LASTEXITCODE -ne 0) { Write-Error "The signed rclone does not run."; exit 1 }
+          Write-Host ($out | Select-Object -First 1)
+          if (($out | Select-Object -First 1) -ne "rclone v$env:VERSION") { Write-Error "The signed rclone reports the wrong version."; exit 1 }
+
+      - name: Write and sign the engine list
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory -Force -Path publish | Out-Null
+          $exeName = "rclone-v$env:VERSION-windows-amd64.exe"
+          Copy-Item engine/rclone.exe "publish/$exeName"
+          Copy-Item engine/rclone-COPYING.txt "publish/rclone-COPYING.txt"
+          function Describe($name) {
+            $path = "publish/$name"
+            [ordered]@{
+              name   = $name
+              sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              size   = [int64](Get-Item $path).Length
+            }
+          }
+          $list = [ordered]@{
+            version = $env:VERSION
+            files   = [ordered]@{ "windows-amd64" = (Describe $exeName) }
+            license = (Describe "rclone-COPYING.txt")
+          }
+          $list | ConvertTo-Json -Depth 5 | Set-Content -Path publish/engine.json -Encoding utf8NoBOM
+          Get-Content publish/engine.json
+          npx tauri signer sign publish/engine.json
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing the engine list failed."; exit 1 }
+          if (-not (Test-Path publish/engine.json.sig)) { Write-Error "The engine list's signature was not written."; exit 1 }
+          Get-ChildItem publish
+
+      # The program and license go up first, so the list never names a file
+      # that isn't there yet.
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:ENGINE_TAG 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:ENGINE_TAG --prerelease --latest=false --title "Sync engine (rclone)" `
+              --notes "rclone, signed by Cover Two Strategies LLC, for SyncHopper to download. Not an app release: get SyncHopper from the latest release."
+            if ($LASTEXITCODE -ne 0) { Write-Error "Creating the engine release failed."; exit 1 }
+          }
+          gh release upload $env:ENGINE_TAG "publish/rclone-v$env:VERSION-windows-amd64.exe" publish/rclone-COPYING.txt --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Error "Uploading rclone failed."; exit 1 }
+          gh release upload $env:ENGINE_TAG publish/engine.json.sig publish/engine.json --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Error "Uploading the engine list failed."; exit 1 }
+          Write-Host "Published rclone $env:VERSION."

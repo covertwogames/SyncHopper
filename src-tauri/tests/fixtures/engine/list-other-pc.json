@@ -1,0 +1,15 @@
+{
+  "version": "1.77.0",
+  "files": {
+    "windows-amd64": {
+      "name": "rclone-v1.77.0-linux-amd64",
+      "sha256": "27740519b004c091baddaef9b42c1757320ccfa0b9a3b07f2939899d539a0b84",
+      "size": 131
+    }
+  },
+  "license": {
+    "name": "rclone-COPYING.txt",
+    "sha256": "fcb7c51ac54d03dd11ac4a075b042f0f9fd3a1f25810085e6f0dbbcc9d255877",
+    "size": 45
+  }
+}

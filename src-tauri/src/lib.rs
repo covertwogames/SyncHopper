@@ -155,16 +155,30 @@ impl Updates {
     }
 }
 
-/// True when this build carries the public key needed to check updates.
-fn updates_possible(config: &tauri::Config) -> bool {
+/// The public key this build checks updates with, if it has one. Release
+/// builds do; builds made on a PC don't.
+fn update_pubkey(config: &tauri::Config) -> Option<String> {
     config
         .plugins
         .0
         .get("updater")
         .and_then(|u| u.get("pubkey"))
         .and_then(|k| k.as_str())
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false)
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// Release builds get the sync engine from the signed channel, checked with
+/// the same key as app updates.
+fn engine_channel(pubkey: Option<String>) -> Option<rclone::EngineChannel> {
+    let pubkey = pubkey?;
+    #[allow(unused_mut)]
+    let mut manifest_url = rclone::ENGINE_CHANNEL_URL.to_string();
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("SYNCHOPPER_ENGINE_URL") {
+        manifest_url = url;
+    }
+    Some(rclone::EngineChannel { manifest_url, pubkey })
 }
 
 /// Asks the release page whether a newer SyncHopper exists.
@@ -368,7 +382,7 @@ async fn unignore_file(app: Ctx<'_>, id: String, path: String) -> Result<(), Str
 
 #[tauri::command]
 async fn retry_engine(app: Ctx<'_>) -> Result<(), String> {
-    app.ensure_engine().await;
+    app.check_engine(crate::app::EngineCheck::Manual).await;
     Ok(())
 }
 
@@ -691,7 +705,8 @@ fn test_remote() -> Option<String> {
 
 pub fn run() {
     let context = tauri::generate_context!();
-    let can_update = updates_possible(context.config());
+    let pubkey = update_pubkey(context.config());
+    let can_update = pubkey.is_some();
     let mut builder = tauri::Builder::default();
     if can_update {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -733,6 +748,9 @@ pub fn run() {
                 test.is_some(),
                 host,
             );
+            if let Some(channel) = engine_channel(pubkey.clone()) {
+                app.use_engine_channel(channel);
+            }
             handle.manage(app.clone());
             setup_notification_actions(&handle);
             build_tray(&handle)?;

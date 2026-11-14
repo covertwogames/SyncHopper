@@ -3,7 +3,7 @@
 
 use crate::core::Core;
 use crate::platform;
-use crate::rclone::friendly_error;
+use crate::rclone::{friendly_error, is_blocked_message};
 use crate::util::Cancel;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -203,6 +203,9 @@ impl Drive {
                 me.core.log(&format!("[drive] Stopped: {raw}"));
             }
             drop(inner);
+            if res.spawn_error.as_deref().is_some_and(is_blocked_message) {
+                me.core.engine_blocked(res.spawn_error.as_deref().unwrap_or_default());
+            }
             me.core.host.state_changed();
         });
     }

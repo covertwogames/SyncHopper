@@ -2,7 +2,7 @@
 //! kept in sync.
 
 use crate::core::{Core, Notice};
-use crate::rclone::friendly_error;
+use crate::rclone::{friendly_error, is_blocked_message};
 use crate::util::{clean_remote, file_name, Cancel};
 use serde::Serialize;
 use std::path::Path;
@@ -177,7 +177,7 @@ impl Uploads {
         let result = match self.core.rclone() {
             Ok(rc) => {
                 let me = self.clone();
-                Some(
+                Ok(
                     rc.run_logged(&args, &cancel, |line| {
                         if let Some(st) = &line.stats {
                             me.set(id, |i| {
@@ -194,19 +194,22 @@ impl Uploads {
                     .await,
                 )
             }
-            Err(_) => None,
+            Err(e) => Err(e),
         };
         let (state, error) = match &result {
-            None => ("failed", Some("The sync engine is not installed yet.".to_string())),
-            Some(r) if r.cancelled => ("cancelled", None),
-            Some(r) if r.exit == 0 => ("done", None),
-            Some(r) => {
+            Err(e) => ("failed", Some(e.clone())),
+            Ok(r) if r.cancelled => ("cancelled", None),
+            Ok(r) if r.exit == 0 => ("done", None),
+            Ok(r) => {
                 let raw = r
                     .spawn_error
                     .clone()
                     .or_else(|| r.errors.iter().find(|l| !l.msg.starts_with("Failed to copy with")).map(|l| l.msg.clone()))
                     .or_else(|| r.errors.first().map(|l| l.msg.clone()))
                     .unwrap_or_else(|| format!("The upload stopped unexpectedly (code {}).", r.exit));
+                if is_blocked_message(&raw) {
+                    self.core.engine_blocked(&raw);
+                }
                 ("failed", Some(friendly_error(&raw)))
             }
         };

@@ -370,7 +370,13 @@
     if (e.state === "ready") return "";
     if (e.state === "downloading") return "Downloading the sync engine (rclone), " + e.percent + "% done.";
     if (e.state === "error") return e.message || "The sync engine could not be set up.";
+    if (e.state === "blocked") return e.message || "This PC blocked SyncHopper's sync engine, so nothing can sync right now.";
     return "Getting the sync engine ready.";
+  }
+
+  // The engine can't be used right now, and Try again makes sense.
+  function engineStuck() {
+    return S.engine.state === "error" || S.engine.state === "blocked";
   }
 
   function pairStatus(p) {
@@ -487,7 +493,7 @@
     const banners = [];
     if (S.test_mode) banners.push('<div class="banner info"><span>Test mode: syncing with a folder on this PC in place of Koofr.</span></div>');
     const eng = engineText();
-    if (eng) banners.push('<div class="banner"><span>' + esc(eng) + "</span>" + (S.engine.state === "error" ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : "") + "</div>");
+    if (eng) banners.push('<div class="banner"><span>' + esc(eng) + "</span>" + (engineStuck() ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : "") + "</div>");
     const up = S.update || {};
     if (up.status === "available") banners.push('<div class="banner info"><span>SyncHopper ' + esc(up.version) + ' is available.</span><button type="button" class="btn" data-banner="update">Install and restart</button></div>');
     else if (up.status === "downloading") banners.push('<div class="banner info"><span>Downloading SyncHopper ' + esc(up.version) + ", " + up.percent + "% done.</span></div>");
@@ -1158,12 +1164,10 @@
     $("#ad-app-update").disabled = !up.enabled;
     $("#ad-check").disabled = !up.enabled || up.status === "checking" || up.status === "downloading" || up.status === "installing";
     const e = S.engine;
-    setText(
-      $("#ad-engine-note"),
-      e.state !== "ready"
-        ? engineText()
-        : "The engine is rclone " + e.version + "."
-    );
+    let engineNote = "The engine is rclone " + e.version + ".";
+    if (e.signed) engineNote = "The engine is rclone " + e.version + ", signed by Cover Two Strategies LLC.";
+    else if (S.engine_channel) engineNote += " SyncHopper switches it to a signed copy as soon as it can download one.";
+    setText($("#ad-engine-note"), e.state !== "ready" ? engineText() : engineNote);
   }
 
   async function saveSetting(key, value) {
@@ -1367,8 +1371,9 @@
   function wizEngineLine() {
     const e = S.engine;
     if (e.state === "ready") return "The sync engine is ready (rclone " + e.version + ").";
-    if (e.state === "downloading") return "Downloading the sync engine (rclone) from rclone.org, " + e.percent + "% done. This happens once.";
+    if (e.state === "downloading") return "Downloading the sync engine (rclone), " + e.percent + "% done. This happens once.";
     if (e.state === "error") return (e.message || "The sync engine could not be set up.") + " ";
+    if (e.state === "blocked") return (e.message || "This PC blocked SyncHopper's sync engine.") + " ";
     return "Getting the sync engine ready.";
   }
 
@@ -1379,7 +1384,7 @@
     const line = $("#wz-engine");
     if (line) {
       setText($("#wz-engine-text"), wizEngineLine());
-      $("#wz-engine-retry").hidden = S.engine.state !== "error";
+      $("#wz-engine-retry").hidden = !engineStuck();
     }
   }
 

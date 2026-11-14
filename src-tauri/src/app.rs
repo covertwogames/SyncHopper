@@ -15,13 +15,39 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const KOOFR_PASSWORD_URL: &str = "https://app.koofr.net/app/admin/preferences/password";
 pub const WINFSP_URL: &str = "https://winfsp.dev/rel/";
 
-/// How often a failed engine download is tried again on its own.
+/// How often the engine is looked at again on its own when it isn't ready,
+/// or isn't the signed copy yet.
 const ENGINE_RETRY: Duration = Duration::from_secs(5 * 60);
+/// A copy the system refused to run is not run again on its own for this
+/// long, because each try can pop up a Windows Security warning.
+const BLOCKED_RETRY: Duration = Duration::from_secs(6 * 3600);
+/// How often a newer signed engine is looked for.
+const ENGINE_UPDATE_EVERY: u64 = 24 * 3600;
+/// After the signed engine list could not be reached, how long the daily
+/// update check waits before trying again.
+const CHANNEL_RETRY: Duration = Duration::from_secs(3600);
+
+/// Why the engine is being looked at.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EngineCheck {
+    /// When SyncHopper starts.
+    Startup,
+    /// Someone pressed Try again.
+    Manual,
+    /// The regular check while SyncHopper runs. Doesn't show "checking".
+    Background,
+}
+
+enum EngineOutcome {
+    Ready { loc: rclone::Located, signed: bool },
+    Blocked(String),
+    Failed(String),
+}
 
 pub struct App {
     pub core: Arc<Core>,
@@ -35,6 +61,14 @@ pub struct App {
     menu_modern: Mutex<Option<bool>>,
     started: AtomicBool,
     download_base: String,
+    /// Set in release builds: where the signed engine comes from.
+    engine_channel: Mutex<Option<rclone::EngineChannel>>,
+    /// Only one engine check at a time.
+    engine_lock: tokio::sync::Mutex<()>,
+    /// A copy the system refused to run: its checksum, when, and the error.
+    blocked_file: Mutex<Option<(String, Instant, String)>>,
+    /// When the signed engine list was last tried.
+    channel_tried: Mutex<Option<Instant>>,
 }
 
 /// A folder someone asked to sync from outside the main window, for example
@@ -137,7 +171,17 @@ impl App {
             menu_modern: Mutex::new(None),
             started: AtomicBool::new(false),
             download_base,
+            engine_channel: Mutex::new(None),
+            engine_lock: tokio::sync::Mutex::new(()),
+            blocked_file: Mutex::new(None),
+            channel_tried: Mutex::new(None),
         })
+    }
+
+    /// Release builds get the engine only from the signed channel. Call
+    /// before `start`.
+    pub fn use_engine_channel(&self, channel: rclone::EngineChannel) {
+        *self.engine_channel.lock().unwrap() = Some(channel);
     }
 
     /// Everything the screens need, in one piece.
@@ -156,6 +200,7 @@ impl App {
             "setup_complete": s.setup_complete,
             "account": { "email": s.account_email, "used": about.as_ref().and_then(|a| a.used), "total": about.as_ref().and_then(|a| a.total) },
             "engine": self.core.engine_info(),
+            "engine_channel": self.engine_channel.lock().unwrap().is_some(),
             "settings": settings,
             "sync": self.engine.sync_view(),
             "pairs": self.engine.pair_views(),
@@ -174,6 +219,9 @@ impl App {
         let sync = self.engine.sync_view();
         if !s.setup_complete {
             "SyncHopper: setup not finished".into()
+        } else if matches!(self.core.engine_info().state.as_str(), "blocked" | "error") {
+            // The sync engine can't run, so nothing syncs.
+            "SyncHopper: can't sync right now".into()
         } else if self.engine.has_problems() {
             "SyncHopper: needs attention".into()
         } else if self.engine.waiting_for_koofr() {
@@ -191,95 +239,243 @@ impl App {
 
     // ----- the sync engine program --------------------------------------
 
-    /// Finds the sync engine, downloading it when it is missing.
+    /// Makes sure the sync engine is ready, getting it when needed.
     pub async fn ensure_engine(self: &Arc<Self>) {
-        {
-            let info = self.core.engine_info();
-            if info.state == "downloading" {
-                return;
+        self.check_engine(EngineCheck::Startup).await;
+    }
+
+    pub async fn check_engine(self: &Arc<Self>, why: EngineCheck) {
+        // Only one check at a time; a second one would only repeat it.
+        let Ok(_guard) = self.engine_lock.try_lock() else { return };
+        let before = self.core.engine_info();
+        if why != EngineCheck::Background {
+            self.core.set_engine(|e| {
+                e.state = "checking".into();
+                e.message.clear();
+            });
+        }
+        rclone::tidy_engine_folder(&self.core.data);
+        let channel = self.engine_channel.lock().unwrap().clone();
+        let outcome = match channel {
+            Some(ch) => self.engine_signed(&ch, why).await,
+            None => self.engine_unsigned(why).await,
+        };
+        match outcome {
+            EngineOutcome::Ready { loc, signed } => {
+                let was_ready = before.state == "ready" && before.exe.is_some();
+                if !was_ready || before.version != loc.version || before.signed != signed {
+                    let kind = if signed { "signed copy" } else { "unsigned copy" };
+                    self.core.log(&format!("Sync engine ready: rclone {} ({kind}) at {}", loc.version, loc.exe.display()));
+                }
+                self.core.set_engine(|e| {
+                    e.state = "ready".into();
+                    e.version = loc.version.clone();
+                    e.exe = Some(loc.exe.clone());
+                    e.signed = signed;
+                    e.percent = 0;
+                    e.message.clear();
+                });
+                self.core.engine_runs_again();
+                if !was_ready && self.started.load(Ordering::SeqCst) {
+                    self.engine.engine_back();
+                    self.drive.apply().await;
+                }
+            }
+            EngineOutcome::Blocked(raw) => self.core.engine_blocked(&raw),
+            EngineOutcome::Failed(msg) => {
+                self.core.log(&format!("Sync engine not available: {msg}"));
+                self.core.set_engine(|e| {
+                    e.state = "error".into();
+                    e.exe = None;
+                    e.signed = false;
+                    e.percent = 0;
+                    e.message = msg.clone();
+                });
             }
         }
-        self.core.set_engine(|e| {
-            e.state = "checking".into();
-            e.message.clear();
-        });
-        let mut found = rclone::locate(&self.core.data).await;
+    }
 
-        // Keep the app's own copy current, at most one check a day.
-        if let Some(loc) = &found {
+    /// Release builds: only a copy from the signed channel is wanted. A
+    /// copy from before SyncHopper used signed copies is replaced, whatever
+    /// the update setting says. It is only used while no signed copy can be
+    /// had, and only if this PC lets it run.
+    async fn engine_signed(self: &Arc<Self>, ch: &rclone::EngineChannel, why: EngineCheck) -> EngineOutcome {
+        let data = self.core.data.clone();
+        // Reads the whole program to check it, so off the async threads.
+        let installed = tokio::task::spawn_blocking(move || rclone::installed_source(&data)).await.ok().flatten();
+        let mut signed = installed.as_ref().is_some_and(|s| s.source == "signed");
+        let s = self.core.settings();
+        let due = now_secs().saturating_sub(s.engine_checked_at) > ENGINE_UPDATE_EVERY;
+        let mut problem: Option<String> = None;
+        if !signed || (s.auto_update_engine && due) {
+            *self.channel_tried.lock().unwrap() = Some(Instant::now());
+            match self.fetch_signed(ch, installed.as_ref(), why != EngineCheck::Background).await {
+                // Either it was already the current signed copy or one was
+                // just put in place.
+                Ok(()) => signed = true,
+                Err(e) => {
+                    self.core.log(&format!("Signed sync engine: {e}"));
+                    problem = Some(e);
+                }
+            }
+        }
+        match self.probe_engine(why).await {
+            rclone::Found::Ready(loc) => EngineOutcome::Ready { loc, signed },
+            rclone::Found::Blocked(raw) => EngineOutcome::Blocked(raw),
+            rclone::Found::Missing => EngineOutcome::Failed(match problem {
+                Some(e) => e,
+                None => "The sync engine was downloaded but would not start.".into(),
+            }),
+        }
+    }
+
+    /// Gets the current signed engine if this PC doesn't have it yet.
+    async fn fetch_signed(
+        self: &Arc<Self>,
+        ch: &rclone::EngineChannel,
+        installed: Option<&rclone::EngineSource>,
+        show: bool,
+    ) -> Result<(), String> {
+        let manifest = rclone::channel_manifest(ch).await?;
+        let file = manifest
+            .files
+            .get(&rclone::platform_key())
+            .cloned()
+            .ok_or_else(|| "No signed sync engine is published for this kind of PC yet.".to_string())?;
+        let have = installed.filter(|i| i.source == "signed");
+        let current = have.is_some_and(|i| i.sha256.eq_ignore_ascii_case(&file.sha256));
+        // Never go back to an older one.
+        let older = have.is_some_and(|i| rclone::version_triple(&manifest.version) < rclone::version_triple(&i.version));
+        if current || older {
+            self.core.update(|s| s.engine_checked_at = now_secs());
+            return Ok(());
+        }
+        match have {
+            Some(i) => self.core.log(&format!("Updating the sync engine from {} to {}", i.version, manifest.version)),
+            None => self.core.log(&format!("Getting the signed sync engine (rclone {})", manifest.version)),
+        }
+        let license = match &manifest.license {
+            Some(l) => Some(rclone::channel_file(ch, l, |_| {}).await?),
+            None => None,
+        };
+        if show {
+            self.core.set_engine(|e| {
+                e.state = "downloading".into();
+                e.percent = 0;
+            });
+        }
+        let core = self.core.clone();
+        let bytes = rclone::channel_file(ch, &file, move |pct| {
+            if show {
+                core.set_engine(|e| e.percent = pct);
+            }
+        })
+        .await?;
+        let data = self.core.data.clone();
+        let version = manifest.version.clone();
+        tokio::task::spawn_blocking(move || {
+            rclone::install_engine(&data, &bytes, "signed", &version)?;
+            if let Some(l) = license {
+                rclone::install_license(&data, &l)?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        self.core.update(|s| s.engine_checked_at = now_secs());
+        Ok(())
+    }
+
+    /// Builds made on a PC (no update key): rclone straight from rclone.org.
+    async fn engine_unsigned(self: &Arc<Self>, why: EngineCheck) -> EngineOutcome {
+        let mut found = self.probe_engine(why).await;
+        if let rclone::Found::Ready(loc) = &found {
+            // Keep it current, at most one check a day.
             let s = self.core.settings();
-            let due = now_secs().saturating_sub(s.engine_checked_at) > 24 * 3600;
+            let due = now_secs().saturating_sub(s.engine_checked_at) > ENGINE_UPDATE_EVERY;
             if s.auto_update_engine && due && !self.core.test_mode {
                 self.core.update(|s| s.engine_checked_at = now_secs());
                 if let Ok(latest) = rclone::latest_version(&self.download_base).await {
-                    let newer = rclone::version_triple(&latest) > rclone::version_triple(&loc.version);
-                    if newer {
+                    if rclone::version_triple(&latest) > rclone::version_triple(&loc.version) {
                         self.core.log(&format!("Updating the sync engine from {} to {latest}", loc.version));
-                        if self.download_engine().await.is_ok() {
-                            found = rclone::locate(&self.core.data).await;
+                        if self.download_unsigned(why != EngineCheck::Background).await.is_ok() {
+                            found = self.probe_engine(why).await;
                         }
                     }
                 }
             }
         }
-
         match found {
-            Some(loc) => {
-                self.core.log(&format!("Sync engine ready: rclone {} at {}", loc.version, loc.exe.display()));
-                self.core.set_engine(|e| {
-                    e.state = "ready".into();
-                    e.version = loc.version.clone();
-                    e.exe = Some(loc.exe.clone());
-                    e.message.clear();
-                });
-            }
-            None => {
-                if self.download_engine().await.is_ok() {
-                    if let Some(loc) = rclone::locate(&self.core.data).await {
-                        self.core.log(&format!("Sync engine downloaded: rclone {}", loc.version));
-                        self.core.set_engine(|e| {
-                            e.state = "ready".into();
-                            e.version = loc.version.clone();
-                            e.exe = Some(loc.exe.clone());
-                            e.message.clear();
-                        });
-                    } else {
-                        self.core.set_engine(|e| {
-                            e.state = "error".into();
-                            e.message = "The sync engine was downloaded but would not start.".into();
-                        });
-                    }
-                }
-            }
+            rclone::Found::Ready(loc) => EngineOutcome::Ready { loc, signed: false },
+            rclone::Found::Blocked(raw) => EngineOutcome::Blocked(raw),
+            rclone::Found::Missing => match self.download_unsigned(why != EngineCheck::Background).await {
+                Err(e) => EngineOutcome::Failed(e),
+                Ok(()) => match self.probe_engine(why).await {
+                    rclone::Found::Ready(loc) => EngineOutcome::Ready { loc, signed: false },
+                    rclone::Found::Blocked(raw) => EngineOutcome::Blocked(raw),
+                    rclone::Found::Missing => EngineOutcome::Failed("The sync engine was downloaded but would not start.".into()),
+                },
+            },
         }
     }
 
-    async fn download_engine(self: &Arc<Self>) -> Result<(), String> {
-        let had = self.core.engine_info().exe;
-        self.core.set_engine(|e| {
-            e.state = "downloading".into();
-            e.percent = 0;
-            e.message.clear();
-        });
+    async fn download_unsigned(self: &Arc<Self>, show: bool) -> Result<(), String> {
+        if show {
+            self.core.set_engine(|e| {
+                e.state = "downloading".into();
+                e.percent = 0;
+            });
+        }
         let core = self.core.clone();
         let result = rclone::download(&self.core.data, &self.download_base, move |pct| {
-            core.set_engine(|e| e.percent = pct);
+            if show {
+                core.set_engine(|e| e.percent = pct);
+            }
         })
         .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                self.core.log(&format!("Sync engine download failed: {e}"));
-                self.core.set_engine(|info| {
-                    if had.is_some() {
-                        info.state = "ready".into();
-                    } else {
-                        info.state = "error".into();
-                        info.message = e.clone();
-                    }
-                });
-                Err(e)
+        if let Err(e) = &result {
+            self.core.log(&format!("Sync engine download failed: {e}"));
+        }
+        result.map(|_| ())
+    }
+
+    /// Runs the installed engine to see whether it works. A copy the system
+    /// refused to run isn't tried again on its own for a while, since each
+    /// try can bring up a Windows Security warning; Try again always tries.
+    async fn probe_engine(&self, why: EngineCheck) -> rclone::Found {
+        let exe = rclone::managed_path(&self.core.data);
+        if !exe.is_file() {
+            return rclone::Found::Missing;
+        }
+        let hash = |exe: PathBuf| async move { tokio::task::spawn_blocking(move || rclone::file_sha256(&exe)).await.ok().flatten().unwrap_or_default() };
+        let known = self.blocked_file.lock().unwrap().clone();
+        if let Some((sha, when, raw)) = known {
+            if why != EngineCheck::Manual && when.elapsed() < BLOCKED_RETRY && hash(exe.clone()).await == sha {
+                return rclone::Found::Blocked(raw);
             }
+        }
+        let found = rclone::find(&self.core.data).await;
+        let blocked = match &found {
+            rclone::Found::Blocked(raw) => Some((hash(exe).await, Instant::now(), raw.clone())),
+            _ => None,
+        };
+        *self.blocked_file.lock().unwrap() = blocked;
+        found
+    }
+
+    /// Whether the regular check has something to do.
+    fn engine_check_due(&self) -> bool {
+        let info = self.core.engine_info();
+        let channel = self.engine_channel.lock().unwrap().is_some();
+        match info.state.as_str() {
+            "error" | "blocked" => true,
+            "ready" if channel => {
+                let s = self.core.settings();
+                let rested = self.channel_tried.lock().unwrap().map(|t| t.elapsed() >= CHANNEL_RETRY).unwrap_or(true);
+                let update_due = s.auto_update_engine && now_secs().saturating_sub(s.engine_checked_at) > ENGINE_UPDATE_EVERY;
+                !info.signed || (update_due && rested)
+            }
+            _ => false,
         }
     }
 
@@ -291,15 +487,16 @@ impl App {
         self.core.log(&format!("SyncHopper {} starting", env!("CARGO_PKG_VERSION")));
         platform::kill_orphans(&self.core.config_path()).await;
         self.ensure_engine().await;
-        // If the engine could not be downloaded (for example the PC was
-        // offline), keep trying in the background instead of waiting for
-        // someone to press Try again.
+        // Keeps looking after the engine while SyncHopper runs: tries again
+        // when it could not be downloaded (for example the PC was offline)
+        // or was blocked, swaps in the signed copy once it can be had, and
+        // picks up newer signed copies, without an app update.
         let me = self.clone();
         self.core.spawn(async move {
             loop {
                 tokio::time::sleep(ENGINE_RETRY).await;
-                if me.core.engine_info().state == "error" {
-                    me.ensure_engine().await;
+                if me.engine_check_due() {
+                    me.check_engine(EngineCheck::Background).await;
                 }
             }
         });

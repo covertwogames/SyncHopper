@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for rclone 1.70.0 in tests.
+if [ "$1" = "version" ]; then echo "rclone v1.70.0"; exit 0; fi
+exec rclone "$@"
