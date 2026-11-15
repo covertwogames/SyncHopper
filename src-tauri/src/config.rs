@@ -40,7 +40,8 @@ pub struct Skipped {
     pub reason: String,
     /// The sync engine's own message, shown under "Technical details".
     pub detail: String,
-    /// "server", "network", "busy", "denied", "permanent" or "unknown".
+    /// What went wrong, as `engine::issue_kind` sorts it ("server",
+    /// "busy", "koofr_name" and so on).
     pub kind: String,
     /// Unix time of the first failure in this run of failures.
     pub first_failed: u64,
@@ -100,6 +101,9 @@ pub struct Settings {
 
     // Advanced
     pub use_http2: bool,
+    /// Keeps each rclone run to the request rate Koofr recommends, for when
+    /// Koofr says SyncHopper is sending too many requests.
+    pub limit_requests: bool,
     /// Megabytes per second, 0 means no limit.
     pub upload_limit_mbps: f64,
     pub download_limit_mbps: f64,
@@ -150,6 +154,7 @@ impl Default for Settings {
             max_delete_percent: 50,
             auto_add_folders: true,
             use_http2: false,
+            limit_requests: false,
             upload_limit_mbps: 0.0,
             download_limit_mbps: 0.0,
             conflict_policy: "keep_both".into(),
@@ -176,6 +181,7 @@ impl Settings {
     pub fn restore_advanced_defaults(&mut self) {
         let d = Settings::default();
         self.use_http2 = d.use_http2;
+        self.limit_requests = d.limit_requests;
         self.upload_limit_mbps = d.upload_limit_mbps;
         self.download_limit_mbps = d.download_limit_mbps;
         self.conflict_policy = d.conflict_policy;
@@ -235,7 +241,22 @@ impl Settings {
         };
         Some(format!("{}:{}", part(self.upload_limit_mbps), part(self.download_limit_mbps)))
     }
+
+    /// Flags added to every rclone run. With "Limit requests to Koofr" on,
+    /// each run sends at most 40 requests a second, the rate Koofr
+    /// recommends. rclone's --tpslimit-burst already defaults to 1, so
+    /// requests are spaced evenly without saying so.
+    pub fn engine_extra_flags(&self) -> Vec<String> {
+        if self.limit_requests {
+            vec!["--tpslimit".into(), KOOFR_REQUEST_LIMIT.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
 }
+
+/// Requests per second Koofr recommends rclone users stay under.
+pub const KOOFR_REQUEST_LIMIT: u32 = 40;
 
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
@@ -290,7 +311,18 @@ mod tests {
         assert!(s.setup_complete);
         assert_eq!(s.transfers, 8);
         assert!(!s.use_http2);
+        assert!(!s.limit_requests);
         assert_eq!(s.ignore_patterns, default_ignores());
+    }
+
+    #[test]
+    fn request_limit_flags() {
+        let mut s = Settings::default();
+        assert!(s.engine_extra_flags().is_empty());
+        s.limit_requests = true;
+        assert_eq!(s.engine_extra_flags(), vec!["--tpslimit".to_string(), "40".to_string()]);
+        s.restore_advanced_defaults();
+        assert!(!s.limit_requests);
     }
 
     #[test]

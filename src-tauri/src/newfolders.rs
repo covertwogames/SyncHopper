@@ -8,7 +8,7 @@ use crate::core::{Core, Notice};
 use crate::engine::Engine;
 use crate::platform;
 use crate::rclone::is_network_error;
-use crate::util::{file_name, glob_match, new_id, norm_local};
+use crate::util::{file_name, glob_match, koofr_refuses_chars, new_id, norm_local};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -298,6 +298,16 @@ impl NewFolders {
                 && same_name(&pair.remote, &old_name);
             if !follow_in_koofr {
                 let _ = self.engine.rename_pair(&pair.id, &new_local, None).await;
+                continue;
+            }
+            if koofr_refuses_chars(&name) {
+                let _ = self.engine.rename_pair(&pair.id, &new_local, None).await;
+                let msg = format!(
+                    "Koofr doesn't allow emoji and some other symbols in folder names, so this folder keeps syncing to \"{}\" in Koofr.",
+                    pair.remote
+                );
+                self.add_notice("rename_kept", &name, &new_local, msg.clone());
+                self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in Koofr"), &msg);
                 continue;
             }
             if koofr_dirs.is_none() {

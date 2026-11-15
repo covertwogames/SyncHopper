@@ -64,7 +64,7 @@ async fn a_large_delete_waits_for_approval_and_can_be_allowed() {
     }
     rig.sync(&id).await;
     assert_eq!(rig.phase(&id), Phase::Approval);
-    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 3, total: 4, side: "pc".into(), everything: false }));
+    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 3, total: 4, side: "pc".into(), everything: false, changed: false }));
     assert_eq!(names(&rig.koofr("Docs")).len(), 4, "nothing may be deleted before approval");
     assert!(rig.host.notes.lock().unwrap().iter().any(|(t, _)| t.contains("needs your OK")));
 
@@ -90,7 +90,7 @@ async fn a_large_delete_can_be_undone_instead() {
         std::fs::remove_file(rig.koofr(&format!("Docs/f{n}.txt"))).unwrap();
     }
     rig.sync(&id).await;
-    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 4, total: 5, side: "koofr".into(), everything: false }), "{}", rig.dump(&id));
+    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 4, total: 5, side: "koofr".into(), everything: false, changed: false }), "{}", rig.dump(&id));
     assert_eq!(names(&rig.pc("Docs")).len(), 5);
     rig.app.engine.restore_deleted(&id);
     rig.app.engine.drain().await;
@@ -110,7 +110,7 @@ async fn an_emptied_pc_folder_is_never_passed_on_automatically() {
         std::fs::remove_file(rig.pc(&format!("Docs/f{n}.txt"))).unwrap();
     }
     rig.sync(&id).await;
-    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 3, total: 3, side: "pc".into(), everything: true }), "{}", rig.dump(&id));
+    assert_eq!(rig.view(&id).approval, Some(Approval { deleted: 3, total: 3, side: "pc".into(), everything: true, changed: false }), "{}", rig.dump(&id));
     assert_eq!(names(&rig.koofr("Docs")).len(), 3);
     let alerts = rig.host.notes.lock().unwrap().iter().filter(|(t, _)| t.contains("needs your OK")).count();
 

@@ -456,6 +456,7 @@ async fn pair_action(app: Ctx<'_>, id: String, action: String) -> Result<(), Str
         "pause" => e.set_paused(&id, true),
         "resume" => e.set_paused(&id, false),
         "approve" => e.approve_deletes(&id),
+        "approve_changed" => e.approve_changed(&id),
         "restore" => e.restore_deleted(&id),
         "repair" => e.repair(&id),
         "retry_skipped" => e.retry_skipped(&id),
@@ -558,6 +559,7 @@ fn open_target(app: Ctx<'_>, handle: AppHandle, kind: String, value: Option<Stri
     let result = match kind.as_str() {
         "koofr_password_page" => opener.open_url(app::KOOFR_PASSWORD_URL, None::<&str>),
         "winfsp_page" => opener.open_url(app::WINFSP_URL, None::<&str>),
+        "rclone_site" => opener.open_url(app::RCLONE_URL, None::<&str>),
         "log" => {
             let path = app.core.log_path();
             if !path.exists() {

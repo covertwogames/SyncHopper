@@ -5,11 +5,16 @@
 use crate::config::{same_state, FileState, Pair, Settings, Skipped};
 use crate::core::{Core, Notice};
 use crate::platform;
-use crate::rclone::{friendly_error, friendly_known, is_blocked_message, is_network_error, LogLine, Rclone, RunResult, Stats};
-use crate::util::{clean_remote, file_name, glob_match, go_unquote, new_id, norm_local, now_secs, parse_time_ns, paths_overlap, system_folder_reason, Cancel};
+use crate::rclone::{
+    error_words, friendly_error, friendly_known, is_blocked_message, is_network_error, reports_status, LogLine, Rclone, RunResult, Stats,
+};
+use crate::util::{
+    clean_remote, file_name, glob_match, go_unquote, koofr_refuses_chars, new_id, norm_local, now_secs, parse_time_ns, paths_overlap,
+    system_folder_reason, Cancel,
+};
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +33,18 @@ pub const MISSING_GRACE: Duration = Duration::from_secs(90);
 const POWER_CHECK: Duration = Duration::from_secs(120);
 /// The headline for a folder error SyncHopper does not recognise.
 pub const UNEXPECTED: &str = "Something unexpected stopped this folder from syncing.";
+/// The reason shown for a file whose error SyncHopper does not recognise.
+/// The engine's own words are kept under the technical details.
+pub const FILE_UNEXPECTED: &str = "Something unexpected stopped this file from syncing.";
+/// rclone stops a sync when every file looks changed (meant for clock
+/// changes). Up to this many changed files are synced anyway without asking,
+/// since a person could easily have edited them all.
+pub const ALL_CHANGED_AUTO: u64 = 20;
+/// The longest path Koofr accepts, in characters.
+pub const KOOFR_MAX_PATH: usize = 1023;
+/// At most this many names Koofr refuses are listed per folder. Any beyond
+/// it are still caught when they fail.
+const KOOFR_NAME_SCAN_MAX: usize = 1000;
 /// How long a failing file is retried quietly before it is shown as
 /// needing attention.
 pub const FLAG_AFTER: u64 = 3 * 3600;
@@ -50,16 +67,22 @@ pub enum Phase {
     Waiting,
 }
 
-/// A sync that stopped because it would delete a large share of a folder.
+/// A sync that stopped to wait for the user: because it would delete a
+/// large share of a folder, or because every file looked changed.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Approval {
+    /// Files deleted, or with `changed`, files changed.
     pub deleted: u64,
     pub total: u64,
-    /// Where the files were deleted: "pc" or "koofr".
+    /// Where it happened: "pc", "koofr", or "both" (only with `changed`).
     pub side: String,
     /// True when that side is completely empty. `deleted` then counts the
     /// files still on the other side.
     pub everything: bool,
+    /// Every file looked changed since the last sync, which rclone stops for
+    /// (meant for clock changes). `deleted` then counts the changed files,
+    /// or is 0 when rclone did not say.
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -77,6 +100,10 @@ pub struct Job {
     pub pair_id: String,
     /// Allow a large delete this once.
     pub force: bool,
+    /// The user approved syncing a folder where every file looked changed.
+    /// The run still starts normally, so rclone's large-delete check runs
+    /// first.
+    pub allow_all_changed: bool,
     /// Rebuild the sync record. Copies both ways and never deletes.
     pub resync: bool,
     /// Started by the user, so automatic pauses do not apply.
@@ -98,11 +125,19 @@ struct PairRt {
     fails: u32,
     retry_all: bool,
     waiting: Option<String>,
+    /// What the folder is waiting for: "koofr", "throttled", "cert" or
+    /// "drive".
+    waiting_kind: Option<String>,
     retry_at: Option<u64>,
     summary: String,
     runs: u64,
     last_finished: Option<Instant>,
     missing_since: Option<Instant>,
+    /// The sync record was rebuilt because rclone found the two sides out
+    /// of step, and no ordinary sync has finished since. If it happens again
+    /// before one does, the folder stops instead of rebuilding over and over
+    /// (a rebuild can bring back files that were deleted).
+    rebuilt_out_of_sync: bool,
 }
 
 #[derive(Default)]
@@ -113,7 +148,9 @@ struct Inner {
     paused_all: bool,
     auto_pause: Option<String>,
     auto_checked: Option<Instant>,
-    outage_notified: bool,
+    /// Waits already notified about ("koofr", "throttled", "cert", or
+    /// "drive:<folder id>"), so each is told once until things work again.
+    notified: HashSet<String>,
 }
 
 /// A file that is being left out of syncing, as the screens see it.
@@ -128,6 +165,9 @@ pub struct FileView {
     /// "Ignore this file" may be offered.
     pub can_ignore: bool,
     pub next_retry: u64,
+    /// SyncHopper tries it again by itself. False for files that can never
+    /// sync as they are, until the user does something.
+    pub auto_retry: bool,
 }
 
 #[derive(Serialize)]
@@ -146,6 +186,7 @@ pub struct PairView {
     pub files: Vec<FileView>,
     pub ignored: Vec<String>,
     pub waiting: Option<String>,
+    pub waiting_kind: Option<String>,
     pub retry_at: Option<u64>,
     pub conflicts: Vec<String>,
     pub summary: String,
@@ -167,6 +208,11 @@ pub enum Verdict {
     LockFound,
     NeedsResync,
     RemoteMissing,
+    /// rclone stopped because every file looked changed on a side: "pc",
+    /// "koofr" or "both".
+    AllChanged(String),
+    /// rclone's check after a sync found the two sides' records out of step.
+    OutOfSync { message: String, details: Vec<String> },
     Failed { must_resync: bool, files: Vec<FailedFile>, message: String, details: Vec<String> },
 }
 
@@ -187,7 +233,7 @@ fn parse_deletes(msg: &str) -> Option<Approval> {
     let deleted = parts.next()?.trim().parse().ok()?;
     let total = parts.next()?.trim().parse().ok()?;
     let side = if msg.contains("on Path1") { "pc" } else { "koofr" };
-    Some(Approval { deleted, total, side: side.into(), everything: false })
+    Some(Approval { deleted, total, side: side.into(), everything: false, changed: false })
 }
 
 fn is_boilerplate(msg: &str) -> bool {
@@ -197,6 +243,25 @@ fn is_boilerplate(msg: &str) -> bool {
         || l.contains("not deleting files as there were io errors")
         || l.contains("not deleting directories as there were io errors")
         || l.contains("config file") && l.contains("not found")
+}
+
+/// Reads rclone's change summary for one side, for example
+/// "Path1:    4 changes:    1 new,    3 modified,    0 deleted", as the side
+/// ("pc" or "koofr") and the number of files modified.
+pub fn parse_change_summary(msg: &str) -> Option<(&'static str, u64)> {
+    let side = if msg.starts_with("Path1:") {
+        "pc"
+    } else if msg.starts_with("Path2:") {
+        "koofr"
+    } else {
+        return None;
+    };
+    if !msg.contains(" change") {
+        return None;
+    }
+    let part = msg.split(',').find(|p| p.trim().ends_with("modified"))?;
+    let n = part.split_whitespace().rev().nth(1)?.parse().ok()?;
+    Some((side, n))
 }
 
 /// Works out what happened in a finished two-way sync run.
@@ -216,6 +281,23 @@ pub fn classify(res: &RunResult) -> Verdict {
     if let Some(a) = find("too many deletes").and_then(|l| parse_deletes(&l.msg)) {
         return Verdict::TooManyDeletes(a);
     }
+    // "Safety abort: all files were changed on Path1 ...". Checked after the
+    // large-delete check, the same order rclone checks them in.
+    let all_changed: Vec<String> = all
+        .iter()
+        .map(|l| l.msg.to_lowercase())
+        .filter(|m| m.contains("all files were changed"))
+        .collect();
+    if !all_changed.is_empty() {
+        let pc = all_changed.iter().any(|m| m.contains("on path1"));
+        let koofr = all_changed.iter().any(|m| m.contains("on path2"));
+        let side = match (pc, koofr) {
+            (true, true) => "both",
+            (false, true) => "koofr",
+            _ => "pc",
+        };
+        return Verdict::AllChanged(side.into());
+    }
     if find("prior lock file found").is_some() {
         return Verdict::LockFound;
     }
@@ -234,18 +316,6 @@ pub fn classify(res: &RunResult) -> Verdict {
         }
     }
     let must_resync = find("must run --resync to recover").is_some();
-    if files.is_empty() {
-        if find("filters file has changed").is_some()
-            || find("filters file md5 hash not found").is_some()
-            || find("cannot find prior path1 or path2 listings").is_some()
-            || find("empty prior path").is_some()
-        {
-            return Verdict::NeedsResync;
-        }
-        if find("directory not found").is_some() {
-            return Verdict::RemoteMissing;
-        }
-    }
     let details: Vec<String> = {
         let mut d: Vec<String> = Vec::new();
         for l in &res.errors {
@@ -263,6 +333,25 @@ pub fn classify(res: &RunResult) -> Verdict {
         }
         d
     };
+    if files.is_empty() {
+        if let Some(l) = find("path1 and path2 are out of sync") {
+            // From rclone's check after a sync: "path1 and path2 are out of
+            // sync, run --resync to recover". The record can't be trusted,
+            // so it is rebuilt rather than put back.
+            let message = l.msg.trim_start_matches("Bisync critical error: ").to_string();
+            return Verdict::OutOfSync { message, details };
+        }
+        if find("filters file has changed").is_some()
+            || find("filters file md5 hash not found").is_some()
+            || find("cannot find prior path1 or path2 listings").is_some()
+            || find("empty prior path").is_some()
+        {
+            return Verdict::NeedsResync;
+        }
+        if find("directory not found").is_some() {
+            return Verdict::RemoteMissing;
+        }
+    }
     let message = files
         .first()
         .map(|f| f.msg.clone())
@@ -271,23 +360,42 @@ pub fn classify(res: &RunResult) -> Verdict {
     Verdict::Failed { must_resync, files, message, details }
 }
 
-/// What kind of failure a message describes. Per-file kinds are "server",
-/// "network", "busy", "denied", "permanent" and "unknown". "auth", "quota"
-/// and "disk" are problems for the whole folder, not for one file.
+/// What kind of failure a message describes.
+///
+/// Per-file kinds: "server", "network", "throttled" (Koofr says too many
+/// requests), "cert", "busy", "locked" (part of the file locked by another
+/// program), "virus", "onedrive" (online-only and OneDrive not running),
+/// "cantaccess", "unreadable", "denied", "permanent", "rejected" (Koofr
+/// refused it) and "unknown". The engine adds "koofr_name" for names Koofr
+/// refuses, since that depends on the path.
+///
+/// "auth", "quota" and "disk" are problems for the whole folder, "drive" is
+/// the drive the folder is on being out of reach, and "blocked" is the
+/// system refusing to run the engine.
 pub fn issue_kind(msg: &str) -> &'static str {
-    let l = msg.to_lowercase();
+    // Paths are left out, so a name in the message can't decide what the
+    // problem is.
+    let l = error_words(msg);
     let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
-    // An HTTP status code standing on its own, not part of a longer number.
-    let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
+    let code = |c: &str| reports_status(&l, c);
     if is_blocked_message(msg) {
         // The system won't run the engine. Not about any file or folder.
         "blocked"
+    } else if code("429") || has(&["too many requests"]) {
+        "throttled"
     } else if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
         "auth"
     } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
         "quota"
     } else if has(&["not enough space", "no space left", "disk full", "there is not enough space"]) {
         "disk"
+    } else if has(&[
+        "x509:",
+        "failed to verify certificate",
+        "certificate signed by unknown authority",
+        "certificate has expired or is not yet valid",
+    ]) {
+        "cert"
     } else if has(&["invalid response status! got 5", "internal server error", "bad gateway", "service unavailable", "gateway timeout"])
         || code("500")
         || code("502")
@@ -299,25 +407,61 @@ pub fn issue_kind(msg: &str) -> &'static str {
         "network"
     } else if has(&["being used by another process", "sharing violation", "source file is being updated", "size changed"]) {
         "busy"
+    } else if has(&["locked a portion of the file", "user-mapped section open"]) {
+        "locked"
+    } else if has(&["contains a virus or potentially unwanted software"]) {
+        "virus"
+    } else if has(&["cloud file provider is not running"]) {
+        "onedrive"
+    } else if has(&["the file cannot be accessed by the system"]) {
+        "cantaccess"
+    } else if has(&["media is write protected", "device is not ready", "device is not connected"]) {
+        "drive"
+    } else if has(&["cyclic redundancy check", "i/o device error", "corrupted and unreadable"]) {
+        "unreadable"
     } else if has(&["access is denied", "permission denied"]) {
         "denied"
     } else if has(&["too long", "syntax is incorrect", "invalid argument", "illegal characters", "name is not allowed"]) {
         "permanent"
+    } else if code("400") {
+        "rejected"
     } else {
         "unknown"
     }
 }
 
+/// Kinds where nothing is blamed on any file: Koofr, or the connection to
+/// it, is the problem, and the folder waits and tries again by itself.
 fn outage_kind(kind: &str) -> bool {
-    kind == "server" || kind == "network"
+    matches!(kind, "server" | "network" | "throttled" | "cert")
+}
+
+/// Kinds that make a folder wait instead of failing.
+fn waits(kind: &str) -> bool {
+    outage_kind(kind) || kind == "drive"
+}
+
+/// Files of these kinds can never sync as they are, so they are not tried
+/// again until the user does something (renames the file, presses Try
+/// again, and so on).
+pub fn never_retried(kind: &str) -> bool {
+    matches!(kind, "permanent" | "koofr_name" | "virus")
 }
 
 /// Seconds to wait before trying a left-out file again.
 fn retry_delay(kind: &str, tries: u32) -> u64 {
+    if never_retried(kind) {
+        return u64::MAX / 4;
+    }
     match kind {
-        "permanent" => u64::MAX / 4,
         // Cheap to check: the file is looked at locally before anything is sent.
         "busy" | "denied" => 120,
+        // Koofr refused it. Most likely it never will accept it, but a daily
+        // look costs nothing in case it was a one-off.
+        "rejected" => 24 * 3600,
+        "unreadable" => 3600,
+        // "locked" goes here too: a file with part of it locked still opens,
+        // so the quick local check can't see it and every try is a real one.
         _ => match tries {
             0 | 1 => 5 * 60,
             2 => 15 * 60,
@@ -330,27 +474,149 @@ fn retry_delay(kind: &str, tries: u32) -> u64 {
 /// Plain-language reason for a file that could not sync.
 pub fn file_reason(kind: &str, object_type: &str, raw: &str) -> String {
     let from_koofr = object_type.to_lowercase().contains("koofr");
+    let l = error_words(raw);
     match kind {
         "server" if from_koofr => "Koofr couldn't send this file. This is usually a temporary problem on Koofr's side.".into(),
         "server" => "Koofr had a problem with this file. This is usually a temporary problem on Koofr's side.".into(),
         "network" => "The connection to Koofr dropped while this file was syncing.".into(),
+        "throttled" => "Koofr said SyncHopper was sending too many requests. If this keeps happening, turn on Limit requests to Koofr in Advanced settings.".into(),
         "busy" => {
-            if raw.to_lowercase().contains("being updated") || raw.to_lowercase().contains("size changed") {
+            if l.contains("being updated") || l.contains("size changed") {
                 "This file was still being written while it synced.".into()
             } else {
                 "This file is open in another program.".into()
             }
         }
+        "locked" => "This file is open in another program.".into(),
+        "virus" => "Windows Security blocked this file because it thinks it contains a virus or unwanted software. Check Protection history in Windows Security.".into(),
+        "onedrive" => "This file is online-only in OneDrive, and OneDrive isn't running to download it. Start OneDrive, or set the folder to Always keep on this device.".into(),
+        "cantaccess" => {
+            // Here the path is the clue: the file is in the OneDrive folder.
+            if raw.to_lowercase().contains("onedrive") {
+                "Windows couldn't open this file. If it's online-only in OneDrive, start OneDrive, or set the folder to Always keep on this device.".into()
+            } else {
+                "Windows couldn't open this file.".into()
+            }
+        }
+        "unreadable" => "Windows couldn't read this file. The drive may be failing.".into(),
+        "drive" => drive_problem_text(raw).into(),
+        // Only reached for a file tried on its own; whole-folder waits use
+        // `cert_hint` with their own headline.
+        "cert" => format!("SyncHopper couldn't connect securely to Koofr. {}", cert_hint(raw)),
         "denied" => "Windows wouldn't let SyncHopper read or write this file.".into(),
         "permanent" => {
-            if raw.to_lowercase().contains("too long") {
+            if l.contains("too long") {
                 "This file's name or path is too long for Windows.".into()
             } else {
                 "This file's name can't be used on Windows or in Koofr.".into()
             }
         }
-        _ => friendly_error(raw),
+        "rejected" => "Koofr refused this file. This usually means its name can't be used there, for example when a folder with the same name already exists in Koofr.".into(),
+        _ => friendly_known(raw).unwrap_or_else(|| FILE_UNEXPECTED.to_string()),
     }
+}
+
+/// What a folder shows while the drive it's on can't be used.
+pub fn drive_problem_text(raw: &str) -> &'static str {
+    if error_words(raw).contains("write protected") {
+        "The drive this folder is on is write-protected, so SyncHopper can't save files there."
+    } else {
+        "Windows can't reach the drive this folder is on. It may be unplugged."
+    }
+}
+
+/// What to check when SyncHopper can't connect securely to Koofr. A
+/// certificate that looks expired or not yet valid usually means the PC's
+/// clock is wrong; one signed by someone unknown means something on the way
+/// is intercepting the connection.
+pub fn cert_hint(raw: &str) -> &'static str {
+    if error_words(raw).contains("expired or is not yet valid") {
+        "Check that this PC's date and time are correct."
+    } else {
+        "This is usually a public Wi-Fi sign-in page, antivirus that scans secure connections, or a work network."
+    }
+}
+
+/// The root of the drive or network share a Windows folder is on, such as
+/// `E:\` or `\\server\share\`. None for other paths.
+pub fn drive_root(local: &str) -> Option<String> {
+    let b = local.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        return Some(format!("{}:\\", &local[..1]));
+    }
+    let rest = local.strip_prefix("\\\\").or_else(|| local.strip_prefix("//"))?;
+    // Long-path forms like \\?\C:\ are not shares.
+    if rest.starts_with('?') || rest.starts_with('.') {
+        return None;
+    }
+    let mut parts = rest.split(['\\', '/']).filter(|p| !p.is_empty());
+    let server = parts.next()?;
+    let share = parts.next()?;
+    Some(format!("\\\\{server}\\{share}\\"))
+}
+
+/// Why Koofr would refuse a path inside a synced folder, if it would:
+/// characters Koofr doesn't allow in a name, or a path longer than Koofr
+/// accepts. `rel` uses forward slashes; a trailing slash marks a folder.
+pub fn koofr_name_problem(remote: &str, rel: &str) -> Option<String> {
+    let is_dir = rel.ends_with('/');
+    let trimmed = rel.trim_end_matches('/');
+    let (parent, name) = match trimmed.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", trimmed),
+    };
+    if koofr_refuses_chars(name) {
+        let what = if is_dir { "folder" } else { "file" };
+        return Some(format!("Koofr doesn't allow emoji and some other symbols in {what} names. Rename this {what} to sync it."));
+    }
+    if koofr_refuses_chars(parent) {
+        return Some("Koofr doesn't allow emoji and some other symbols in folder names. Rename the folder it's in to sync it.".into());
+    }
+    let remote = remote.trim_matches('/');
+    let full = if remote.is_empty() { format!("/{trimmed}") } else { format!("/{remote}/{trimmed}") };
+    if full.chars().count() > KOOFR_MAX_PATH {
+        return Some(format!(
+            "This {}'s path is longer than Koofr allows ({KOOFR_MAX_PATH} characters). Shorten the folder or file names to sync it.",
+            if is_dir { "folder" } else { "file" }
+        ));
+    }
+    None
+}
+
+/// Finds the names in a synced folder that Koofr would refuse, so they can
+/// be left out before syncing instead of being sent to Koofr at all. A
+/// folder with such a name is listed once, without looking inside it.
+/// Returns paths with forward slashes, folders ending in a slash, and the
+/// reason for each. Names matching the ignore list are skipped, as they
+/// are never synced anyway.
+pub fn find_koofr_name_problems(local_root: &Path, remote: &str, ignore: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, String)> = vec![(local_root.to_path_buf(), String::new())];
+    while let Some((dir, rel_dir)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            if out.len() >= KOOFR_NAME_SCAN_MAX {
+                return out;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if ignore.iter().any(|g| glob_match(g, &name)) {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            // Links are left to rclone, which doesn't follow them by default.
+            if ft.is_symlink() {
+                continue;
+            }
+            let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
+            let rel_shown = if ft.is_dir() { format!("{rel}/") } else { rel.clone() };
+            if let Some(reason) = koofr_name_problem(remote, &rel_shown) {
+                out.push((rel_shown, reason));
+            } else if ft.is_dir() {
+                stack.push((e.path(), rel));
+            }
+        }
+    }
+    out
 }
 
 /// Reads one side's sync record into path and file state.
@@ -417,7 +683,8 @@ fn escape_glob(path: &str) -> String {
 
 /// The rclone filter file for a folder: the ignore list, then the files
 /// that are being left out (because they could not sync, or because the user
-/// chose to ignore them).
+/// chose to ignore them). A left-out folder, stored with a trailing slash,
+/// leaves out the folder and everything in it.
 pub fn filters_text(s: &Settings, pair: &Pair) -> String {
     let mut out = String::from("# Written by SyncHopper. Change the ignore list in Advanced settings.\n");
     for p in &s.ignore_patterns {
@@ -427,7 +694,10 @@ pub fn filters_text(s: &Settings, pair: &Pair) -> String {
     paths.sort_unstable();
     paths.dedup();
     for path in paths {
-        out.push_str(&format!("- /{}\n", escape_glob(path)));
+        match path.strip_suffix('/') {
+            Some(dir) => out.push_str(&format!("- /{}/**\n", escape_glob(dir))),
+            None => out.push_str(&format!("- /{}\n", escape_glob(path))),
+        }
     }
     out
 }
@@ -518,15 +788,16 @@ fn clear_locks(work: &Path) {
 pub fn file_view(k: &Skipped) -> FileView {
     let now = now_secs();
     let age = now.saturating_sub(k.first_failed);
-    let permanent = k.kind == "permanent";
+    let stuck = never_retried(&k.kind);
     FileView {
         path: k.path.clone(),
         reason: k.reason.clone(),
         detail: k.detail.clone(),
         kind: k.kind.clone(),
-        flagged: permanent || age >= FLAG_AFTER,
-        can_ignore: permanent || age >= IGNORE_AFTER,
+        flagged: stuck || age >= FLAG_AFTER,
+        can_ignore: stuck || age >= IGNORE_AFTER,
         next_retry: k.next_retry,
+        auto_retry: !stuck,
     }
 }
 
@@ -576,6 +847,7 @@ impl Engine {
                     files: p.skipped.iter().map(file_view).collect(),
                     ignored: p.ignored.iter().map(|k| k.path.clone()).collect(),
                     waiting: rt.and_then(|r| r.waiting.clone()),
+                    waiting_kind: rt.and_then(|r| r.waiting_kind.clone()),
                     retry_at: rt.and_then(|r| r.retry_at),
                     conflicts: rt.map(|r| r.conflicts.clone()).unwrap_or_default(),
                     summary: rt.map(|r| r.summary.clone()).unwrap_or_default(),
@@ -603,7 +875,12 @@ impl Engine {
 
     /// True while any folder is waiting for Koofr to come back.
     pub fn waiting_for_koofr(&self) -> bool {
-        self.inner.lock().unwrap().rt.values().any(|r| r.phase == Phase::Waiting)
+        self.inner.lock().unwrap().rt.values().any(|r| r.phase == Phase::Waiting && r.waiting_kind.as_deref() != Some("drive"))
+    }
+
+    /// True while any folder is waiting for the drive it is on.
+    pub fn waiting_for_drive(&self) -> bool {
+        self.inner.lock().unwrap().rt.values().any(|r| r.phase == Phase::Waiting && r.waiting_kind.as_deref() == Some("drive"))
     }
 
     /// How many sync runs a folder has had since the app started.
@@ -630,6 +907,7 @@ impl Engine {
             }
             if let Some(q) = inner.queue.iter_mut().find(|q| q.pair_id == job.pair_id) {
                 q.force |= job.force;
+                q.allow_all_changed |= job.allow_all_changed;
                 q.resync |= job.resync;
                 q.manual |= job.manual;
                 q.create_remote |= job.create_remote;
@@ -713,7 +991,7 @@ impl Engine {
     /// this way: the app does not empty a whole folder by itself.
     pub fn approve_deletes(&self, id: &str) {
         let allowed = self.with_rt(id, |rt| match &rt.approval {
-            Some(a) if !a.everything => {
+            Some(a) if !a.everything && !a.changed => {
                 rt.approval = None;
                 rt.phase = Phase::Idle;
                 true
@@ -722,6 +1000,24 @@ impl Engine {
         });
         if allowed {
             self.enqueue(Job { pair_id: id.to_string(), force: true, manual: true, ..Default::default() });
+        }
+    }
+
+    /// Syncs a folder where every file looked changed, after the user said
+    /// so. The run starts normally, and is only repeated with rclone's
+    /// safety checks off if it stops on the same thing again, so the
+    /// large-delete check still runs first.
+    pub fn approve_changed(&self, id: &str) {
+        let allowed = self.with_rt(id, |rt| match &rt.approval {
+            Some(a) if a.changed => {
+                rt.approval = None;
+                rt.phase = Phase::Idle;
+                true
+            }
+            _ => false,
+        });
+        if allowed {
+            self.enqueue(Job { pair_id: id.to_string(), allow_all_changed: true, manual: true, ..Default::default() });
         }
     }
 
@@ -789,7 +1085,7 @@ impl Engine {
                 k.tries = 0;
                 k.first_failed = now_secs();
                 k.notified = false;
-                if k.kind == "permanent" {
+                if never_retried(&k.kind) {
                     k.kind = "unknown".into();
                 }
                 if !p.skipped.iter().any(|x| x.path == k.path) {
@@ -833,6 +1129,12 @@ impl Engine {
         }
         if s.feature_drive && cfg!(windows) && ln.starts_with(&format!("{}:", s.drive_letter.to_lowercase())) {
             return Err("That folder is on the Koofr drive, which is already Koofr. Pick a folder on this PC.".into());
+        }
+        if koofr_refuses_chars(&remote) {
+            return Err("Koofr doesn't allow emoji and some other symbols in folder names. Rename the folder, or pick a different Koofr folder name.".into());
+        }
+        if remote.chars().count() + 1 > KOOFR_MAX_PATH {
+            return Err(format!("That Koofr folder's path is longer than Koofr allows ({KOOFR_MAX_PATH} characters)."));
         }
         for p in &s.pairs {
             if paths_overlap(&ln, &norm_local(&p.local), sep) {
@@ -1197,42 +1499,81 @@ impl Engine {
             rt.retry_at = (rt.phase == Phase::Waiting).then(|| now_secs() + wait.max(5));
             if rt.phase != Phase::Waiting {
                 rt.waiting = None;
+                rt.waiting_kind = None;
             }
         }
         self.core.host.state_changed();
     }
 
-    /// Koofr is down or out of reach. Nothing is blamed on any file; the
-    /// folder simply tries again later.
+    /// The folder can't sync for now for a reason that is not about its
+    /// files: Koofr is down or out of reach ("server", "network"), Koofr
+    /// says it is getting too many requests ("throttled"), a secure
+    /// connection to Koofr can't be made ("cert"), or the drive the folder
+    /// is on can't be used ("drive"). Nothing is blamed on any file; the
+    /// folder tries again by itself, and one notification is shown if it
+    /// goes on for a while.
     fn wait_outage(&self, pair: &Pair, interval_min: u32, kind: &str, raw: String, details: Vec<String>) {
         if kind == "blocked" || is_blocked_message(&raw) {
             return self.engine_blocked(pair, interval_min, &raw);
         }
-        let msg = if kind == "network" {
-            "Can't connect to Koofr right now."
-        } else {
-            "Koofr is having problems right now."
+        let name = file_name(&pair.local);
+        let keep_trying = "SyncHopper will keep trying and catch up once Koofr is back.";
+        // What the folder shows, which wait it is, and the notification.
+        let (waiting_kind, shown, key, title, body): (&str, String, String, String, String) = match kind {
+            "network" => {
+                let m = "Can't connect to Koofr right now.";
+                ("koofr", m.into(), "koofr".into(), m.into(), keep_trying.into())
+            }
+            "throttled" if self.core.settings().limit_requests => {
+                let m = "Koofr is busy right now.";
+                ("throttled", m.into(), "throttled".into(), m.into(), keep_trying.into())
+            }
+            "throttled" => (
+                "throttled",
+                "Koofr says SyncHopper is sending too many requests.".into(),
+                "throttled".into(),
+                "Koofr says SyncHopper is sending too many requests".into(),
+                "SyncHopper will keep trying. If this keeps happening, turn on Limit requests to Koofr in Advanced settings.".into(),
+            ),
+            "cert" => (
+                "cert",
+                format!("SyncHopper couldn't connect securely to Koofr. {}", cert_hint(&raw)),
+                "cert".into(),
+                "SyncHopper can't connect securely to Koofr".into(),
+                format!("{} SyncHopper will keep trying.", cert_hint(&raw)),
+            ),
+            "drive" => (
+                "drive",
+                drive_problem_text(&raw).into(),
+                format!("drive:{}", pair.id),
+                format!("{name} can't sync right now"),
+                format!("{} SyncHopper will keep trying.", drive_problem_text(&raw)),
+            ),
+            _ => {
+                let m = "Koofr is having problems right now.";
+                ("koofr", m.into(), "koofr".into(), m.into(), keep_trying.into())
+            }
         };
-        self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+        if waiting_kind == "drive" {
+            self.core.log(&format!("[{}] Waiting for the drive: {}", pair.local, raw));
+        } else {
+            self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+        }
         let mut fails = 0;
         self.finish(&pair.id, interval_min, |rt| {
             rt.phase = Phase::Waiting;
             rt.fails += 1;
             fails = rt.fails;
-            rt.waiting = Some(msg.to_string());
+            rt.waiting = Some(shown.clone());
+            rt.waiting_kind = Some(waiting_kind.to_string());
             rt.error = None;
             rt.details = details;
         });
-        let first_notice = {
-            let mut inner = self.inner.lock().unwrap();
-            let due = fails >= 3 && !inner.outage_notified;
-            if due {
-                inner.outage_notified = true;
-            }
-            due
-        };
+        // Brief blips are not worth a notification: only the third wait in
+        // a row tells the user, and only once until things work again.
+        let first_notice = fails >= 3 && self.inner.lock().unwrap().notified.insert(key);
         if first_notice {
-            self.core.notify(Notice::Problem, msg, "SyncHopper will keep trying and catch up once Koofr is back.");
+            self.core.notify(Notice::Problem, &title, &body);
         }
     }
 
@@ -1307,7 +1648,9 @@ impl Engine {
     /// Parks a folder until the user decides what to do about a large delete.
     fn ask_approval(&self, pair: &Pair, interval_min: u32, a: Approval) {
         let name = file_name(&pair.local);
-        let body = if a.everything {
+        let body = if a.changed {
+            "Every file in this folder looks changed since the last sync. SyncHopper is waiting for your OK before syncing them.".to_string()
+        } else if a.everything {
             let place = if a.side == "pc" { "on this PC" } else { "in Koofr" };
             format!("Everything in this folder is gone {place}. SyncHopper is waiting for you to decide what to do.")
         } else {
@@ -1339,13 +1682,21 @@ impl Engine {
             if pair.skipped.iter().chain(pair.ignored.iter()).any(|k| k.path == path) || add.iter().any(|k| k.path == path) {
                 continue;
             }
-            let kind = issue_kind(&f.msg);
+            // A name Koofr refuses can never sync as it is, whatever the
+            // error looked like.
+            let (kind, reason) = match koofr_name_problem(&pair.remote, &path) {
+                Some(why) => ("koofr_name", why),
+                None => {
+                    let kind = issue_kind(&f.msg);
+                    (kind, self.reason_for(kind, &f.object_type, &f.msg))
+                }
+            };
             // A file that was just put back for a retry and failed again keeps
             // its history, so long-running trouble is still noticed.
             if let Some(prev) = recent.iter().find(|k| k.path == path) {
                 let tries = prev.tries.saturating_add(1);
                 add.push(Skipped {
-                    reason: file_reason(kind, &f.object_type, &f.msg),
+                    reason,
                     detail: f.msg.clone(),
                     kind: kind.to_string(),
                     next_retry: now.saturating_add(retry_delay(kind, tries)),
@@ -1355,7 +1706,7 @@ impl Engine {
                 continue;
             }
             add.push(Skipped {
-                reason: file_reason(kind, &f.object_type, &f.msg),
+                reason,
                 detail: f.msg.clone(),
                 kind: kind.to_string(),
                 first_failed: now,
@@ -1380,6 +1731,87 @@ impl Engine {
             }
         });
         true
+    }
+
+    /// The reason shown for a left-out file. A file Koofr turned away for
+    /// too many requests only points to Limit requests to Koofr while that
+    /// setting is off.
+    fn reason_for(&self, kind: &str, object_type: &str, raw: &str) -> String {
+        if kind == "throttled" && self.core.settings().limit_requests {
+            return "Koofr was too busy to take this file.".into();
+        }
+        file_reason(kind, object_type, raw)
+    }
+
+    /// Leaves out the names in a folder that Koofr would refuse, before
+    /// anything is sent, and drops the ones that are gone (renamed, moved or
+    /// deleted) so whatever replaced them syncs normally. Returns true when
+    /// the list of left-out files changed.
+    ///
+    /// Entries this check owns have no engine message. One that came from a
+    /// failed sync instead keeps its message and is never dropped here: its
+    /// path is rclone's, which can differ from the name on disk (rclone
+    /// shows a full-width "？" in a Windows name as "?", for example), so not
+    /// finding it on disk proves nothing. Dropping it anyway would only have
+    /// it fail, and be announced, all over again.
+    fn update_koofr_names(&self, pair: &Pair, s: &Settings, recent: &[Skipped]) -> bool {
+        let found = find_koofr_name_problems(Path::new(&pair.local), &pair.remote, &s.ignore_patterns);
+        // A capped list may be missing some, so nothing is dropped then.
+        let complete = found.len() < KOOFR_NAME_SCAN_MAX;
+        let now = now_secs();
+        let mut changed = false;
+        let mut added: Vec<String> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        self.core.update_pair(&pair.id, |p| {
+            if complete {
+                p.skipped.retain(|k| {
+                    let keep = k.kind != "koofr_name" || !k.detail.is_empty() || found.iter().any(|(path, _)| path == &k.path);
+                    if !keep {
+                        dropped.push(k.path.clone());
+                    }
+                    keep
+                });
+            }
+            for (path, why) in &found {
+                if p.ignored.iter().any(|k| &k.path == path) {
+                    continue;
+                }
+                if let Some(k) = p.skipped.iter_mut().find(|k| &k.path == path) {
+                    // Found on disk, so from now on this check owns it.
+                    if k.kind != "koofr_name" || &k.reason != why || !k.detail.is_empty() {
+                        k.kind = "koofr_name".into();
+                        k.reason = why.clone();
+                        k.detail.clear();
+                        k.next_retry = now.saturating_add(retry_delay("koofr_name", k.tries));
+                        changed = true;
+                    }
+                    continue;
+                }
+                // Put back a moment ago by "Try again": keep its history, so
+                // it isn't announced as new.
+                let prev = recent.iter().find(|k| &k.path == path);
+                p.skipped.push(Skipped {
+                    path: path.clone(),
+                    reason: why.clone(),
+                    detail: String::new(),
+                    kind: "koofr_name".into(),
+                    first_failed: prev.map(|k| k.first_failed).unwrap_or(now),
+                    next_retry: now.saturating_add(retry_delay("koofr_name", 1)),
+                    tries: prev.map(|k| k.tries.saturating_add(1)).unwrap_or(1),
+                    base_pc: None,
+                    base_koofr: None,
+                    notified: prev.map(|k| k.notified).unwrap_or(false),
+                });
+                added.push(path.clone());
+            }
+        });
+        for path in &added {
+            self.core.log(&format!("[{}] Leaving out {path}: Koofr doesn't accept its name", pair.local));
+        }
+        for path in &dropped {
+            self.core.log(&format!("[{}] {path} is gone, so it is no longer left out", pair.local));
+        }
+        changed || !added.is_empty() || !dropped.is_empty()
     }
 
     /// The full Koofr path of a file inside a synced folder. Unlike
@@ -1513,7 +1945,7 @@ impl Engine {
             if outage.is_some() || cancel.is_cancelled() {
                 break;
             }
-            if !all && (k.kind == "permanent" || now < k.next_retry) {
+            if !all && (never_retried(&k.kind) || now < k.next_retry) {
                 continue;
             }
             // A file that is still locked on this PC can't sync yet, so there
@@ -1535,7 +1967,7 @@ impl Engine {
                         outage = Some((kind.to_string(), e));
                         continue;
                     }
-                    if outage_kind(kind) && !still_locked {
+                    if waits(kind) && !still_locked {
                         outage = Some((kind.to_string(), e.clone()));
                     }
                     if matches!(kind, "auth" | "quota" | "disk") {
@@ -1546,7 +1978,7 @@ impl Engine {
                     next.next_retry = now.saturating_add(retry_delay(kind, next.tries));
                     if !still_locked {
                         next.kind = kind.to_string();
-                        next.reason = file_reason(kind, "", &e);
+                        next.reason = self.reason_for(kind, "", &e);
                         next.detail = e;
                     }
                     updated.push(next);
@@ -1599,6 +2031,14 @@ impl Engine {
             Err(e) => return self.fail(&first, interval, e, vec![]),
         };
         if !Path::new(&first.local).is_dir() {
+            // The whole drive or network share is gone, not just the folder:
+            // wait for it to come back rather than calling the folder missing.
+            if let Some(root) = drive_root(&first.local) {
+                if !Path::new(&root).exists() {
+                    let raw = format!("The drive {root} is not available.");
+                    return self.wait_outage(&first, interval, "drive", raw.clone(), vec![raw]);
+                }
+            }
             let early = self.with_rt(&first.id, |rt| rt.missing_since.get_or_insert_with(Instant::now).elapsed() < MISSING_GRACE);
             if early {
                 // Most likely renamed a moment ago. Look again shortly
@@ -1635,11 +2075,19 @@ impl Engine {
             return self.finish(&first.id, interval, |rt| rt.phase = Phase::Idle);
         }
 
+        // Names Koofr would refuse are left out before anything is sent.
+        let names_changed = self.update_koofr_names(&first, &s, &put_back);
+
         let mut want_resync = job.resync;
-        let force = job.force;
+        let mut force = job.force;
+        // Set once a run that stopped because every file looked changed is
+        // repeated with rclone's safety checks off.
+        let mut forced_changed = false;
         // Set when the list of left-out files changed in a way rclone can
-        // take without a full rebuild of the sync record.
-        let mut soft_filters = !put_back.is_empty() && listing_ready(&work);
+        // take without a full rebuild of the sync record: files put back
+        // after being synced on their own, files newly left out, and
+        // refused names that are gone.
+        let mut soft_filters = (!put_back.is_empty() || names_changed) && listing_ready(&work);
         let mut conflicts: Vec<String> = Vec::new();
         let mut moved: u64 = 0;
 
@@ -1683,17 +2131,28 @@ impl Engine {
                 "[{}] Sync starting{}{}",
                 pair.local,
                 if resync { " (rebuilding the sync record)" } else { "" },
-                if force { " (large delete allowed)" } else { "" }
+                if forced_changed {
+                    " (every file looked changed, syncing anyway)"
+                } else if force {
+                    " (large delete allowed)"
+                } else {
+                    ""
+                }
             ));
             let me = self.clone();
             let id = pair.id.clone();
             let label = pair.local.clone();
             let mut found: Vec<String> = Vec::new();
+            // Files rclone counted as modified on each side: PC, Koofr.
+            let mut modified: [Option<u64>; 2] = [None, None];
             let res: RunResult = rc
                 .run_logged(&args, &cancel, |line| {
                     if let Some(st) = &line.stats {
                         me.on_stats(&id, st);
                         return;
+                    }
+                    if let Some((side, n)) = parse_change_summary(&line.msg) {
+                        modified[if side == "pc" { 0 } else { 1 }] = Some(n);
                     }
                     // rclone names a winner only for files that really differ
                     // on the two sides, so this marks a true conflict.
@@ -1710,6 +2169,13 @@ impl Engine {
                 moved += st.transfers + st.deletes;
             }
             conflicts.extend(found);
+            // The checks are only off for the one run straight after a
+            // normal run that stopped on every file looking changed. Any
+            // further run starts normally again, so rclone's large-delete
+            // check runs before anything else is let through.
+            if std::mem::take(&mut forced_changed) {
+                force = job.force;
+            }
 
             match classify(&res) {
                 Verdict::Ok => {
@@ -1730,13 +2196,24 @@ impl Engine {
                         rt.details.clear();
                         rt.approval = None;
                         rt.summary = summary.clone();
+                        if !resync {
+                            rt.rebuilt_out_of_sync = false;
+                        }
                         for c in conflicts.drain(..) {
                             if !rt.conflicts.contains(&c) && rt.conflicts.len() < 100 {
                                 rt.conflicts.push(c);
                             }
                         }
                     });
-                    self.inner.lock().unwrap().outage_notified = false;
+                    {
+                        // Koofr and this folder's drive work again, so a new
+                        // problem with them is worth telling.
+                        let mut inner = self.inner.lock().unwrap();
+                        for key in ["koofr", "throttled", "cert"] {
+                            inner.notified.remove(key);
+                        }
+                        inner.notified.remove(&format!("drive:{}", pair.id));
+                    }
                     self.core.log(&format!("[{}] Sync finished. {}", pair.local, summary));
                     let name = file_name(&pair.local);
                     self.notify_flagged(&pair.id, &name);
@@ -1760,6 +2237,56 @@ impl Engine {
                     self.core.update_pair(&pair.id, |p| p.needs_resync = true);
                     want_resync = true;
                     continue;
+                }
+                Verdict::AllChanged(side) => {
+                    // rclone stops when every file looks changed, which is
+                    // meant to catch clock changes. A few files are synced
+                    // anyway, since a person could easily have edited them
+                    // all; more need the user's OK. rclone's large-delete
+                    // check ran before this one, so the repeat skips nothing
+                    // the user hasn't been asked about.
+                    let count = match side.as_str() {
+                        "pc" => modified[0],
+                        "koofr" => modified[1],
+                        _ => modified[0].max(modified[1]),
+                    };
+                    let few = count.map(|n| n <= ALL_CHANGED_AUTO).unwrap_or(false);
+                    if !force && pass < 4 && (few || job.allow_all_changed) {
+                        self.core.log(&format!(
+                            "[{}] Every file looked changed ({} files). Syncing them anyway.",
+                            pair.local,
+                            count.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+                        ));
+                        force = true;
+                        forced_changed = true;
+                        continue;
+                    }
+                    let n = count.unwrap_or(0);
+                    self.core.log(&format!("[{}] Stopped: every file looked changed ({n} files).", pair.local));
+                    let a = Approval { deleted: n, total: n, side, everything: false, changed: true };
+                    return self.ask_approval(&pair, interval, a);
+                }
+                Verdict::OutOfSync { message, details } => {
+                    let again = self.with_rt(&pair.id, |rt| rt.rebuilt_out_of_sync);
+                    if !resync && !again && pass < 4 {
+                        // rclone's check after the sync found the two sides'
+                        // records out of step. Rebuilding the record fixes
+                        // that; it never deletes anything.
+                        self.core.log(&format!("[{}] The sync record was out of step. Rebuilding it.", pair.local));
+                        self.with_rt(&pair.id, |rt| rt.rebuilt_out_of_sync = true);
+                        self.core.update_pair(&pair.id, |p| p.needs_resync = true);
+                        want_resync = true;
+                        continue;
+                    }
+                    // It happened again before an ordinary sync could finish.
+                    // Rebuilding every time would keep bringing back deleted
+                    // files, so the folder stops instead, the same way it
+                    // always has for this.
+                    let restored = !resync && restore_records(&work);
+                    if !restored {
+                        self.core.update_pair(&pair.id, |p| p.needs_resync = true);
+                    }
+                    return self.fail_raw(&pair, interval, message, details);
                 }
                 Verdict::TooManyDeletes(_) if soft && pass < 4 => {
                     // Files that were just left out look like deletions to
@@ -1793,7 +2320,7 @@ impl Engine {
                         }
                         Some(n) => {
                             self.core.log(&format!("[{}] One side is empty ({side}). {n} files are still on the other side.", pair.local));
-                            let a = Approval { deleted: n, total: n, side, everything: true };
+                            let a = Approval { deleted: n, total: n, side, everything: true, changed: false };
                             return self.ask_approval(&pair, interval, a);
                         }
                         None => {
@@ -1829,6 +2356,15 @@ impl Engine {
                         .map(|m| m.to_string());
                     if let Some(m) = folder_problem {
                         return self.fail_raw(&pair, interval, m, details);
+                    }
+                    // The drive the folder is on can't be used, which is not
+                    // about any one file either.
+                    let drive_problem = std::iter::once(message.as_str())
+                        .chain(files.iter().map(|f| f.msg.as_str()))
+                        .find(|m| issue_kind(m) == "drive")
+                        .map(|m| m.to_string());
+                    if let Some(m) = drive_problem {
+                        return self.wait_outage(&pair, interval, "drive", m, details);
                     }
                     // Koofr itself is down: nothing could be read or sent, so
                     // no file is to blame.
@@ -1928,7 +2464,7 @@ mod tests {
     #[test]
     fn deletes_message() {
         let a = parse_deletes("too many deletes (>50%, 100 of 140) on Path1 \"/x/local/\". Run with --force if desired.").unwrap();
-        assert_eq!(a, Approval { deleted: 100, total: 140, side: "pc".into(), everything: false });
+        assert_eq!(a, Approval { deleted: 100, total: 140, side: "pc".into(), everything: false, changed: false });
         let b = parse_deletes("too many deletes (>10%, 3 of 9) on Path2 \"koofr:Docs\". Run with --force if desired.").unwrap();
         assert_eq!(b.side, "koofr");
     }
@@ -1974,6 +2510,44 @@ mod tests {
         r = RunResult { exit: 1, ..Default::default() };
         r.notices.push(LogLine { level: "notice".into(), msg: "Failed to bisync: prior lock file found: /x.lck".into(), ..Default::default() });
         assert_eq!(classify(&r), Verdict::LockFound);
+
+        // Every file changed, as rclone 1.76 logs it.
+        let notice = |m: &str| LogLine { level: "notice".into(), msg: m.into(), ..Default::default() };
+        r = RunResult { exit: 1, ..Default::default() };
+        r.errors.push(err("Safety abort: all files were changed on Path1 \"/x/a/\". Run with --force if desired.", "", ""));
+        r.notices.push(notice("Bisync aborted. Please try again."));
+        r.notices.push(notice("Failed to bisync: all files were changed"));
+        assert_eq!(classify(&r), Verdict::AllChanged("pc".into()));
+        r = RunResult { exit: 1, ..Default::default() };
+        r.errors.push(err("Safety abort: all files were changed on Path2 \"koofr:Docs/\". Run with --force if desired.", "", ""));
+        assert_eq!(classify(&r), Verdict::AllChanged("koofr".into()));
+        r.errors.push(err("Safety abort: all files were changed on Path1 \"/x/a/\". Run with --force if desired.", "", ""));
+        assert_eq!(classify(&r), Verdict::AllChanged("both".into()));
+        // The large-delete check comes first, as it does in rclone.
+        r.errors.insert(0, err("too many deletes (>50%, 2 of 3) on Path1 \"/a\". Run with --force if desired.", "", ""));
+        assert!(matches!(classify(&r), Verdict::TooManyDeletes(_)));
+
+        // rclone's check after a sync found the records out of step.
+        r = RunResult { exit: 7, ..Default::default() };
+        r.errors.push(err("-                   Path1 file not found in Path2               - pics/a.jpg", "", ""));
+        r.errors.push(err("Bisync critical error: path1 and path2 are out of sync, run --resync to recover", "", ""));
+        r.errors.push(err("Bisync aborted. Must run --resync to recover.", "", ""));
+        match classify(&r) {
+            Verdict::OutOfSync { message, details } => {
+                assert_eq!(message, "path1 and path2 are out of sync, run --resync to recover");
+                assert!(details.iter().any(|d| d.contains("pics/a.jpg")), "{details:?}");
+            }
+            v => panic!("unexpected {v:?}"),
+        }
+    }
+
+    #[test]
+    fn change_summaries() {
+        assert_eq!(parse_change_summary("Path1:    4 changes:    1 new,    3 modified,    0 deleted"), Some(("pc", 3)));
+        assert_eq!(parse_change_summary("Path2:    1 changes:    0 new,    1 modified,    0 deleted"), Some(("koofr", 1)));
+        assert_eq!(parse_change_summary("Path1:  120 changes:    0 new,  120 modified,    0 deleted"), Some(("pc", 120)));
+        assert_eq!(parse_change_summary("(Modified:    3 newer,    0 older,    3 larger,    0 smaller)"), None);
+        assert_eq!(parse_change_summary("Path1 checking for diffs"), None);
     }
 
     #[test]
@@ -1995,6 +2569,131 @@ mod tests {
         assert_eq!(retry_delay("server", 9), 3600);
         assert!(retry_delay("permanent", 1) > 10 * 365 * 86_400);
         assert!(file_reason("server", "*koofr.Object", "x").starts_with("Koofr couldn't send"));
+
+        // Koofr turning requests away, and its wording for a refused file.
+        let koofr = |code: u32| format!("Failed to copy: Invalid response status! Got {code}, expected 200; headers: map[Content-Length:[42]], content: x");
+        assert_eq!(issue_kind(&koofr(429)), "throttled");
+        assert_eq!(issue_kind("HTTP 429: Too Many Requests"), "throttled");
+        assert_eq!(issue_kind(&koofr(400)), "rejected");
+        assert_eq!(issue_kind(&koofr(503)), "server");
+        // Secure connection problems, as Go words them.
+        let expired = "Get \"https://app.koofr.net/api/v2/mounts\": tls: failed to verify certificate: x509: certificate has expired or is not yet valid: current time 2019-01-01T00:00:00Z is before 2026-01-01T00:00:00Z";
+        let unknown = "Get \"https://app.koofr.net/api/v2/mounts\": tls: failed to verify certificate: x509: certificate signed by unknown authority";
+        assert_eq!(issue_kind(expired), "cert");
+        assert_eq!(issue_kind(unknown), "cert");
+        assert!(cert_hint(expired).contains("date and time"));
+        assert!(cert_hint(unknown).contains("Wi-Fi sign-in page"));
+        // Windows' own wording for each file problem.
+        let win = |m: &str| format!("failed to open source object: open C:\\Users\\r\\x.txt: {m}");
+        assert_eq!(issue_kind(&win("The process cannot access the file because another process has locked a portion of the file.")), "locked");
+        assert_eq!(issue_kind(&win("The requested operation cannot be performed on a file with a user-mapped section open.")), "locked");
+        assert_eq!(issue_kind(&win("Operation did not complete successfully because the file contains a virus or potentially unwanted software.")), "virus");
+        assert_eq!(issue_kind(&win("The cloud file provider is not running.")), "onedrive");
+        assert_eq!(issue_kind(&win("The file cannot be accessed by the system.")), "cantaccess");
+        assert_eq!(issue_kind(&win("The media is write protected.")), "drive");
+        assert_eq!(issue_kind(&win("The device is not ready.")), "drive");
+        assert_eq!(issue_kind(&win("The device is not connected.")), "drive");
+        assert_eq!(issue_kind(&win("Data error (cyclic redundancy check).")), "unreadable");
+        assert_eq!(issue_kind(&win("The request could not be performed because of an I/O device error.")), "unreadable");
+        assert_eq!(issue_kind(&win("The file or directory is corrupted and unreadable.")), "unreadable");
+        assert_eq!(issue_kind(&win("Access is denied.")), "denied");
+
+        // A name in the message never decides the kind: these all used to be
+        // read as a wrong password, a full Koofr or a Koofr outage.
+        let busy = "The process cannot access the file because it is being used by another process.";
+        assert_eq!(issue_kind(&format!("open C:\\Users\\r\\Docs\\Invoice 401.pdf: {busy}")), "busy");
+        assert_eq!(issue_kind(&format!("open C:\\Users\\r\\Docs\\Sales quota 2026.xlsx: {busy}")), "busy");
+        assert_eq!(issue_kind(&format!("open \\\\?\\C:\\Users\\r\\Server 503 logs\\a.log: {busy}")), "busy");
+        assert_eq!(issue_kind("failed to open source object: open /home/r/disk full backup.zip: permission denied"), "denied");
+        assert_eq!(issue_kind(&format!("open C:\\Music\\Broken Pipe - Live.mp3: {busy}")), "busy");
+        assert_eq!(issue_kind("open C:\\Unauthorized\\a.jpg: Access is denied."), "denied");
+        assert_eq!(issue_kind("Failed to copy: Invalid response status! Got 400, expected 200; headers: map[Content-Length:[401]], content: "), "rejected");
+        assert_eq!(issue_kind("Failed to copy: Invalid response status! Got 400, expected 200; headers: map[Content-Length:[503]], content: "), "rejected");
+        assert_eq!(issue_kind("Post \"https://app.koofr.net/content/api/v2/mounts/x/files/put?path=%2FQuota\": dial tcp: lookup app.koofr.net: no such host"), "network");
+        // The OneDrive hint still comes from where the file is.
+        assert!(file_reason("cantaccess", "", "open C:\\Users\\r\\OneDrive\\b.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
+        assert_eq!(drive_problem_text("open E:\\write protected stuff\\a.txt: The device is not ready."), "Windows can't reach the drive this folder is on. It may be unplugged.");
+
+        // What the user reads for each.
+        assert!(file_reason("locked", "", "").contains("open in another program"));
+        assert!(file_reason("virus", "", "").contains("Protection history"));
+        assert!(file_reason("onedrive", "", "").contains("Always keep on this device"));
+        assert_eq!(file_reason("cantaccess", "", "open D:\\stuff\\a.txt: The file cannot be accessed by the system."), "Windows couldn't open this file.");
+        assert!(file_reason("cantaccess", "", "open C:\\Users\\r\\OneDrive\\a.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
+        assert!(file_reason("unreadable", "", "").contains("drive may be failing"));
+        assert!(file_reason("rejected", "", "").starts_with("Koofr refused this file."));
+        assert!(file_reason("throttled", "", "").contains("Limit requests to Koofr"));
+        assert_eq!(drive_problem_text("The device is not ready."), "Windows can't reach the drive this folder is on. It may be unplugged.");
+        assert!(drive_problem_text("The media is write protected.").contains("write-protected"));
+        // Anything not recognised gets one plain line; the engine's words go
+        // under the technical details.
+        assert_eq!(file_reason("unknown", "", "Failed to copy IMG_15001.jpg: odd"), FILE_UNEXPECTED);
+        assert!(file_reason("unknown", "", "open x: Access is denied.").contains("Windows"));
+
+        // Which ones are tried again, and how soon.
+        for k in ["permanent", "koofr_name", "virus"] {
+            assert!(never_retried(k), "{k}");
+            assert!(retry_delay(k, 1) > 10 * 365 * 86_400, "{k}");
+        }
+        for k in ["rejected", "locked", "unreadable", "onedrive", "cantaccess", "throttled", "unknown"] {
+            assert!(!never_retried(k), "{k}");
+        }
+        assert_eq!(retry_delay("rejected", 1), 24 * 3600);
+        assert_eq!(retry_delay("unreadable", 3), 3600);
+        assert_eq!([1, 2, 3, 4].map(|t| retry_delay("locked", t)), [300, 900, 1800, 3600]);
+        assert_eq!(retry_delay("busy", 5), 120);
+    }
+
+    #[test]
+    fn names_koofr_refuses() {
+        assert_eq!(koofr_name_problem("Docs", "notes.txt"), None);
+        assert_eq!(koofr_name_problem("Docs", "Caf\u{e9} \u{2600}/r\u{e9}sum\u{e9}.txt"), None);
+        let file = koofr_name_problem("Docs", "Trip/beach \u{1F3D6}.jpg").unwrap();
+        assert!(file.contains("Rename this file"), "{file}");
+        let dir = koofr_name_problem("Docs", "Party \u{1F389}/").unwrap();
+        assert!(dir.contains("Rename this folder"), "{dir}");
+        let inside = koofr_name_problem("Docs", "Party \u{1F389}/a.jpg").unwrap();
+        assert!(inside.contains("Rename the folder it's in"), "{inside}");
+        // The whole Koofr path counts, the synced folder's own path included.
+        let deep = format!("{}/{}.txt", "d".repeat(500), "f".repeat(515));
+        assert_eq!(koofr_name_problem("", &deep), None, "1021 characters with the leading slash");
+        assert!(koofr_name_problem("Docs", &deep).unwrap().contains("longer than Koofr allows"));
+        assert!(koofr_name_problem("Docs", &format!("{}/", "d".repeat(1020))).unwrap().contains("This folder's path"));
+    }
+
+    #[test]
+    fn scan_for_names_koofr_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mk = |p: &str| std::fs::create_dir_all(root.join(p)).unwrap();
+        let put = |p: &str| std::fs::write(root.join(p), "x").unwrap();
+        mk("fine/deeper");
+        put("fine/deeper/ok.txt");
+        put("fine/bad \u{1F600}.txt");
+        mk("Party \u{1F389}/inside");
+        put("Party \u{1F389}/inside/a.jpg");
+        mk("empty \u{1F4E6}");
+        put("~$lock \u{1F600}.docx");
+        let mut found = find_koofr_name_problems(root, "Docs", &["~$*".to_string()]);
+        found.sort();
+        let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        // A refused folder is listed once, without what's inside it; names
+        // on the ignore list are left alone.
+        assert_eq!(paths, vec!["Party \u{1F389}/", "empty \u{1F4E6}/", "fine/bad \u{1F600}.txt"]);
+        assert!(found[0].1.contains("Rename this folder"));
+        assert!(found[2].1.contains("Rename this file"));
+    }
+
+    #[test]
+    fn drive_roots() {
+        assert_eq!(drive_root("E:\\Photos\\2026").as_deref(), Some("E:\\"));
+        assert_eq!(drive_root("e:/Photos").as_deref(), Some("e:\\"));
+        assert_eq!(drive_root("\\\\nas\\share\\Photos").as_deref(), Some("\\\\nas\\share\\"));
+        assert_eq!(drive_root("//nas/share/Photos").as_deref(), Some("\\\\nas\\share\\"));
+        assert_eq!(drive_root("\\\\?\\C:\\long"), None);
+        assert_eq!(drive_root("\\\\nas"), None);
+        assert_eq!(drive_root("C:"), None);
+        assert_eq!(drive_root("/home/r/Photos"), None);
     }
 
     struct NoHost;
@@ -2064,6 +2763,53 @@ mod tests {
         assert_eq!(get().ignored.len(), 1);
         assert_eq!(filters_text(&core.settings(), &get()), before);
         assert!(engine.ignore_file("p1", "nope.txt").is_err());
+
+        // A name Koofr refuses is called that, whatever the error said, and
+        // isn't tried again by itself.
+        let refused = vec![FailedFile {
+            path: "trip/beach \u{1F3D6}.jpg".into(),
+            msg: "Failed to copy: Invalid response status! Got 400, expected 200".into(),
+            object_type: "*local.Object".into(),
+        }];
+        assert!(engine.update_skips(&get(), &refused, &work, false, &[]));
+        let k = get().skipped.into_iter().find(|k| k.path.starts_with("trip/")).unwrap();
+        assert_eq!(k.kind, "koofr_name");
+        assert!(k.reason.contains("Rename this file"));
+        assert!(file_view(&k).flagged && !file_view(&k).auto_retry);
+        // The check before each sync doesn't find it on disk, but it came
+        // from a failed sync, so it stays. One the check added and can no
+        // longer find is dropped.
+        core.update_pair("p1", |p| {
+            p.skipped.push(Skipped { path: "gone \u{1F600}.txt".into(), kind: "koofr_name".into(), reason: "x".into(), ..Default::default() })
+        });
+        assert!(engine.update_koofr_names(&get(), &core.settings(), &[]));
+        assert!(get().skipped.iter().any(|k| k.path.starts_with("trip/")));
+        assert!(!get().skipped.iter().any(|k| k.path.starts_with("gone")));
+        // Found on disk, an entry from a failed sync becomes the check's own.
+        std::fs::create_dir_all(dir.path().join("trip")).unwrap();
+        std::fs::write(dir.path().join("trip/beach \u{1F3D6}.jpg"), "x").unwrap();
+        assert!(engine.update_koofr_names(&get(), &core.settings(), &[]));
+        let k = get().skipped.into_iter().find(|k| k.path.starts_with("trip/")).unwrap();
+        assert!(k.detail.is_empty() && k.kind == "koofr_name");
+        assert!(!engine.update_koofr_names(&get(), &core.settings(), &[]), "nothing changes the second time");
+
+        // Koofr turning a file away points to the request limit only while
+        // it is off.
+        let busy = |path: &str| FailedFile { path: path.into(), msg: "Invalid response status! Got 429, expected 200".into(), object_type: "*local.Object".into() };
+        assert!(engine.update_skips(&get(), &[busy("one.txt")], &work, false, &[]));
+        core.update(|s| s.limit_requests = true);
+        assert!(engine.update_skips(&get(), &[busy("two.txt")], &work, false, &[]));
+        let reason = |path: &str| get().skipped.into_iter().find(|k| k.path == path).unwrap().reason;
+        assert!(reason("one.txt").contains("turn on Limit requests to Koofr"));
+        assert_eq!(reason("two.txt"), "Koofr was too busy to take this file.");
+
+        // Un-ignoring a file that is never retried by itself makes it due.
+        let mut virus = Skipped { path: "v.exe".into(), kind: "virus".into(), next_retry: u64::MAX / 4, ..Default::default() };
+        virus.notified = true;
+        core.update_pair("p1", |p| p.ignored.push(virus));
+        engine.unignore_file("p1", "v.exe").unwrap();
+        let back = get().skipped.into_iter().find(|k| k.path == "v.exe").unwrap();
+        assert_eq!((back.kind.as_str(), back.next_retry, back.notified), ("unknown", 0, false));
     }
 
     #[test]
@@ -2115,8 +2861,13 @@ mod tests {
         let s = Settings::default();
         let mut p = Pair::default();
         p.skipped.push(Skipped { path: "sub dir/we[ird] name.txt".into(), ..Default::default() });
+        p.skipped.push(Skipped { path: "Party \u{1F389}/".into(), kind: "koofr_name".into(), ..Default::default() });
+        p.ignored.push(Skipped { path: "old*/".into(), ..Default::default() });
         let t = filters_text(&s, &p);
         assert!(t.contains("- ~$*\n"));
         assert!(t.contains("- /sub dir/we\\[ird\\] name.txt\n"));
+        // A left-out folder leaves out everything in it, and the folder too.
+        assert!(t.contains("- /Party \u{1F389}/**\n"), "{t}");
+        assert!(t.contains("- /old\\*/**\n"), "{t}");
     }
 }

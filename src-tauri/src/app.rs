@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 pub const KOOFR_PASSWORD_URL: &str = "https://app.koofr.net/app/admin/preferences/password";
 pub const WINFSP_URL: &str = "https://winfsp.dev/rel/";
+pub const RCLONE_URL: &str = "https://rclone.org";
 
 /// How often the engine is looked at again on its own when it isn't ready,
 /// or isn't the signed copy yet.
@@ -226,6 +227,8 @@ impl App {
             "SyncHopper: needs attention".into()
         } else if self.engine.waiting_for_koofr() {
             "SyncHopper: waiting for Koofr".into()
+        } else if self.engine.waiting_for_drive() {
+            "SyncHopper: waiting for a drive".into()
         } else if self.engine.busy() {
             "SyncHopper: syncing".into()
         } else if self.uploads.active() > 0 {
@@ -741,10 +744,10 @@ impl App {
 
     /// Saves changed settings and applies what follows from them.
     pub async fn update_settings(self: &Arc<Self>, patch: serde_json::Value) -> Result<(), String> {
-        const EDITABLE: [&str; 20] = [
+        const EDITABLE: [&str; 21] = [
             "feature_sync", "feature_drive", "drive_letter", "feature_context_menu", "feature_sidebar", "autostart",
-            "check_interval_min", "transfers", "max_delete_percent", "auto_add_folders", "use_http2", "upload_limit_mbps",
-            "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery",
+            "check_interval_min", "transfers", "max_delete_percent", "auto_add_folders", "use_http2", "limit_requests",
+            "upload_limit_mbps", "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery",
             "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app",
         ];
         let old = self.core.settings();
@@ -806,7 +809,13 @@ impl App {
         if old.ignore_patterns != new.ignore_patterns {
             self.engine.filters_changed();
         }
-        if old.feature_drive != new.feature_drive || old.drive_letter != new.drive_letter || old.use_http2 != new.use_http2 {
+        // The drive is one long-running engine, so it has to reconnect to pick
+        // up a change to how it talks to Koofr.
+        if old.feature_drive != new.feature_drive
+            || old.drive_letter != new.drive_letter
+            || old.use_http2 != new.use_http2
+            || old.limit_requests != new.limit_requests
+        {
             let drive = self.drive.clone();
             let turned_on = !old.feature_drive && new.feature_drive;
             self.core.spawn(async move {
@@ -827,7 +836,10 @@ impl App {
         let mut defaults = self.core.settings();
         defaults.restore_advanced_defaults();
         let patch = serde_json::to_value(&defaults).map_err(|e| e.to_string())?;
-        let keep = ["use_http2", "upload_limit_mbps", "download_limit_mbps", "conflict_policy", "ignore_patterns", "pause_on_battery", "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app"];
+        let keep = [
+            "use_http2", "limit_requests", "upload_limit_mbps", "download_limit_mbps", "conflict_policy", "ignore_patterns",
+            "pause_on_battery", "pause_on_metered", "notify_level", "auto_update_engine", "auto_update_app",
+        ];
         let only: serde_json::Map<String, serde_json::Value> = patch
             .as_object()
             .map(|o| o.iter().filter(|(k, _)| keep.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -983,8 +995,15 @@ impl App {
             s.feature_sync, s.feature_drive, d.state, s.feature_context_menu, s.feature_sidebar, s.autostart, s.auto_update_app
         ));
         out.push_str(&format!(
-            "Sync: every {} min, {} at a time, HTTP/2 {}, limits up {} down {} MB/s, conflicts {}, delete check {}%\n",
-            s.check_interval_min, s.transfers, if s.use_http2 { "on" } else { "off" }, s.upload_limit_mbps, s.download_limit_mbps, s.conflict_policy, s.max_delete_percent
+            "Sync: every {} min, {} at a time, HTTP/2 {}, request limit {}, limits up {} down {} MB/s, conflicts {}, delete check {}%\n",
+            s.check_interval_min,
+            s.transfers,
+            if s.use_http2 { "on" } else { "off" },
+            if s.limit_requests { "on" } else { "off" },
+            s.upload_limit_mbps,
+            s.download_limit_mbps,
+            s.conflict_policy,
+            s.max_delete_percent
         ));
         out.push_str(&format!("Ignored: {}\n", s.ignore_patterns.join(", ")));
         let sync = self.engine.sync_view();

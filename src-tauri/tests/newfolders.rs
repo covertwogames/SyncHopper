@@ -170,6 +170,45 @@ async fn a_rename_to_a_name_koofr_already_has_keeps_the_old_koofr_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rename_to_a_name_koofr_refuses_keeps_the_old_koofr_name() {
+    let rig = rig_with_base().await;
+    write(&rig.pc("Docs/a.txt"), "a");
+    let id = rig.pair("Docs").await;
+    rig.app.folders.scan().await;
+    std::fs::rename(rig.pc("Docs"), rig.pc("Docs \u{1F4DA}")).unwrap();
+    rig.app.folders.scan().await;
+    let pair = rig.app.core.pair(&id).unwrap();
+    assert_eq!(pair.local, rig.pc("Docs \u{1F4DA}").to_string_lossy());
+    assert_eq!(pair.remote, "Docs");
+    let n = notices(&rig);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].0, "rename_kept");
+    assert!(n[0].1.starts_with("Koofr doesn't allow emoji"), "{}", n[0].1);
+    assert!(rig.host.notes.lock().unwrap().iter().any(|(t, _)| t == "\"Docs \u{1F4DA}\" was not renamed in Koofr"));
+    write(&rig.pc("Docs \u{1F4DA}/b.txt"), "b");
+    rig.sync(&id).await;
+    assert_eq!(rig.phase(&id), Phase::Ok, "{}", rig.dump(&id));
+    assert_eq!(read(&rig.koofr("Docs/b.txt")), "b");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_folder_named_with_emoji_is_explained_not_synced() {
+    let rig = rig_with_base().await;
+    write(&rig.pc("Party \u{1F389}/a.txt"), "a");
+    rig.app.folders.scan().await;
+    assert!(rig.app.core.settings().pairs.is_empty());
+    let n = notices(&rig);
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].0, "failed");
+    assert!(n[0].1.contains("Koofr doesn't allow emoji"), "{}", n[0].1);
+    // Renamed, it syncs.
+    std::fs::rename(rig.pc("Party \u{1F389}"), rig.pc("Party")).unwrap();
+    rig.app.folders.scan().await;
+    assert!(pair_for(&rig, "Party").is_some());
+    assert!(notices(&rig).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_folder_that_stopped_syncing_is_not_added_back() {
     let rig = rig_with_base().await;
     write(&rig.pc("Docs/a.txt"), "a");

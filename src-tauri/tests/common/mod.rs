@@ -156,6 +156,9 @@ pub async fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
 /// - `locked.list`: absolute paths made unreadable to the engine.
 /// - `listing_error`: every two-way sync fails with this message (written
 ///   JSON-escaped), as when a folder listing fails.
+/// - `listing_error_once`: the same, for the next two-way sync only.
+///
+/// Every command line it is given is added to `args.log`.
 ///
 /// Returns None when the test machine can't run it.
 #[cfg(unix)]
@@ -177,6 +180,7 @@ pub fn fake_engine(rig: &Rig, as_nobody: bool) -> Option<std::path::PathBuf> {
     let script = format!(
         r#"#!/bin/sh
 R='{root}'
+printf '%s\n' "$*" >> "$R/args.log"
 chmod -R a+rwX "$R" 2>/dev/null
 if [ -f "$R/locked.list" ]; then while read -r f; do chmod 000 "$f"; done < "$R/locked.list"; fi
 if [ "$1" != "bisync" ]; then exec {run} "$@"; fi
@@ -197,6 +201,14 @@ if [ -f "$R/listing_error" ]; then
   echo '{{"level":"error","msg":"'"$m"'"}}' >&2
   echo '{{"level":"error","msg":"Bisync critical error: '"$m"'"}}' >&2
   echo '{{"level":"error","msg":"Bisync aborted. Error is retryable without --resync due to --resilient mode."}}' >&2
+  exit 7
+fi
+if [ -f "$R/listing_error_once" ]; then
+  m=$(cat "$R/listing_error_once")
+  rm -f "$R/listing_error_once"
+  echo '{{"level":"error","msg":"'"$m"'"}}' >&2
+  echo '{{"level":"error","msg":"Bisync critical error: '"$m"'"}}' >&2
+  echo '{{"level":"error","msg":"Bisync aborted. Must run --resync to recover."}}' >&2
   exit 7
 fi
 if [ ! -f "$R/fail.list" ]; then exec {run} "$@"; fi

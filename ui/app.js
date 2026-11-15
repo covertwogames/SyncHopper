@@ -390,7 +390,11 @@
       Object.assign(st, {
         chip: "warn",
         label: "Needs your OK",
-        sub: p.approval.everything ? "Everything here is gone " + where : num(p.approval.deleted) + " of " + num(p.approval.total) + " files were deleted " + where,
+        sub: p.approval.changed
+          ? "Every file looks changed since the last sync"
+          : p.approval.everything
+            ? "Everything here is gone " + where
+            : num(p.approval.deleted) + " of " + num(p.approval.total) + " files were deleted " + where,
         btn: "Review",
         act: "review",
       });
@@ -417,7 +421,7 @@
     } else if (p.phase === "waiting") {
       Object.assign(st, {
         chip: "info",
-        label: "Waiting for Koofr",
+        label: p.waiting_kind === "drive" ? "Waiting for the drive" : "Waiting for Koofr",
         sub: (p.waiting || "Koofr is having problems right now.") + " " + retryText(p.retry_at),
         btn: "Try now",
         act: "sync",
@@ -698,7 +702,7 @@
 
   function reviewKind(p, wanted) {
     const busy = p.phase === "syncing" || p.phase === "checking" || p.phase === "queued";
-    if (p.approval && !busy) return (p.approval.everything ? "empty-" : "deletes-") + p.approval.side;
+    if (p.approval && !busy) return p.approval.changed ? "changed" : (p.approval.everything ? "empty-" : "deletes-") + p.approval.side;
     if (busy && p.approval) return "working";
     if (p.phase === "error") return "error";
     if (p.phase === "waiting" && wanted !== "files") return "waiting";
@@ -709,15 +713,17 @@
 
   function fileItem(f) {
     let retry;
-    if (f.kind === "permanent") retry = "SyncHopper won't try this one again by itself.";
+    if (!f.auto_retry) retry = "SyncHopper won't try this one again by itself.";
     else if (f.next_retry) {
       const secs = f.next_retry - Math.floor(Date.now() / 1000);
-      retry = secs <= 60 ? "It will be tried again at the next sync." : "It will be tried again in about " + plural(Math.max(1, Math.round(secs / 60)), "minute") + ".";
+      if (secs <= 60) retry = "It will be tried again at the next sync.";
+      else if (secs < 90 * 60) retry = "It will be tried again in about " + plural(Math.max(1, Math.round(secs / 60)), "minute") + ".";
+      else retry = "It will be tried again in about " + plural(Math.round(secs / 3600), "hour") + ".";
     } else retry = "It will be tried again at the next sync.";
     return (
       "<li><b>" + esc(f.path) + '</b><br><span class="small muted">' + esc(f.reason) + " " + esc(retry) + "</span>" +
       (f.detail ? '<details><summary class="small">Technical details</summary><pre>' + esc(f.detail) + "</pre></details>" : "") +
-      (f.can_ignore ? '<div style="margin-top:6px"><button type="button" class="btn small-btn" data-ignore="' + esc(f.path) + '">Ignore this file</button></div>' : "") +
+      (f.can_ignore ? '<div style="margin-top:6px"><button type="button" class="btn small-btn" data-ignore="' + esc(f.path) + '">' + (f.path.endsWith("/") ? "Ignore this folder" : "Ignore this file") + "</button></div>" : "") +
       "</li>"
     );
   }
@@ -737,9 +743,19 @@
     } else if (kind === "empty-koofr") {
       out.push("<p>Everything in this folder is gone from Koofr, or the folder was renamed or deleted there. This PC still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
       out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to Koofr. If you really want the folder empty, delete the files on this PC yourself and syncing will carry on.</p>");
+    } else if (kind === "changed") {
+      const count = a.deleted > 0 ? " (<b>" + plural(a.deleted, "file") + "</b>)" : "";
+      out.push("<p>Every file in this folder looks changed since the last sync" + count + ". That can happen after a clock change or restoring a backup. Sync them anyway?</p>");
     } else if (kind === "waiting") {
       out.push("<p><b>" + esc(p.waiting || "Koofr is having problems right now.") + "</b></p>");
-      out.push("<p>Nothing is wrong with your files. SyncHopper tries again by itself and catches up once Koofr is back. " + esc(retryText(p.retry_at)) + "</p>");
+      let next = "SyncHopper tries again by itself and catches up once Koofr is back.";
+      if (p.waiting_kind === "drive") next = "SyncHopper tries again by itself and catches up once it can use the drive again.";
+      else if (p.waiting_kind === "cert") next = "SyncHopper tries again by itself and catches up once it can connect securely.";
+      else if (p.waiting_kind === "throttled") {
+        next = "SyncHopper tries again by itself.";
+        if (!S.settings.limit_requests) next += " If this keeps happening, turn on Limit requests to Koofr in Advanced settings.";
+      }
+      out.push("<p>Nothing is wrong with your files. " + esc(next) + " " + esc(retryText(p.retry_at)) + "</p>");
       if (p.details.length) out.push("<details><summary>Technical details</summary><pre>" + esc(p.details.join("\n")) + "</pre></details>");
     } else if (kind === "working") {
       out.push("<p>This folder is syncing right now.</p>");
@@ -797,6 +813,12 @@
         { label: "Copy them back to " + here, kind: "primary", action: act("restore") },
       ];
     }
+    if (kind === "changed") {
+      return [
+        { label: "Decide later", left: true },
+        { label: "Sync them anyway", kind: "primary", action: act("approve_changed") },
+      ];
+    }
     if (kind === "working" || kind === "fine") return [{ label: "Close", kind: "primary" }];
     if (kind === "waiting") return [{ label: "Try now", action: act("sync") }, { label: "Close", kind: "primary" }];
     const buttons = [{ label: "Open folder", left: true, close: false, action: () => run("open_target", { kind: "pair_folder", value: id }).then(() => false) }];
@@ -811,8 +833,9 @@
   function reviewTitle(p, kind) {
     if (kind.startsWith("deletes-")) return "Check before deleting from " + p.name;
     if (kind.startsWith("empty-")) return p.name + " was emptied";
+    if (kind === "changed") return "Check before syncing " + p.name;
     if (kind === "error") return p.name + " could not sync";
-    if (kind === "waiting") return p.name + " is waiting for Koofr";
+    if (kind === "waiting") return p.name + (p.waiting_kind === "drive" ? " is waiting for its drive" : " is waiting for Koofr");
     if (kind === "skipped") return "Files left out of " + p.name;
     if (kind === "conflicts") return "Changed in both places";
     return p.name;
@@ -827,10 +850,10 @@
       old.modal.close();
     }
     const kind = reviewKind(p, wanted);
-    const entry = { id: id, kind: kind, wanted: wanted, modal: null };
+    const entry = { id: id, kind: kind, wanted: wanted, title: reviewTitle(p, kind), modal: null };
     entry.modal = openModal({
       width: 640,
-      title: reviewTitle(p, kind),
+      title: entry.title,
       body: reviewBody(p, kind),
       buttons: reviewButtons(p, kind),
       onClose: () => {
@@ -842,10 +865,11 @@
       const b = e.target.closest("[data-ignore]");
       if (!b) return;
       const path = b.dataset.ignore;
+      const what = path.endsWith("/") ? "folder" : "file";
       const ok = await confirmDialog(
         "Ignore " + lastPart(path) + "?",
-        "SyncHopper stops trying to sync this file and stops warning you about it. The file stays where it is. You can sync it again from the folder's menu under Ignored files.",
-        "Ignore this file"
+        "SyncHopper stops trying to sync this " + what + " and stops warning you about it. The " + what + " stays where it is. You can sync it again from the folder's menu under Ignored files.",
+        "Ignore this " + what
       );
       if (ok) run("ignore_file", { id: id, path: path });
     });
@@ -884,7 +908,7 @@
       return;
     }
     const kind = reviewKind(p, review.wanted);
-    if (kind !== review.kind) {
+    if (kind !== review.kind || reviewTitle(p, kind) !== review.title) {
       openReview(p.id, review.wanted);
     } else {
       review.modal.setBody(reviewBody(p, kind));
@@ -1241,6 +1265,7 @@
   $("#st-rerun").addEventListener("click", () => startWizard(true));
 
   $("#ad-log").addEventListener("click", () => run("open_target", { kind: "log" }));
+  $("#ad-rclone").addEventListener("click", () => run("open_target", { kind: "rclone_site" }));
 
   $("#ad-check").addEventListener("click", async () => {
     const before = S.update ? S.update.status : "";

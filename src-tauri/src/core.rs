@@ -185,7 +185,8 @@ impl Core {
             None if info.state == "blocked" => return Err(info.message),
             None => return Err("The sync engine is not installed yet.".to_string()),
         };
-        Ok(Rclone { exe, config: self.config_path(), cache: self.cache_dir() })
+        let extra = self.settings().engine_extra_flags();
+        Ok(Rclone { exe, config: self.config_path(), cache: self.cache_dir(), extra })
     }
 
     /// The full rclone path for a folder inside Koofr.

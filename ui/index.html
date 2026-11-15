@@ -176,6 +176,10 @@
             <input id="ad-http2" type="checkbox" data-set="use_http2">
             <label for="ad-http2"><span>Use HTTP/2</span><span class="small muted">Off is much faster for uploads to Koofr. Turn on only to test.</span></label>
           </div>
+          <div class="check">
+            <input id="ad-limit" type="checkbox" data-set="limit_requests">
+            <label for="ad-limit"><span>Limit requests to Koofr</span><span class="small muted">Limits syncs, uploads and the drive to 40 requests per second each, the rate Koofr recommends. Turn this on if Koofr says SyncHopper is sending too many requests. Big syncs may be a little slower, and the drive reconnects when you change this.</span></label>
+          </div>
         </section>
         <section aria-labelledby="ad-h-limits" class="col gap8">
           <h2 id="ad-h-limits">Limits and conflicts</h2>
@@ -236,6 +240,7 @@
             <input id="ad-update" type="checkbox" data-set="auto_update_engine">
             <label for="ad-update"><span>Keep the sync engine up to date automatically</span><span class="small muted" id="ad-engine-note"></span></label>
           </div>
+          <p class="small muted indent-check">rclone is free, open-source software by Nick Craig-Wood and the rclone contributors. <button type="button" class="link" id="ad-rclone">rclone.org</button></p>
         </section>
         <section aria-labelledby="ad-h-trouble" class="col gap8">
           <h2 id="ad-h-trouble">Troubleshooting</h2>

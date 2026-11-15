@@ -304,6 +304,8 @@ pub struct Rclone {
     pub exe: PathBuf,
     pub config: PathBuf,
     pub cache: PathBuf,
+    /// Added to every command, for example the request limit.
+    pub extra: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -405,6 +407,7 @@ impl Rclone {
         c.args(args);
         c.arg("--config").arg(&self.config);
         c.arg("--cache-dir").arg(&self.cache);
+        c.args(&self.extra);
         c.stdin(Stdio::null());
         c.kill_on_drop(true);
         platform::hide_window(&mut c);
@@ -812,8 +815,66 @@ pub const NETWORK_WORDS: &[&str] = &[
 
 /// True when the text describes a dropped or failed connection.
 pub fn is_network_error(raw: &str) -> bool {
-    let l = raw.to_lowercase();
+    let l = error_words(raw);
     NETWORK_WORDS.iter().any(|w| l.contains(w))
+}
+
+/// An error in lower case with its file paths, folder paths and web
+/// addresses taken out, so that what an error is gets decided by its words
+/// and never by a name in it: a file called "Sales quota 401.xlsx" that is
+/// open in another program is not "storage full" or "wrong password".
+///
+/// A path starts at a drive (`C:\`), a network or long path (`\\`), a
+/// slash after a space or quote, or `koofr:`, and runs up to a quote, the
+/// end of a line, or a colon that ends it (Windows names can't hold a
+/// colon). A web address runs up to a quote or a space.
+pub fn error_words(raw: &str) -> String {
+    let c: Vec<char> = raw.chars().collect();
+    let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, ch)| c.get(i + k).map(|x| x.to_ascii_lowercase()) == Some(ch));
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < c.len() {
+        let starts = i == 0 || matches!(c[i - 1], ' ' | '"' | '(' | '[' | '=' | '`' | '\t' | '\n');
+        let url = starts && (at(i, "http://") || at(i, "https://"));
+        let path = starts
+            && !url
+            && ((c[i] == '\\' && c.get(i + 1) == Some(&'\\'))
+                || (c[i].is_ascii_alphabetic() && c.get(i + 1) == Some(&':') && matches!(c.get(i + 2), Some('\\') | Some('/')))
+                || (c[i] == '/' && c.get(i + 1).is_some_and(|n| !n.is_whitespace() && *n != '/'))
+                || (at(i, "koofr:") && c.get(i + 6).is_some_and(|n| !n.is_whitespace())));
+        if !url && !path {
+            out.extend(c[i].to_lowercase());
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < c.len() {
+            let ch = c[j];
+            if ch == '"' || ch == '\n' || (url && ch.is_whitespace()) {
+                break;
+            }
+            if path && ch == ':' && c.get(j + 1).is_none_or(|n| n.is_whitespace()) {
+                break;
+            }
+            j += 1;
+        }
+        out.push(' ');
+        i = j;
+    }
+    out
+}
+
+/// True when the text (from `error_words`) reports this HTTP status, the
+/// way Koofr's errors do ("Invalid response status! Got 401, expected 200")
+/// or as "status code 401" or "HTTP error 401". Any other number, such as
+/// a header value or part of a name, is not a status.
+pub fn reports_status(words: &str, code: &str) -> bool {
+    ["status! got ", "status code ", "http error "].iter().any(|marker| {
+        words.match_indices(marker).any(|(i, _)| {
+            let digits: String = words[i + marker.len()..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            digits == code
+        })
+    })
 }
 
 /// A plain-language version of an error from the sync engine. Text it does
@@ -832,12 +893,13 @@ pub fn friendly_error(raw: &str) -> String {
 /// A plain-language version of an error, or None when it is not one SyncHopper
 /// recognises.
 pub fn friendly_known(raw: &str) -> Option<String> {
-    let l = raw.to_lowercase();
+    let l = error_words(raw);
     let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
-    // An HTTP status code standing on its own, not part of a longer number.
-    let code = |c: &str| l.split(|ch: char| !ch.is_ascii_digit()).any(|tok| tok == c);
+    let code = |c: &str| reports_status(&l, c);
     let text = if is_blocked_message(raw) {
         BLOCKED_TEXT
+    } else if code("429") || has(&["too many requests"]) {
+        "Koofr says SyncHopper is sending too many requests. If this keeps happening, turn on Limit requests to Koofr in Advanced settings."
     } else if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
         "Koofr did not accept the saved email and app password. Open Settings and run setup again to reconnect."
     } else if has(&["being used by another process", "sharing violation"]) {
@@ -870,6 +932,44 @@ mod tests {
 
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!("{FIX}/{name}")).unwrap()
+    }
+
+    #[test]
+    fn paths_and_addresses_are_left_out_of_error_words() {
+        let w = error_words("Failed to copy: failed to open source object: open C:\\Users\\r\\Sales quota\\Invoice 401.pdf: The process cannot access the file because it is being used by another process.");
+        assert!(!w.contains("quota") && !w.contains("401"), "{w}");
+        assert!(w.contains("failed to open source object: open"), "{w}");
+        assert!(w.contains("the process cannot access the file because it is being used by another process."), "{w}");
+        // rclone's long Windows paths and network shares.
+        let w = error_words("open \\\\?\\C:\\Unauthorized\\a.jpg: Access is denied.");
+        assert_eq!(w.trim(), "open  : access is denied.".trim(), "{w}");
+        let w = error_words("open \\\\nas\\share\\disk full\\b.txt: The device is not ready.");
+        assert!(!w.contains("disk full") && w.contains("the device is not ready."), "{w}");
+        // Quoted paths, several in one message.
+        let w = error_words("rename \"C:\\a\\quota.partial\" \"C:\\a\\quota.txt\": Access is denied.");
+        assert!(!w.contains("quota") && w.contains("access is denied."), "{w}");
+        assert!(!error_words("too many deletes (>50%, 2 of 3) on Path2 \"koofr:Quota/x\". Run with --force").contains("quota"));
+        // Web addresses carry names too.
+        let w = error_words("Post \"https://app.koofr.net/content/api/v2/mounts/x/files/put?path=%2FQuota&filename=a%20401.txt\": dial tcp: lookup app.koofr.net: no such host");
+        assert!(!w.contains("quota") && !w.contains("401") && w.contains("dial tcp: lookup app.koofr.net: no such host"), "{w}");
+        let w = error_words("Get https://app.koofr.net/api/v2/mounts: tls: failed to verify certificate: x509: certificate signed by unknown authority");
+        assert!(w.contains("tls: failed to verify certificate: x509:"), "{w}");
+        // Slashes that aren't paths stay.
+        for keep in ["i/o timeout", "an i/o device error", "use -l/--copy-links", "map[content-type:[application/json]]", "expected [200 206]"] {
+            assert!(error_words(keep).contains(keep), "{keep}");
+        }
+    }
+
+    #[test]
+    fn only_reported_statuses_count() {
+        let koofr = |code: u32, len: u32| error_words(&format!("Invalid response status! Got {code}, expected 200; headers: map[Content-Length:[{len}] Date:[Sat, 14 Nov 2026 10:50:30 GMT]], content: "));
+        assert!(reports_status(&koofr(400, 401), "400"));
+        assert!(!reports_status(&koofr(400, 401), "401"), "a header value is not a status");
+        assert!(!reports_status(&koofr(400, 503), "503"));
+        assert!(!reports_status(&koofr(4001, 0), "400"), "only the whole number counts");
+        assert!(reports_status(&error_words("unexpected status code 401"), "401"));
+        assert!(reports_status(&error_words("HTTP error 503 returned"), "503"));
+        assert!(!reports_status(&error_words("Failed to copy IMG_401.jpg: odd"), "401"));
     }
 
     #[test]
@@ -1007,5 +1107,12 @@ mod tests {
         assert!(is_network_error("read tcp 10.0.0.2:1->1.2.3.4:443: wsarecv: An established connection was aborted by the software in your host machine."));
         assert!(is_network_error("dial tcp 1.2.3.4:443: connectex: A connection attempt failed because the connected party did not properly respond after a period of time"));
         assert!(friendly_known("something odd").is_none());
+        // A number or word in a name is never taken for the error itself.
+        assert_eq!(friendly_known("open C:\\Users\\r\\Invoice 401.pdf: something odd"), None);
+        assert_eq!(friendly_known("open /home/r/Sales quota.xlsx: something odd"), None);
+        assert_eq!(friendly_known("Failed to copy Invoice 401.pdf: odd"), None);
+        let busy = "Invalid response status! Got 429, expected 200; headers: map[], content: ";
+        assert!(friendly_error(busy).contains("Limit requests to Koofr"));
+        assert!(friendly_error("HTTP 429 Too Many Requests").contains("too many requests"));
     }
 }

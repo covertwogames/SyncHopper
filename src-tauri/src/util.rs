@@ -42,6 +42,13 @@ pub fn new_id(prefix: &str) -> String {
     format!("{}{:x}{:x}", prefix, nanos, COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
+/// True when the text has characters Koofr refuses in file and folder names:
+/// code points from U+10000 up, which covers most emoji. rclone passes them
+/// on unchanged, so Koofr would reject the name.
+pub fn koofr_refuses_chars(text: &str) -> bool {
+    text.chars().any(|c| c as u32 >= 0x10000)
+}
+
 /// Case-insensitive match of `name` against a simple pattern with `*` and `?`.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
@@ -300,6 +307,10 @@ mod tests {
 
     #[test]
     fn globs() {
+        assert!(koofr_refuses_chars("Trip \u{1F3D6}.jpg"));
+        assert!(koofr_refuses_chars("\u{10000}"));
+        assert!(!koofr_refuses_chars("Caf\u{00E9} \u{2600} \u{FFFD} notes.txt"));
+        assert!(!koofr_refuses_chars(""));
         assert!(glob_match("~$*", "~$Budget.xlsx"));
         assert!(glob_match("*.tmp", "a.TMP"));
         assert!(glob_match("Thumbs.db", "thumbs.db"));
