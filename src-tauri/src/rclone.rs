@@ -325,6 +325,15 @@ pub struct LogLine {
     pub stats: Option<Stats>,
 }
 
+impl LogLine {
+    /// An error, including text that wasn't rclone's JSON and the levels
+    /// above "error" ("critical" and up) that rclone uses when it can't
+    /// even start, for example when Koofr can't be reached at all.
+    pub fn is_error(&self) -> bool {
+        matches!(self.level.as_str(), "error" | "raw" | "critical" | "alert" | "emergency")
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub bytes: u64,
@@ -538,7 +547,7 @@ impl Rclone {
                             });
                             if let Some(s) = &parsed.stats {
                                 res.stats = Some(s.clone());
-                            } else if parsed.level == "error" || parsed.level == "raw" {
+                            } else if parsed.is_error() {
                                 if res.errors.len() < 400 { res.errors.push(parsed.clone()); }
                             } else if parsed.level == "notice" || parsed.level == "warning" {
                                 if res.notices.len() < 400 { res.notices.push(parsed.clone()); }
@@ -1091,6 +1100,14 @@ mod tests {
         let n = parse_line(r#"{"level":"notice","msg":"y","stats":{"bytes":0,"eta":null}}"#).unwrap();
         assert_eq!(n.stats.unwrap().eta, None);
         assert!(parse_line("not json").is_none());
+        // What rclone 1.76 prints when Koofr can't be reached at all, as when
+        // a laptop has just woken up and isn't online yet.
+        let c = parse_line(r#"{"time":"2026-11-16T15:10:55-05:00","level":"critical","msg":"Failed to create file system for destination \"koofr:Docs\": Get \"https://app.koofr.net/api/v2/mounts\": dial tcp: lookup app.koofr.net: no such host","source":"cmd/cmd.go:208"}"#).unwrap();
+        assert!(c.is_error());
+        assert!(is_network_error(&c.msg));
+        for (level, error) in [("error", true), ("raw", true), ("alert", true), ("emergency", true), ("warning", false), ("notice", false), ("info", false)] {
+            assert_eq!(LogLine { level: level.into(), ..Default::default() }.is_error(), error, "{level}");
+        }
     }
 
     #[test]

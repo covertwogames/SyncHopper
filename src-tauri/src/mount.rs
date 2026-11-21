@@ -180,7 +180,7 @@ impl Drive {
             let core = me.core.clone();
             let res = rc
                 .run_logged(&args, &cancel, |line| {
-                    if line.level == "error" || line.level == "raw" {
+                    if line.is_error() {
                         core.log(&format!("[drive] {} {}", line.level, line.msg));
                     }
                 })

@@ -187,8 +187,8 @@ impl Uploads {
                                 i.view.speed = st.speed;
                             });
                             me.core.host.state_changed();
-                        } else if line.level == "error" {
-                            me.core.log(&format!("[upload] error {} {}", line.object, line.msg));
+                        } else if line.is_error() {
+                            me.core.log(&format!("[upload] {} {} {}", line.level, line.object, line.msg));
                         }
                     })
                     .await,

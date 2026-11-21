@@ -157,6 +157,9 @@ pub async fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
 /// - `listing_error`: every two-way sync fails with this message (written
 ///   JSON-escaped), as when a folder listing fails.
 /// - `listing_error_once`: the same, for the next two-way sync only.
+/// - `offline`: every two-way sync fails the way rclone 1.76 does when it
+///   can't reach Koofr at all, as on a laptop that just woke up: one
+///   "critical" line, exit code 1.
 ///
 /// Every command line it is given is added to `args.log`.
 ///
@@ -184,6 +187,10 @@ printf '%s\n' "$*" >> "$R/args.log"
 chmod -R a+rwX "$R" 2>/dev/null
 if [ -f "$R/locked.list" ]; then while read -r f; do chmod 000 "$f"; done < "$R/locked.list"; fi
 if [ "$1" != "bisync" ]; then exec {run} "$@"; fi
+if [ -f "$R/offline" ]; then
+  echo '{{"level":"critical","msg":"Failed to create file system for destination \"koofr:Docs\": Get \"https://app.koofr.net/api/v2/mounts\": dial tcp: lookup app.koofr.net: no such host","source":"cmd/cmd.go:208"}}' >&2
+  exit 1
+fi
 work=""; filters=""; prev=""
 for a in "$@"; do
   [ "$prev" = "--workdir" ] && work="$a"

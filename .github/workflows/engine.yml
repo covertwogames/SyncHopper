@@ -19,6 +19,11 @@
 # To run it by hand: Actions > Sync engine > Run workflow. Tick "force" to
 # sign and publish the current rclone version again.
 #
+# GitHub switches off scheduled workflows in a public repository after 60
+# days without any activity. The keep-alive job switches this workflow on
+# again every day, which starts that count over, so it keeps running even
+# when nothing is pushed for months.
+#
 # Uses the same settings as release.yml: the "release" environment, the
 # AZURE_CLIENT_ID and AZURE_TENANT_ID variables, and the
 # TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets.
@@ -44,6 +49,16 @@ env:
   RCLONE_KEY: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
 
 jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep this workflow switched on
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/engine.yml/enable"
+
   check:
     runs-on: ubuntu-latest
     permissions:

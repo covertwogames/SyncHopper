@@ -31,6 +31,13 @@ const BREATHER: Duration = Duration::from_secs(15);
 pub const MISSING_GRACE: Duration = Duration::from_secs(90);
 /// How often the battery and metered-connection checks run.
 const POWER_CHECK: Duration = Duration::from_secs(120);
+/// After the first failed connection to Koofr in a while, the next try comes
+/// this soon, and nothing changes on screen in between. A laptop that has
+/// just woken up is usually back online within it.
+pub const QUIET_RETRY: Duration = Duration::from_secs(20);
+/// A wait for Koofr whose retry time passed this long ago without a retry
+/// (the PC was asleep, say) is over: the next failure starts afresh.
+const KOOFR_WAIT_STALE: Duration = Duration::from_secs(600);
 /// The headline for a folder error SyncHopper does not recognise.
 pub const UNEXPECTED: &str = "Something unexpected stopped this folder from syncing.";
 /// The reason shown for a file whose error SyncHopper does not recognise.
@@ -110,6 +117,8 @@ pub struct Job {
     pub manual: bool,
     /// Create the Koofr folder if it is missing.
     pub create_remote: bool,
+    /// When it was queued. Set by `enqueue`.
+    pub queued_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -138,6 +147,9 @@ struct PairRt {
     /// before one does, the folder stops instead of rebuilding over and over
     /// (a rebuild can bring back files that were deleted).
     rebuilt_out_of_sync: bool,
+    /// What the folder showed before it was queued, to go back to if the
+    /// job is set aside while waiting for Koofr.
+    queued_from: Phase,
 }
 
 #[derive(Default)]
@@ -151,6 +163,29 @@ struct Inner {
     /// Waits already notified about ("koofr", "throttled", "cert", or
     /// "drive:<folder id>"), so each is told once until things work again.
     notified: HashSet<String>,
+    /// Koofr can't be reached (or is turning requests away). One folder
+    /// finding that out is enough: the others wait with it instead of each
+    /// trying in turn.
+    koofr_wait: Option<KoofrWait>,
+    /// Jobs set aside while waiting for Koofr, queued again once it's time
+    /// to try again or Koofr has answered.
+    held: Vec<Job>,
+}
+
+/// A wait for Koofr shared by every folder.
+struct KoofrWait {
+    /// Only a fresh "Sync now" or "Try now" runs before this.
+    until: Instant,
+    /// When the latest try failed.
+    since: Instant,
+    /// Unix time of `until`, for the screens.
+    retry_at: u64,
+    /// Failed tries in a row, the quiet first one included.
+    tries: u32,
+    /// How many of them were shown as "Waiting for Koofr".
+    shown: u32,
+    /// While shown: the folder text, the kind of wait and the details.
+    view: Option<(String, String, Vec<String>)>,
 }
 
 /// A file that is being left out of syncing, as the screens see it.
@@ -911,11 +946,22 @@ impl Engine {
                 q.resync |= job.resync;
                 q.manual |= job.manual;
                 q.create_remote |= job.create_remote;
+                if job.manual {
+                    q.queued_at = Some(Instant::now());
+                }
             } else {
                 let rt = inner.rt.entry(job.pair_id.clone()).or_default();
-                if rt.phase != Phase::Approval {
+                // A folder waiting for Koofr keeps saying so until it really
+                // tries again, rather than flicking to "Waiting to sync".
+                let koofr_wait = rt.phase == Phase::Waiting && rt.waiting_kind.as_deref() != Some("drive");
+                if rt.phase != Phase::Approval && !koofr_wait {
+                    if rt.phase != Phase::Queued {
+                        rt.queued_from = rt.phase;
+                    }
                     rt.phase = Phase::Queued;
                 }
+                let mut job = job;
+                job.queued_at = Some(Instant::now());
                 if job.manual {
                     inner.queue.push_front(job);
                 } else {
@@ -1364,10 +1410,16 @@ impl Engine {
                 continue;
             }
             self.refresh_auto_pause(&s).await;
+            self.retry_koofr_if_due();
             let mut due: Vec<String> = Vec::new();
             {
                 let mut inner = self.inner.lock().unwrap();
                 if inner.paused_all || inner.auto_pause.is_some() {
+                    continue;
+                }
+                // Waiting for Koofr: nothing starts by itself until it's time
+                // to try again.
+                if inner.koofr_wait.as_ref().is_some_and(|w| Instant::now() < w.until) {
                     continue;
                 }
                 let running = inner.current.as_ref().map(|(id, _)| id.clone());
@@ -1394,10 +1446,111 @@ impl Engine {
     /// Runs everything that is waiting, then returns.
     pub async fn drain(self: &Arc<Self>) {
         loop {
-            let job = self.inner.lock().unwrap().queue.pop_front();
+            let job = {
+                let mut inner = self.inner.lock().unwrap();
+                let mut next = None;
+                while let Some(job) = inner.queue.pop_front() {
+                    // While waiting for Koofr, only a "Sync now" or "Try now"
+                    // pressed since the last failed try goes ahead.
+                    let waiting = inner.koofr_wait.as_ref().filter(|w| Instant::now() < w.until).map(|w| w.since);
+                    match waiting {
+                        Some(since) if !(job.manual && job.queued_at.is_some_and(|t| t > since)) => Self::hold_job(&mut inner, job),
+                        _ => {
+                            next = Some(job);
+                            break;
+                        }
+                    }
+                }
+                next
+            };
             match job {
                 Some(job) => self.run_pair(job).await,
                 None => break,
+            }
+        }
+        self.core.host.state_changed();
+    }
+
+    /// Sets a job aside until it's time to try Koofr again. The folder shows
+    /// the shared wait, if there is one on screen.
+    fn hold_job(inner: &mut Inner, job: Job) {
+        let shown = inner.koofr_wait.as_ref().and_then(|w| w.view.clone().map(|v| (v, w.retry_at, w.until)));
+        let rt = inner.rt.entry(job.pair_id.clone()).or_default();
+        match shown {
+            Some(((text, kind, details), retry_at, until)) if rt.phase != Phase::Approval => {
+                rt.phase = Phase::Waiting;
+                rt.waiting = Some(text);
+                rt.waiting_kind = Some(kind);
+                rt.details = details;
+                rt.error = None;
+                rt.retry_at = Some(retry_at);
+                rt.next_due = Some(until);
+            }
+            _ => {
+                if rt.phase == Phase::Queued {
+                    rt.phase = rt.queued_from;
+                }
+            }
+        }
+        if let Some(h) = inner.held.iter_mut().find(|h| h.pair_id == job.pair_id) {
+            h.force |= job.force;
+            h.allow_all_changed |= job.allow_all_changed;
+            h.resync |= job.resync;
+            h.manual |= job.manual;
+            h.create_remote |= job.create_remote;
+        } else {
+            inner.held.push(job);
+        }
+    }
+
+    /// Once it's time to try Koofr again, puts the jobs that were set aside
+    /// back in the queue. The first one to run finds out whether Koofr is
+    /// back; if it isn't, the rest are set aside again without trying.
+    pub fn retry_koofr_if_due(&self) {
+        let jobs = {
+            let mut inner = self.inner.lock().unwrap();
+            let due = inner.koofr_wait.as_ref().is_some_and(|w| Instant::now() >= w.until);
+            if !due {
+                return;
+            }
+            std::mem::take(&mut inner.held)
+        };
+        for job in jobs {
+            self.enqueue(job);
+        }
+    }
+
+    /// Koofr answered, so the shared wait is over: whatever was set aside
+    /// runs now, and folders still showing the wait sync straight away.
+    fn koofr_answered(&self) {
+        let jobs = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.koofr_wait.take().is_none() && inner.held.is_empty() {
+                return;
+            }
+            for rt in inner.rt.values_mut() {
+                if rt.phase == Phase::Waiting && rt.waiting_kind.as_deref() != Some("drive") {
+                    rt.next_due = None;
+                }
+            }
+            std::mem::take(&mut inner.held)
+        };
+        for job in jobs {
+            self.enqueue(job);
+        }
+    }
+
+    /// For tests: acts as if the time to try Koofr again came `ago`.
+    #[doc(hidden)]
+    pub fn expire_koofr_wait(&self, ago: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        let past = Instant::now().checked_sub(ago + Duration::from_millis(10)).unwrap_or_else(Instant::now);
+        if let Some(w) = inner.koofr_wait.as_mut() {
+            w.until = past;
+        }
+        for rt in inner.rt.values_mut() {
+            if rt.next_due.is_some_and(|t| t > past) {
+                rt.next_due = Some(past);
             }
         }
     }
@@ -1512,7 +1665,10 @@ impl Engine {
     /// is on can't be used ("drive"). Nothing is blamed on any file; the
     /// folder tries again by itself, and one notification is shown if it
     /// goes on for a while.
-    fn wait_outage(&self, pair: &Pair, interval_min: u32, kind: &str, raw: String, details: Vec<String>) {
+    ///
+    /// A wait for Koofr is shared by every folder (see `wait_for_koofr`).
+    /// `manual` says the user started this sync.
+    fn wait_outage(&self, pair: &Pair, interval_min: u32, kind: &str, raw: String, details: Vec<String>, manual: bool) {
         if kind == "blocked" || is_blocked_message(&raw) {
             return self.engine_blocked(pair, interval_min, &raw);
         }
@@ -1554,11 +1710,10 @@ impl Engine {
                 ("koofr", m.into(), "koofr".into(), m.into(), keep_trying.into())
             }
         };
-        if waiting_kind == "drive" {
-            self.core.log(&format!("[{}] Waiting for the drive: {}", pair.local, raw));
-        } else {
-            self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+        if waiting_kind != "drive" {
+            return self.wait_for_koofr(pair, interval_min, kind, &raw, (waiting_kind, shown, key, title, body), details, manual);
         }
+        self.core.log(&format!("[{}] Waiting for the drive: {}", pair.local, raw));
         let mut fails = 0;
         self.finish(&pair.id, interval_min, |rt| {
             rt.phase = Phase::Waiting;
@@ -1572,6 +1727,125 @@ impl Engine {
         // Brief blips are not worth a notification: only the third wait in
         // a row tells the user, and only once until things work again.
         let first_notice = fails >= 3 && self.inner.lock().unwrap().notified.insert(key);
+        if first_notice {
+            self.core.notify(Notice::Problem, &title, &body);
+        }
+    }
+
+    /// Koofr can't be reached, or is turning requests away. Every folder
+    /// waits together: the others are set aside instead of each trying in
+    /// turn. The first failed connection in a while, unless the user started
+    /// the sync, changes nothing on screen and is tried again shortly, since
+    /// a PC that has just woken up is usually back online within seconds.
+    /// After that every folder shows the wait at once, it's tried again
+    /// after 2, 5, 10 and then every 15 minutes, and the third shown wait
+    /// brings one notification.
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_koofr(
+        &self,
+        pair: &Pair,
+        interval_min: u32,
+        kind: &str,
+        raw: &str,
+        texts: (&str, String, String, String, String),
+        details: Vec<String>,
+        manual: bool,
+    ) {
+        let (waiting_kind, shown_text, key, title, body) = texts;
+        let now = Instant::now();
+        let (quiet, shown, until, retry_at) = {
+            let mut inner = self.inner.lock().unwrap();
+            // A retry time that passed long ago without a retry (the PC was
+            // asleep) ends the old wait: this is a fresh start.
+            if inner.koofr_wait.as_ref().is_some_and(|w| now > w.until + KOOFR_WAIT_STALE) {
+                inner.koofr_wait = None;
+            }
+            let w = inner.koofr_wait.get_or_insert(KoofrWait { until: now, since: now, retry_at: 0, tries: 0, shown: 0, view: None });
+            w.tries += 1;
+            let quiet = kind == "network" && w.tries == 1 && !manual;
+            let secs = if quiet {
+                QUIET_RETRY.as_secs()
+            } else {
+                w.shown += 1;
+                match w.shown {
+                    1 => 120,
+                    2 => 300,
+                    3 => 600,
+                    _ => 900,
+                }
+            };
+            let secs = secs.min(interval_min as u64 * 60).max(5);
+            w.since = now;
+            w.until = now + Duration::from_secs(secs);
+            w.retry_at = now_secs() + secs;
+            w.view = (!quiet).then(|| (shown_text.clone(), waiting_kind.to_string(), details.clone()));
+            (quiet, w.shown, w.until, w.retry_at)
+        };
+        if quiet {
+            self.core.log(&format!("[{}] Couldn't reach Koofr. Trying again shortly: {}", pair.local, raw));
+        } else {
+            self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+        }
+        let synced_before = pair.last_sync > 0;
+        self.finish(&pair.id, interval_min, |rt| {
+            if quiet {
+                // Nothing changes on screen: the folder goes back to how it
+                // looked before this try.
+                if rt.phase != Phase::Approval {
+                    rt.phase = if rt.waiting.is_some() && rt.waiting_kind.as_deref() != Some("drive") {
+                        Phase::Waiting
+                    } else if rt.error.is_some() {
+                        Phase::Error
+                    } else if synced_before {
+                        Phase::Ok
+                    } else {
+                        Phase::Idle
+                    };
+                }
+            } else {
+                rt.phase = Phase::Waiting;
+                rt.fails += 1;
+                rt.waiting = Some(shown_text.clone());
+                rt.waiting_kind = Some(waiting_kind.to_string());
+                rt.error = None;
+                rt.details = details.clone();
+            }
+        });
+        {
+            // Every folder waits for the same retry time. The others are set
+            // aside, and while the wait is shown they show it too.
+            let s = self.core.settings();
+            let mut inner = self.inner.lock().unwrap();
+            let queued: Vec<Job> = inner.queue.drain(..).collect();
+            for job in queued {
+                Self::hold_job(&mut inner, job);
+            }
+            for p in s.pairs.iter().filter(|p| !p.paused) {
+                let rt = inner.rt.entry(p.id.clone()).or_default();
+                let drive_wait = rt.phase == Phase::Waiting && rt.waiting_kind.as_deref() == Some("drive");
+                if p.id == pair.id || (!quiet && rt.phase != Phase::Approval && !drive_wait) {
+                    rt.next_due = Some(until);
+                } else {
+                    rt.next_due = Some(rt.next_due.map_or(until, |t| t.max(until)));
+                }
+                if rt.phase == Phase::Waiting && !drive_wait {
+                    rt.retry_at = Some(retry_at);
+                }
+                if quiet || p.id == pair.id || rt.phase == Phase::Approval || drive_wait {
+                    continue;
+                }
+                rt.phase = Phase::Waiting;
+                rt.waiting = Some(shown_text.clone());
+                rt.waiting_kind = Some(waiting_kind.to_string());
+                rt.details = details.clone();
+                rt.error = None;
+                rt.retry_at = Some(retry_at);
+            }
+        }
+        self.core.host.state_changed();
+        // Brief blips are not worth a notification: only the third shown
+        // wait in a row tells the user, and only once until Koofr is back.
+        let first_notice = shown >= 3 && self.inner.lock().unwrap().notified.insert(key);
         if first_notice {
             self.core.notify(Notice::Problem, &title, &body);
         }
@@ -1647,6 +1921,8 @@ impl Engine {
 
     /// Parks a folder until the user decides what to do about a large delete.
     fn ask_approval(&self, pair: &Pair, interval_min: u32, a: Approval) {
+        // rclone compared both sides to get here, so Koofr is answering.
+        self.koofr_answered();
         let name = file_name(&pair.local);
         let body = if a.changed {
             "Every file in this folder looks changed since the last sync. SyncHopper is waiting for your OK before syncing them.".to_string()
@@ -2036,7 +2312,7 @@ impl Engine {
             if let Some(root) = drive_root(&first.local) {
                 if !Path::new(&root).exists() {
                     let raw = format!("The drive {root} is not available.");
-                    return self.wait_outage(&first, interval, "drive", raw.clone(), vec![raw]);
+                    return self.wait_outage(&first, interval, "drive", raw.clone(), vec![raw], job.manual);
                 }
             }
             let early = self.with_rt(&first.id, |rt| rt.missing_since.get_or_insert_with(Instant::now).elapsed() < MISSING_GRACE);
@@ -2069,7 +2345,7 @@ impl Engine {
         // so the folder sync itself never has to start over for them.
         let (put_back, outage) = self.retry_due(&rc, &s, &first, &cancel).await;
         if let Some((kind, raw)) = outage {
-            return self.wait_outage(&first, interval, &kind, raw.clone(), vec![raw]);
+            return self.wait_outage(&first, interval, &kind, raw.clone(), vec![raw], job.manual);
         }
         if cancel.is_cancelled() {
             return self.finish(&first.id, interval, |rt| rt.phase = Phase::Idle);
@@ -2117,7 +2393,7 @@ impl Engine {
                 if let Err(e) = rc.mkdir(&self.core.remote(&pair.remote)).await {
                     let kind = issue_kind(&e);
                     if outage_kind(kind) {
-                        return self.wait_outage(&pair, interval, kind, e.clone(), vec![e]);
+                        return self.wait_outage(&pair, interval, kind, e.clone(), vec![e], job.manual);
                     }
                     return self.fail_raw(&pair, interval, e.clone(), vec![e]);
                 }
@@ -2214,6 +2490,7 @@ impl Engine {
                         }
                         inner.notified.remove(&format!("drive:{}", pair.id));
                     }
+                    self.koofr_answered();
                     self.core.log(&format!("[{}] Sync finished. {}", pair.local, summary));
                     let name = file_name(&pair.local);
                     self.notify_flagged(&pair.id, &name);
@@ -2364,7 +2641,7 @@ impl Engine {
                         .find(|m| issue_kind(m) == "drive")
                         .map(|m| m.to_string());
                     if let Some(m) = drive_problem {
-                        return self.wait_outage(&pair, interval, "drive", m, details);
+                        return self.wait_outage(&pair, interval, "drive", m, details, job.manual);
                     }
                     // Koofr itself is down: nothing could be read or sent, so
                     // no file is to blame.
@@ -2381,7 +2658,7 @@ impl Engine {
                         None
                     };
                     if let Some(kind) = outage {
-                        return self.wait_outage(&pair, interval, kind, message, details);
+                        return self.wait_outage(&pair, interval, kind, message, details, job.manual);
                     }
                     let soft_ok = !resync && (restored || (!must_resync && listing_ready(&work)));
                     if self.update_skips(&pair, &files, &work, !soft_ok, &put_back) && pass < 4 && !cancel.is_cancelled() {
