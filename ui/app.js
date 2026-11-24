@@ -77,6 +77,48 @@
     return base.replace(/[\\/]+$/, "") + sep + name.replace(/\//g, sep);
   }
 
+  // ----- icons and small page parts ---------------------------------------
+
+  // Line icons on a 20 by 20 grid. They ship with the app, so they look the
+  // same on every system.
+  const ICONS = {
+    folder: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h3.4l1.6 1.8h6A1.5 1.5 0 0 1 17 8.3v6.2a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5z"/>',
+    drive: '<rect x="3" y="6" width="14" height="8" rx="1.5"/><path d="M6 11.3h.1M9 11.3h5"/>',
+    ok: '<circle cx="10" cy="10" r="7"/><path d="M6.8 10.2l2.2 2.2 4.2-4.6"/>',
+    sync: '<path d="M4.5 9a5.6 5.6 0 0 1 10-2.6M15.5 11a5.6 5.6 0 0 1-10 2.6M14.8 3.6v3h-3M5.2 16.4v-3h3"/>',
+    warn: '<path d="M10 3.5l7 12.5H3zM10 8.5v3.5M10 14.2v.1"/>',
+    clock: '<circle cx="10" cy="10" r="7"/><path d="M10 6.2V10l2.6 1.6"/>',
+    pause: '<circle cx="10" cy="10" r="7"/><path d="M8.3 7.6v4.8M11.7 7.6v4.8"/>',
+    off: '<circle cx="10" cy="10" r="7"/><path d="M6.8 10h6.4"/>',
+    info: '<circle cx="10" cy="10" r="7"/><path d="M10 9.4v4.1M10 6.6v.1"/>',
+    more: '<circle cx="5" cy="10" r="1" fill="currentColor"/><circle cx="10" cy="10" r="1" fill="currentColor"/><circle cx="15" cy="10" r="1" fill="currentColor"/>',
+    upload: '<path d="M10 13V4.5M6.5 8L10 4.5 13.5 8M4.5 15.5h11"/>',
+    plus: '<path d="M10 4.5v11M4.5 10h11"/>',
+    gear: '<path d="M8.63 4.47L8.87 2.48L11.13 2.48L11.37 4.47L12.94 5.12L14.52 3.89L16.11 5.48L14.88 7.06L15.53 8.63L17.52 8.87L17.52 11.13L15.53 11.37L14.88 12.94L16.11 14.52L14.52 16.11L12.94 14.88L11.37 15.53L11.13 17.52L8.87 17.52L8.63 15.53L7.06 14.88L5.48 16.11L3.89 14.52L5.12 12.94L4.47 11.37L2.48 11.13L2.48 8.87L4.47 8.63L5.12 7.06L3.89 5.48L5.48 3.89L7.06 5.12z"/><circle cx="10" cy="10" r="2.5"/>',
+    back: '<path d="M16 10H4.5M9 5.5L4.5 10 9 14.5"/>',
+    chevron: '<path d="M8 5.5l4.5 4.5L8 14.5"/>',
+  };
+
+  function icon(name, size) {
+    const s = size || 20;
+    return (
+      '<svg class="ico" aria-hidden="true" focusable="false" width="' + s + '" height="' + s +
+      '" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
+      ICONS[name] +
+      "</svg>"
+    );
+  }
+
+  // A notice bar. `html` goes into the page as it is, so escape text first.
+  function banner(tone, html, buttons) {
+    return '<div class="banner' + (tone === "warn" ? " warn" : "") + '">' + icon(tone === "warn" ? "warn" : "info") + "<span>" + html + "</span>" + (buttons || "") + "</div>";
+  }
+
+  // An icon with one line of text beside it. tone: ok, warn, busy or quiet.
+  function statusLine(tone, name, text) {
+    return '<span class="status ' + tone + '">' + icon(name, 18) + '<span class="status-text">' + esc(text) + "</span></span>";
+  }
+
   let toastTimer = null;
   function toast(message, ms) {
     const el = $("#toast");
@@ -217,7 +259,7 @@
         title: title || "Choose a Koofr folder",
         body:
           '<div class="crumbs" id="br-crumbs"></div>' +
-          '<div class="browser-list"><ul class="list pick" id="br-list"></ul><p class="small muted" id="br-note" style="padding:12px 14px"></p></div>' +
+          '<div class="browser-list"><ul class="list pick" id="br-list"></ul><p class="small muted list-note" id="br-note"></p></div>' +
           '<div class="row gap8"><input type="text" id="br-new" class="grow" placeholder="Name for a new folder here" aria-label="Name for a new folder here" autocomplete="off" spellcheck="false">' +
           '<button type="button" class="btn" id="br-make">Create folder</button></div>',
         buttons: [
@@ -251,7 +293,7 @@
           note.textContent = names.length ? "" : "No folders inside this one.";
           note.hidden = names.length > 0;
           list.innerHTML = names
-            .map((n) => '<li tabindex="0" role="button" data-name="' + esc(n) + '"><span class="name">' + esc(n) + '</span><span class="tiny muted">Open</span></li>')
+            .map((n) => '<li tabindex="0" role="button" data-name="' + esc(n) + '">' + icon("folder", 18) + '<span class="name">' + esc(n) + "</span>" + icon("chevron", 16) + "</li>")
             .join("");
         } catch (e) {
           if (mine !== token) return;
@@ -380,15 +422,17 @@
   }
 
   function pairStatus(p) {
-    const st = { chip: "plain", label: "", sub: "", bar: null, btn: "Sync now", act: "sync" };
+    // tone: ok, warn, busy or quiet. icon: one of ICONS.
+    const st = { tone: "quiet", icon: "clock", label: "", sub: "", bar: null, btn: "Sync now", act: "sync" };
     const hold = S.sync.paused_all ? "All syncing is paused" : S.sync.auto_pause === "battery" ? "Paused while on battery" : S.sync.auto_pause === "metered" ? "Paused on a metered connection" : "";
     const busy = p.phase === "syncing" || p.phase === "checking" || p.phase === "queued";
     if (p.paused) {
-      Object.assign(st, { label: "Paused", sub: "This folder is not syncing", btn: "Resume", act: "resume" });
+      Object.assign(st, { icon: "pause", label: "Paused", sub: "This folder is not syncing", btn: "Resume", act: "resume" });
     } else if (p.approval && !busy) {
       const where = p.approval.side === "pc" ? "on this PC" : "in Koofr";
       Object.assign(st, {
-        chip: "warn",
+        tone: "warn",
+        icon: "warn",
         label: "Needs your OK",
         sub: p.approval.changed
           ? "Every file looks changed since the last sync"
@@ -403,7 +447,8 @@
       const speed = g.speed > 0 ? fmtSpeed(g.speed) : "";
       const eta = fmtEta(g.eta);
       Object.assign(st, {
-        chip: "info",
+        tone: "busy",
+        icon: "sync",
         label: g.total > 0 ? "Syncing " + num(Math.min(g.done + 1, g.total)) + " of " + plural(g.total, "file") : "Syncing",
         sub: [speed, eta].filter(Boolean).join(", ") || "Working",
         bar: g.percent,
@@ -412,7 +457,8 @@
       });
     } else if (busy) {
       Object.assign(st, {
-        chip: "info",
+        tone: p.phase === "queued" ? "quiet" : "busy",
+        icon: p.phase === "queued" ? "clock" : "sync",
         label: p.phase === "queued" ? "Waiting to sync" : "Checking for changes",
         sub: p.phase === "queued" ? "Another folder is syncing first" : "Comparing this PC with Koofr",
         btn: "Pause",
@@ -420,23 +466,22 @@
       });
     } else if (p.phase === "waiting") {
       Object.assign(st, {
-        chip: "info",
         label: p.waiting_kind === "drive" ? "Waiting for the drive" : "Waiting for Koofr",
         sub: (p.waiting || "Koofr is having problems right now.") + " " + retryText(p.retry_at),
         btn: "Try now",
         act: "sync",
       });
     } else if (p.phase === "error") {
-      Object.assign(st, { chip: "warn", label: "Needs attention", sub: p.error || "The last sync did not finish", btn: "Review", act: "review" });
+      Object.assign(st, { tone: "warn", icon: "warn", label: "Needs attention", sub: p.error || "The last sync did not finish", btn: "Review", act: "review" });
     } else if (flaggedFiles(p).length) {
       const f = flaggedFiles(p);
-      Object.assign(st, { chip: "warn", label: plural(f.length, "file needs", "files need") + " attention", sub: f[0].reason, btn: "Review", act: "review" });
+      Object.assign(st, { tone: "warn", icon: "warn", label: plural(f.length, "file needs", "files need") + " attention", sub: f[0].reason, btn: "Review", act: "review" });
     } else if (p.conflicts.length) {
-      Object.assign(st, { chip: "warn", label: plural(p.conflicts.length, "file", "files") + " changed in both places", sub: "See which ones", btn: "Review", act: "review" });
+      Object.assign(st, { tone: "warn", icon: "warn", label: plural(p.conflicts.length, "file", "files") + " changed in both places", sub: "See which ones", btn: "Review", act: "review" });
     } else if (hold) {
-      Object.assign(st, { label: "Paused", sub: hold });
+      Object.assign(st, { icon: "pause", label: "Paused", sub: hold });
     } else if (p.phase === "ok" || p.last_sync) {
-      Object.assign(st, { chip: "ok", label: "Up to date", sub: [ago(p.last_sync) + ".", quietExtras(p)].filter(Boolean).join(" ") });
+      Object.assign(st, { tone: "ok", icon: "ok", label: "Up to date", sub: [ago(p.last_sync) + ".", quietExtras(p)].filter(Boolean).join(" ") });
     } else {
       Object.assign(st, { label: "Not synced yet", sub: "Waiting for the first sync" });
     }
@@ -468,11 +513,16 @@
     return "Trying again in " + plural(Math.round(secs / 60), "minute") + ".";
   }
 
+  // st.extra, when given, is ready-made markup for under the text.
   function statusHtml(st) {
     return (
-      '<span class="chip ' + st.chip + '">' + esc(st.label) + "</span>" +
+      '<div class="status ' + st.tone + '">' +
+      icon(st.icon, 18) +
+      '<div class="status-text"><span>' + esc(st.label) + "</span>" +
       (st.bar == null ? "" : '<div class="bar" role="img" aria-label="Sync progress, ' + Math.round(st.bar) + ' percent done"><div style="width:' + Math.max(2, Math.min(100, st.bar)).toFixed(1) + '%"></div></div>') +
-      '<span class="sub">' + esc(st.sub) + "</span>"
+      (st.sub ? '<span class="sub">' + esc(st.sub) + "</span>" : "") +
+      (st.extra || "") +
+      "</div></div>"
     );
   }
 
@@ -489,33 +539,33 @@
 
   function renderMain() {
     const acct = S.account;
-    let line = "Connected as " + acct.email + ".";
-    if (acct.used != null && acct.total != null) line += " " + fmtBytes(acct.used) + " of " + fmtBytes(acct.total) + " used.";
+    let line = acct.email || "";
+    if (acct.used != null && acct.total != null) line += " \u00b7 " + fmtBytes(acct.used) + " of " + fmtBytes(acct.total) + " used";
     setText($("#main-account"), line);
 
     // Banners
     const banners = [];
-    if (S.test_mode) banners.push('<div class="banner info"><span>Test mode: syncing with a folder on this PC in place of Koofr.</span></div>');
+    if (S.test_mode) banners.push(banner("info", "Test mode: syncing with a folder on this PC in place of Koofr."));
     const eng = engineText();
-    if (eng) banners.push('<div class="banner"><span>' + esc(eng) + "</span>" + (engineStuck() ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : "") + "</div>");
+    if (eng) banners.push(banner("warn", esc(eng), engineStuck() ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : ""));
     const up = S.update || {};
-    if (up.status === "available") banners.push('<div class="banner info"><span>SyncHopper ' + esc(up.version) + ' is available.</span><button type="button" class="btn" data-banner="update">Install and restart</button></div>');
-    else if (up.status === "downloading") banners.push('<div class="banner info"><span>Downloading SyncHopper ' + esc(up.version) + ", " + up.percent + "% done.</span></div>");
-    else if (up.status === "installing") banners.push('<div class="banner info"><span>Installing the update. SyncHopper will close and open again by itself.</span></div>');
-    else if (up.status === "error" && up.version) banners.push('<div class="banner"><span>' + esc(up.message) + '</span><button type="button" class="btn" data-banner="update">Try again</button></div>');
-    if (S.sync.paused_all) banners.push('<div class="banner"><span>All syncing is paused.</span><button type="button" class="btn" data-banner="resume">Resume</button></div>');
-    else if (S.sync.auto_pause === "battery") banners.push('<div class="banner info"><span>Syncing is paused while this PC is on battery. Use Sync now on a folder to sync it anyway.</span></div>');
-    else if (S.sync.auto_pause === "metered") banners.push('<div class="banner info"><span>Syncing is paused on this metered connection. Use Sync now on a folder to sync it anyway.</span></div>');
+    if (up.status === "available") banners.push(banner("info", "SyncHopper " + esc(up.version) + " is available.", '<button type="button" class="btn" data-banner="update">Install and restart</button>'));
+    else if (up.status === "downloading") banners.push(banner("info", "Downloading SyncHopper " + esc(up.version) + ", " + up.percent + "% done."));
+    else if (up.status === "installing") banners.push(banner("info", "Installing the update. SyncHopper will close and open again by itself."));
+    else if (up.status === "error" && up.version) banners.push(banner("warn", esc(up.message), '<button type="button" class="btn" data-banner="update">Try again</button>'));
+    if (S.sync.paused_all) banners.push(banner("warn", "All syncing is paused.", '<button type="button" class="btn" data-banner="resume">Resume</button>'));
+    else if (S.sync.auto_pause === "battery") banners.push(banner("info", "Syncing is paused while this PC is on battery. Use Sync now on a folder to sync it anyway."));
+    else if (S.sync.auto_pause === "metered") banners.push(banner("info", "Syncing is paused on this metered connection. Use Sync now on a folder to sync it anyway."));
     (S.folder_notices || []).forEach((n) => {
       let buttons = "";
       if (n.kind === "clash" || n.kind === "not_synced" || n.kind === "failed") buttons += '<button type="button" class="btn" data-banner="fsync" data-local="' + esc(n.local) + '">Sync it</button>';
       if (n.kind === "files") buttons += '<button type="button" class="btn" data-banner="fopen">Open folder</button>';
       buttons += '<button type="button" class="btn" data-banner="fdismiss" data-id="' + esc(n.id) + '">Dismiss</button>';
-      banners.push('<div class="banner info"><span>' + esc(n.message) + "</span>" + buttons + "</div>");
+      banners.push(banner("info", esc(n.message), buttons));
     });
     setHtml($("#main-banners"), banners.join(""));
 
-    // Folder cards, updated in place so buttons stay clickable.
+    // Folder rows, updated in place so buttons stay clickable.
     const list = $("#pair-list");
     const syncOn = S.settings.feature_sync;
     const pairs = syncOn ? S.pairs : [];
@@ -525,21 +575,22 @@
       let li = list.querySelector('li[data-id="' + p.id + '"]');
       if (!li) {
         li = document.createElement("li");
-        li.className = "card";
         li.dataset.id = p.id;
         li.innerHTML =
-          '<div class="card-main"><span class="name"></span><span class="path selectable"></span></div>' +
-          '<div class="card-status"></div>' +
+          icon("folder") +
+          '<div class="frow-main"><span class="name"></span><span class="path selectable"></span></div>' +
+          '<div class="frow-status"></div>' +
           '<button type="button" class="btn main"></button>' +
-          '<button type="button" class="btn icon more" aria-haspopup="menu">&#8943;</button>';
+          '<button type="button" class="btn subtle icon more" aria-haspopup="menu">' + icon("more", 18) + "</button>";
         list.appendChild(li);
       }
       if (list.children[index] !== li) list.insertBefore(li, list.children[index]);
       const st = pairStatus(p);
       setText($(".name", li), p.name);
+      $(".name", li).title = p.name;
       setText($(".path", li), p.local);
       $(".path", li).title = p.local + "   Koofr: /" + p.remote;
-      setHtml($(".card-status", li), statusHtml(st));
+      setHtml($(".frow-status", li), statusHtml(st));
       const btn = $(".btn.main", li);
       setText(btn, st.btn);
       btn.dataset.act = st.act;
@@ -560,9 +611,10 @@
       empty.hidden = true;
     }
     $("#add-folder").hidden = !syncOn;
+    $("#main-footnote").hidden = !syncOn;
     setText(
       $("#main-footnote"),
-      syncOn ? "Checks Koofr for changes every " + plural(S.settings.check_interval_min, "minute") + ". Local changes sync right away." : ""
+      syncOn ? "Checks Koofr for changes every " + plural(S.settings.check_interval_min, "minute") + ". Changes on this PC sync right away." : ""
     );
     renderDrive();
   }
@@ -570,23 +622,34 @@
   function renderDrive() {
     const card = $("#drive-card");
     const d = S.drive;
-    card.hidden = !d.enabled;
+    $("#drive-section").hidden = !d.enabled;
     if (!d.enabled) return;
+    // tone, icon, status, what it means, button, what the button does
     const m = {
-      off: ["plain", "Not connected", "The drive is turned on but not connected yet.", "Connect", "retry"],
-      needs_driver: ["warn", "Driver needed", d.message || "The drive needs a small driver called WinFsp.", "Install driver", "install"],
-      installing: ["info", "Installing driver", "Windows may ask for permission. This can take a minute.", "", ""],
-      starting: ["info", "Connecting", "Setting up drive " + d.letter + ":", "", ""],
-      connected: ["ok", "Connected", "Your whole Koofr account, online only. Files download when you open them.", "Open", "open"],
-      error: ["warn", "Not connected", d.message || "The drive could not connect.", "Try again", "retry"],
-    }[d.state] || ["plain", d.state, "", "", ""];
+      off: ["quiet", "off", "Not connected", "The drive is turned on but not connected yet.", "Connect", "retry"],
+      needs_driver: ["warn", "warn", "Driver needed", d.message || "The drive needs a small driver called WinFsp.", "Install driver", "install"],
+      installing: ["busy", "sync", "Installing driver", "Windows may ask for permission. This can take a minute.", "", ""],
+      starting: ["busy", "sync", "Connecting", "Setting up drive " + d.letter + ":", "", ""],
+      connected: ["ok", "ok", "Connected", "Your whole account, without keeping the files on this PC", "Open", "open"],
+      error: ["warn", "warn", "Not connected", d.message || "The drive could not connect.", "Try again", "retry"],
+    }[d.state] || ["quiet", "off", d.state, "", "", ""];
     const html =
-      '<div class="card-main"><span class="name">Koofr drive (' + esc(d.letter) + ':)</span><span class="path">' + esc(m[2]) + "</span></div>" +
-      '<div class="card-status"><span class="chip ' + m[0] + '">' + esc(m[1]) + "</span>" +
-      (d.state === "needs_driver" ? '<button type="button" class="link small" data-drive="page" style="align-self:flex-start">Download the driver yourself</button>' : "") +
+      '<div class="frow">' +
+      icon("drive") +
+      '<div class="frow-main"><span class="name">Koofr drive (' + esc(d.letter) + ':)</span><span class="desc">' + esc(m[3]) + "</span></div>" +
+      '<div class="frow-status">' +
+      statusHtml({
+        tone: m[0],
+        icon: m[1],
+        label: m[2],
+        sub: "",
+        bar: null,
+        extra: d.state === "needs_driver" ? '<button type="button" class="link" data-drive="page">Download the driver yourself</button>' : "",
+      }) +
       "</div>" +
-      (m[3] ? '<button type="button" class="btn main" data-drive="' + m[4] + '">' + esc(m[3]) + "</button>" : '<span style="width:104px"></span>') +
-      '<span style="width:44px"></span>';
+      (m[4] ? '<button type="button" class="btn main" data-drive="' + m[5] + '">' + esc(m[4]) + "</button>" : '<span class="gap-main"></span>') +
+      '<span class="gap-more"></span>' +
+      "</div>";
     setHtml(card, html);
   }
 
@@ -647,6 +710,7 @@
       (retryingFiles(p).length ? '<button type="button" role="menuitem" data-m="retrying">Files waiting to sync (' + retryingFiles(p).length + ")</button>" : "") +
       ((p.ignored || []).length ? '<button type="button" role="menuitem" data-m="ignored">Ignored files (' + p.ignored.length + ")</button>" : "") +
       '<button type="button" role="menuitem" data-m="repair">Repair</button>' +
+      '<div class="menu-sep" role="separator"></div>' +
       '<button type="button" role="menuitem" class="danger" data-m="remove">Stop syncing this folder</button>';
     menu.dataset.id = id;
     menu.hidden = false;
@@ -723,7 +787,7 @@
     return (
       "<li><b>" + esc(f.path) + '</b><br><span class="small muted">' + esc(f.reason) + " " + esc(retry) + "</span>" +
       (f.detail ? '<details><summary class="small">Technical details</summary><pre>' + esc(f.detail) + "</pre></details>" : "") +
-      (f.can_ignore ? '<div style="margin-top:6px"><button type="button" class="btn small-btn" data-ignore="' + esc(f.path) + '">' + (f.path.endsWith("/") ? "Ignore this folder" : "Ignore this file") + "</button></div>" : "") +
+      (f.can_ignore ? '<div class="item-act"><button type="button" class="btn small-btn" data-ignore="' + esc(f.path) + '">' + (f.path.endsWith("/") ? "Ignore this folder" : "Ignore this file") + "</button></div>" : "") +
       "</li>"
     );
   }
@@ -883,7 +947,7 @@
       return (
         '<p class="small muted">These files are not synced. Choose Sync it again to have SyncHopper pick a file back up.</p>' +
         '<ul class="plain">' +
-        list.map((path) => '<li class="row" style="justify-content:space-between;gap:12px"><b class="selectable">' + esc(path) + '</b><button type="button" class="btn small-btn" data-unignore="' + esc(path) + '">Sync it again</button></li>').join("") +
+        list.map((path) => '<li class="row between gap12"><b class="selectable">' + esc(path) + '</b><button type="button" class="btn small-btn" data-unignore="' + esc(path) + '">Sync it again</button></li>').join("") +
         "</ul>"
       );
     };
@@ -942,7 +1006,7 @@
         '<p class="muted small">Pick a folder in Koofr and where to keep it on this PC. The two are then kept the same.</p>' +
         '<div class="field"><label for="af-remote">Koofr folder</label><div class="row gap8"><input id="af-remote" type="text" class="grow" autocomplete="off" spellcheck="false" placeholder="For example Documents"><button type="button" class="btn" id="af-rbrowse">Browse</button></div></div>' +
         '<div class="field"><label for="af-local">Folder on this PC</label><div class="row gap8"><input id="af-local" type="text" class="grow" autocomplete="off" spellcheck="false"><button type="button" class="btn" id="af-lbrowse">Browse</button></div></div>' +
-        (prefill && prefill.note ? '<p class="banner info"><span>' + esc(prefill.note) + "</span></p>" : "") +
+        (prefill && prefill.note ? banner("info", esc(prefill.note)) : "") +
         '<p id="af-preview" class="small muted" role="status"></p>' +
         '<p class="small muted">Files missing on either side are copied across. Nothing is deleted. If the same file is in both places, the newer one is kept.</p>',
       buttons: [
@@ -1299,7 +1363,7 @@
       ta.remove();
     }
     if (copied) toast("Diagnostic info copied. It has no passwords, and your email is masked.");
-    else openModal({ title: "Diagnostic info", width: 640, body: '<p class="small muted">Copying did not work, so here it is to select and copy by hand.</p><textarea rows="12" readonly style="width:100%">' + esc(text) + "</textarea>", buttons: [{ label: "Close", kind: "primary" }] });
+    else openModal({ title: "Diagnostic info", width: 640, body: '<p class="small muted">Copying did not work, so here it is to select and copy by hand.</p><textarea rows="12" readonly class="fill">' + esc(text) + "</textarea>", buttons: [{ label: "Close", kind: "primary" }] });
   });
 
   $("#ad-repair").addEventListener("click", () => {
@@ -1309,7 +1373,7 @@
     }
     const modal = openModal({
       title: "Repair a folder",
-      body: '<p class="small muted">Pick the folder to repair.</p><ul class="list pick">' + S.pairs.map((p) => '<li tabindex="0" role="button" data-id="' + esc(p.id) + '"><span class="name">' + esc(p.name) + '</span><span class="tiny muted">' + esc(p.local) + "</span></li>").join("") + "</ul>",
+      body: '<p class="small muted">Pick the folder to repair.</p><ul class="box list pick">' + S.pairs.map((p) => '<li tabindex="0" role="button" data-id="' + esc(p.id) + '">' + icon("folder", 18) + '<span class="name">' + esc(p.name) + '</span><span class="tiny muted">' + esc(p.local) + "</span></li>").join("") + "</ul>",
       buttons: [{ label: "Cancel" }],
     });
     const pick = (e) => {
@@ -1328,7 +1392,7 @@
       title: "Ignored files",
       body:
         '<p class="small muted">One pattern per line. A star stands for any text, so *.tmp means every file ending in .tmp. Files that match are never uploaded or downloaded.</p>' +
-        '<textarea id="ig-text" rows="9" spellcheck="false" aria-label="Ignore patterns, one per line" style="width:100%">' + esc(S.settings.ignore_patterns.join("\n")) + "</textarea>" +
+        '<textarea id="ig-text" rows="9" spellcheck="false" aria-label="Ignore patterns, one per line" class="fill">' + esc(S.settings.ignore_patterns.join("\n")) + "</textarea>" +
         '<p class="small muted">Saving a changed list makes every folder compare itself with Koofr again, which can take a while for big folders.</p>',
       buttons: [
         { label: "Use the standard list", left: true, close: false, action: (m) => { $("#ig-text", m.el).value = S.default_ignores.join("\n"); return false; } },
@@ -1417,7 +1481,7 @@
     $("#wiz-steps").innerHTML = STEPS.map((name, i) => {
       const skipped = i === 2 && !wiz.sync && wiz.step !== 2;
       const cls = i === wiz.step ? "current" : i < wiz.step ? "done" : "";
-      return '<li class="' + cls + (skipped ? " skipped" : "") + '"' + (i === wiz.step ? ' aria-current="step"' : "") + '><span class="num">' + (i < wiz.step && !skipped ? "&#10003;" : i + 1) + "</span>" + name + "</li>";
+      return '<li class="' + cls + (skipped ? " skipped" : "") + '"' + (i === wiz.step ? ' aria-current="step"' : "") + '><span class="num">' + (i < wiz.step && !skipped ? icon("ok", 20) : i + 1) + "</span>" + name + "</li>";
     }).join("");
   }
 
@@ -1437,12 +1501,12 @@
       const keep = !!S.account.email;
       page.innerHTML =
         "<header><h1>Connect your Koofr account</h1><p class=\"muted\">Koofr gives other apps their own password, so your normal password is never used here.</p></header>" +
-        (S.test_mode ? '<div class="banner info"><span>Test mode: this build uses a folder on this PC in place of Koofr. Any email works and the password is ignored.</span></div>' : "") +
-        (keep ? '<p><span class="chip ok big">Connected as ' + esc(S.account.email) + "</span></p><p class=\"small muted\">Leave the boxes empty to keep this account, or fill them in to switch to another one.</p>" : "") +
-        '<div class="field"><label for="wz-email">Koofr email</label><input id="wz-email" type="email" autocomplete="off" spellcheck="false" value="' + esc(wiz.email) + '"></div>' +
-        '<div class="field"><label for="wz-pass">App password</label><input id="wz-pass" type="password" autocomplete="off" value="' + esc(wiz.password) + '">' +
+        (S.test_mode ? banner("info", "Test mode: this build uses a folder on this PC in place of Koofr. Any email works and the password is ignored.") : "") +
+        (keep ? "<p>" + statusLine("ok", "ok", "Connected as " + S.account.email) + "</p><p class=\"small muted\">Leave the boxes empty to keep this account, or fill them in to switch to another one.</p>" : "") +
+        '<div class="field"><label for="wz-email">Koofr email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(wiz.email) + '"></div>' +
+        '<div class="field"><label for="wz-pass">App password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(wiz.password) + '">' +
         '<p class="small muted">No app password yet? <button type="button" class="link" id="wz-koofr">Open Koofr\'s app password page</button>, create one, and paste it here.</p></div>' +
-        '<div class="row" style="gap:12px"><button type="button" class="btn" id="wz-test">Test connection</button><span id="wz-result" role="status"></span></div>' +
+        '<div class="row gap12"><button type="button" class="btn" id="wz-test">Test connection</button><span id="wz-result" class="grow" role="status"></span></div>' +
         '<p id="wz-engine" class="tiny muted" role="status"><span id="wz-engine-text"></span><button type="button" class="link" id="wz-engine-retry" hidden>Try again</button></p>' +
         '<p class="tiny muted">The app password is saved on this PC only, scrambled the way rclone stores it. You can cancel it any time on the same Koofr page.</p>';
       $("#wz-email").addEventListener("input", (e) => {
@@ -1466,12 +1530,14 @@
     } else if (wiz.step === 1) {
       page.innerHTML =
         "<header><h1>Choose what to turn on</h1><p class=\"muted\">Every one of these can be changed later in Settings.</p></header>" +
+        '<div class="panel">' +
         '<div class="check"><input id="wz-sync" type="checkbox"' + (wiz.sync ? " checked" : "") + '><label for="wz-sync"><span>Synced folders</span><span class="small muted">Keep chosen Koofr folders on this PC. Changes on either side are copied to the other.</span></label></div>' +
         '<div class="check"><input id="wz-drive" type="checkbox"' + (wiz.drive ? " checked" : "") + (S.windows ? "" : " disabled") + '><label for="wz-drive"><span>Koofr drive</span><span class="small muted">' +
         (S.windows ? "Browse your whole account as a drive letter without keeping the files on this PC. Installs a small driver called WinFsp, and Windows asks for permission." : "Browse your whole account as a drive letter. Only available on Windows.") +
         "</span></label></div>" +
         '<div class="check"><input id="wz-auto" type="checkbox"' + (wiz.auto ? " checked" : "") + '><label for="wz-auto"><span>Start with Windows</span><span class="small muted">Open quietly in the tray when you sign in, so syncing is always on.</span></label></div>' +
-        '<p class="small muted">Upload to Koofr is always there: a button in the main window for sending files straight to Koofr without keeping them in sync.</p>';
+        "</div>" +
+        '<p class="small muted">Upload is always there: a button in the main window for sending files straight to Koofr without keeping them in sync.</p>';
       $("#wz-sync").addEventListener("change", (e) => {
         wiz.sync = e.target.checked;
         renderSteps();
@@ -1484,16 +1550,16 @@
       });
     } else if (wiz.step === 2) {
       let listHtml;
-      if (wiz.loading) listHtml = '<p class="small muted" style="padding:12px 14px">Loading your Koofr folders</p>';
-      else if (wiz.foldersError) listHtml = '<p class="err" style="padding:12px 14px">' + esc(wiz.foldersError) + ' <button type="button" class="link" id="wz-reload">Try again</button></p>';
-      else if (wiz.folders && !wiz.folders.length) listHtml = '<p class="small muted" style="padding:12px 14px">Your Koofr account has no folders yet. You can add some later with Add a folder.</p>';
+      if (wiz.loading) listHtml = '<p class="small muted list-note">Loading your Koofr folders</p>';
+      else if (wiz.foldersError) listHtml = '<p class="err list-note">' + esc(wiz.foldersError) + ' <button type="button" class="link" id="wz-reload">Try again</button></p>';
+      else if (wiz.folders && !wiz.folders.length) listHtml = '<p class="small muted list-note">Your Koofr account has no folders yet. You can add some later with Add folder.</p>';
       else
         listHtml =
-          '<ul class="list" style="border:0">' +
+          '<ul class="list">' +
           (wiz.folders || [])
             .map((name, i) => {
               const on = !!wiz.chosen[name];
-              return '<li><input id="wz-f' + i + '" type="checkbox" style="margin:0" data-folder="' + esc(name) + '"' + (on ? " checked" : "") + '><label for="wz-f' + i + '" class="grow" style="font-weight:500">' + esc(name) + '</label><span class="' + (on ? "tag-on" : "tag-off") + '">' + (on ? "On this PC" : "Online only") + "</span></li>";
+              return '<li><input id="wz-f' + i + '" type="checkbox" data-folder="' + esc(name) + '"' + (on ? " checked" : "") + '><label for="wz-f' + i + '" class="grow">' + esc(name) + '</label><span class="' + (on ? "tag-on" : "tag-off") + '">' + (on ? "On this PC" : "Online only") + "</span></li>";
             })
             .join("") +
           "</ul>";
@@ -1502,7 +1568,7 @@
       page.innerHTML =
         "<header><h1>Pick folders to keep on this PC</h1><p class=\"muted\">Ticked folders are copied to this PC and stay in sync. Everything else stays online only.</p></header>" +
         '<div class="field"><label for="wz-base">Where to keep them</label><div class="row gap8"><input id="wz-base" type="text" class="grow" autocomplete="off" spellcheck="false" value="' + esc(wiz.base) + '"><button type="button" class="btn" id="wz-browse">Browse</button></div></div>' +
-        '<div role="group" aria-label="Koofr folders" style="border:1px solid var(--line);border-radius:10px">' + listHtml + "</div>" +
+        '<div role="group" aria-label="Koofr folders" class="box">' + listHtml + "</div>" +
         '<p class="small muted" role="status">' +
         (wiz.folders ? plural(names.length, "folder") + " will be kept on this PC. " + plural(others, "folder stays", "folders stay") + " online only. You can add more later, including a single folder from deeper inside your account." : "") +
         "</p>";
@@ -1549,7 +1615,7 @@
         plan.drop.forEach((name) => rows.push("<li><span class=\"strong\">" + esc(name) + '</span><span class="what">Stops syncing. Files stay on this PC and in Koofr.</span></li>'));
         planHtml =
           "<h2>What the first sync will do</h2>" +
-          (rows.length ? '<ul class="plan">' + rows.join("") + "</ul>" : '<p class="small muted">No folders were picked, so nothing is copied yet. Use Add a folder in the main window when you are ready.</p>') +
+          (rows.length ? '<ul class="panel plan">' + rows.join("") + "</ul>" : '<p class="small muted">No folders were picked, so nothing is copied yet. Use Add folder in the main window when you are ready.</p>') +
           (plan.add.length ? '<p class="small muted">Files missing on either side are copied across. If the same file is in both places, the newer one is kept.</p>' : "") +
           spaceWarning(plan);
       }
@@ -1560,7 +1626,7 @@
         "</dl>" +
         planHtml +
         (wiz.drive && S.drive.state !== "connected" ? '<p class="small muted">The Koofr drive needs the WinFsp driver. If it is not installed yet, Windows asks for permission to install it right after this step.</p>' : "") +
-        '<p><span class="chip ok big">No files will be deleted on this PC or in Koofr.</span></p>';
+        "<p>" + statusLine("ok", "ok", "No files will be deleted on this PC or in Koofr.") + "</p>";
     }
   }
 
@@ -1588,7 +1654,7 @@
       }
     });
     if (free != null && need > free) {
-      return '<div class="banner"><span>These folders hold ' + fmtBytes(need) + " in Koofr, but this drive only has " + fmtBytes(free) + " free. Go back and untick some, or pick a drive with more room.</span></div>";
+      return banner("warn", "These folders hold " + fmtBytes(need) + " in Koofr, but this drive only has " + fmtBytes(free) + " free. Go back and untick some, or pick a drive with more room.");
     }
     return "";
   }
@@ -1596,8 +1662,8 @@
   function showResult() {
     const el = $("#wz-result");
     if (!el) return;
-    if (wiz.testing) el.innerHTML = '<span class="chip info big">Checking with Koofr</span>';
-    else if (wiz.result) el.innerHTML = '<span class="chip big ' + (wiz.result.ok ? "ok" : "warn") + '">' + esc(wiz.result.text) + "</span>";
+    if (wiz.testing) el.innerHTML = statusLine("busy", "sync", "Checking with Koofr");
+    else if (wiz.result) el.innerHTML = statusLine(wiz.result.ok ? "ok" : "warn", wiz.result.ok ? "ok" : "warn", wiz.result.text);
     else el.innerHTML = "";
     const btn = $("#wz-test");
     if (btn) btn.disabled = wiz.testing;
@@ -1741,6 +1807,11 @@
 
   // ----- wiring up ----------------------------------------------------------
 
+  // Buttons in index.html name their icon with data-icon. Draw it in.
+  $$("[data-icon]").forEach((el) => {
+    el.insertAdjacentHTML("afterbegin", icon(el.dataset.icon, Number(el.dataset.iconSize) || 16));
+  });
+
   T.event.listen("state", (e) => onState(e.payload));
   T.event.listen("navigate", (e) => {
     if (S && S.setup_complete && VIEWS.includes(e.payload)) go(e.payload);
@@ -1748,7 +1819,7 @@
   T.event.listen("files-dropped", (e) => {
     $("#drop-zone").classList.remove("over");
     if (view === "upload" && !openModals.length) addUploads(e.payload);
-    else if (S && S.setup_complete && view === "main") toast("To upload files, open Upload to Koofr first, then drop them there.");
+    else if (S && S.setup_complete && view === "main") toast("To upload files, click Upload first, then drop them there.");
   });
   T.event.listen("drag-hover", (e) => {
     $("#drop-zone").classList.toggle("over", !!e.payload && view === "upload");

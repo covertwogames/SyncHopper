@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>SyncHopper</title>
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -29,38 +30,42 @@
   </div>
 </main>
 
-<!-- Main window -->
+<!-- Main window. Buttons with data-icon get their icon from app.js. -->
 <main id="view-main" class="view page" hidden>
-  <header class="page-head">
-    <div>
-      <h1>Your Koofr folders</h1>
+  <header class="page-head split">
+    <div class="titles">
+      <h1>Koofr</h1>
       <p id="main-account" class="small muted"></p>
     </div>
     <div class="row gap8">
-      <button type="button" class="btn primary" data-nav="upload">Upload to Koofr</button>
-      <button type="button" class="btn" data-nav="settings">Settings</button>
+      <button type="button" class="btn primary" data-nav="upload" data-icon="upload">Upload</button>
+      <button type="button" class="btn" id="add-folder" data-icon="plus">Add folder</button>
+      <button type="button" class="btn subtle icon" data-nav="settings" data-icon="gear" data-icon-size="18" aria-label="Settings" title="Settings"></button>
     </div>
   </header>
   <div id="main-banners" role="status"></div>
   <div class="scroll">
-    <ul id="pair-list" class="cards"></ul>
-    <div id="main-empty" class="note-card" hidden></div>
-    <div id="drive-card" class="card" hidden></div>
+    <section class="group" aria-labelledby="main-h-folders">
+      <h2 id="main-h-folders">Synced folders</h2>
+      <ul id="pair-list" class="panel rows"></ul>
+      <div id="main-empty" class="note-card" hidden></div>
+    </section>
+    <section id="drive-section" class="group" aria-labelledby="main-h-drive" hidden>
+      <h2 id="main-h-drive">Network drive</h2>
+      <div id="drive-card" class="panel rows"></div>
+    </section>
+    <p id="main-footnote" class="small muted"></p>
   </div>
-  <footer class="page-foot">
-    <button type="button" class="btn" id="add-folder">Add a folder</button>
-    <span id="main-footnote" class="small muted"></span>
-  </footer>
 </main>
 
 <!-- Upload -->
 <main id="view-upload" class="view page" hidden>
-  <header class="page-head baseline">
-    <div>
+  <header class="page-head">
+    <button type="button" class="btn subtle icon" data-nav="main" data-icon="back" data-icon-size="18" aria-label="Back to folders" title="Back to folders"></button>
+    <div class="titles">
       <h1>Upload to Koofr</h1>
       <p class="small muted">Files go straight to Koofr. They are not kept in sync with this PC.</p>
     </div>
-    <button type="button" class="link" data-nav="main">Back to folders</button>
   </header>
   <div class="field">
     <label for="up-dest">Koofr folder</label>
@@ -75,7 +80,7 @@
     <button type="button" class="btn" id="up-folder">Choose a folder</button>
   </div>
   <div class="scroll">
-    <ul id="upload-list" class="list"></ul>
+    <ul id="upload-list" class="panel list"></ul>
   </div>
   <footer class="page-foot">
     <span id="upload-summary" class="small muted" role="status"></span>
@@ -89,64 +94,72 @@
 
 <!-- Settings -->
 <main id="view-settings" class="view page" hidden>
-  <header class="page-head baseline">
+  <header class="page-head">
+    <button type="button" class="btn subtle icon" data-nav="main" data-icon="back" data-icon-size="18" aria-label="Back to folders" title="Back to folders"></button>
     <h1>Settings</h1>
-    <button type="button" class="link" data-nav="main">Back to folders</button>
   </header>
   <div class="scroll">
-    <div class="cols">
-      <section aria-labelledby="st-h-features" class="col">
-        <h2 id="st-h-features">Features</h2>
-        <div class="check">
-          <input id="st-sync" type="checkbox" data-set="feature_sync">
-          <label for="st-sync"><span>Synced folders</span><span class="small muted">Keep chosen folders on this PC.</span></label>
-        </div>
-        <div class="check">
-          <input id="st-drive" type="checkbox" data-set="feature_drive">
-          <label for="st-drive"><span>Koofr drive</span><span class="small muted" id="st-drive-note">Turning this on installs a small driver.</span></label>
-        </div>
-        <div class="setting indent" id="st-letter-row" hidden>
-          <label for="st-letter">Drive letter</label>
-          <select id="st-letter" data-set="drive_letter"></select>
-        </div>
-        <div class="check">
-          <input id="st-menu" type="checkbox" data-set="feature_context_menu">
-          <label for="st-menu"><span>SyncHopper in the right-click menu</span><span class="small muted">Adds Send to Koofr and Sync folder to Koofr to File Explorer's right-click menu.</span></label>
-        </div>
-        <div class="check">
-          <input id="st-sidebar" type="checkbox" data-set="feature_sidebar">
-          <label for="st-sidebar"><span>Koofr in File Explorer's sidebar</span><span class="small muted" id="st-sidebar-note">Adds Koofr next to OneDrive and This PC. It opens the folder your synced folders are in.</span></label>
-        </div>
-        <div class="check">
-          <input id="st-start" type="checkbox" data-set="autostart">
-          <label for="st-start"><span>Start with Windows</span><span class="small muted">Open in the tray when you sign in.</span></label>
-        </div>
-      </section>
-      <div class="col gap18">
-        <section aria-labelledby="st-h-sync" class="col gap8">
-          <h2 id="st-h-sync">Syncing</h2>
-          <div class="setting">
-            <label for="st-every">Check Koofr for changes every</label>
-            <select id="st-every" data-set="check_interval_min" data-num></select>
-          </div>
-          <div class="setting">
-            <label for="st-par">Files transferred at a time</label>
-            <select id="st-par" data-set="transfers" data-num></select>
-          </div>
-          <div class="setting">
-            <label for="st-del">Ask before deleting more than</label>
-            <select id="st-del" data-set="max_delete_percent" data-num></select>
-          </div>
-          <div class="check">
-            <input id="st-auto" type="checkbox" data-set="auto_add_folders">
-            <label for="st-auto"><span>Automatically sync new folders added to your Koofr folder</span><span class="small muted">New folders you put there get a matching folder in Koofr. If Koofr already has one with that name, SyncHopper asks first. When this is off, SyncHopper tells you about new folders instead.</span></label>
+    <div class="cols wide-right">
+      <div class="col">
+        <section class="group" aria-labelledby="st-h-features">
+          <h2 id="st-h-features">Features</h2>
+          <div class="panel">
+            <div class="check">
+              <input id="st-sync" type="checkbox" data-set="feature_sync">
+              <label for="st-sync"><span>Synced folders</span><span class="small muted">Keep chosen folders on this PC.</span></label>
+            </div>
+            <div class="check">
+              <input id="st-drive" type="checkbox" data-set="feature_drive">
+              <label for="st-drive"><span>Koofr drive</span><span class="small muted" id="st-drive-note">Turning this on installs a small driver.</span></label>
+            </div>
+            <div class="setting sub" id="st-letter-row" hidden>
+              <label for="st-letter">Drive letter</label>
+              <select id="st-letter" data-set="drive_letter"></select>
+            </div>
+            <div class="check">
+              <input id="st-menu" type="checkbox" data-set="feature_context_menu">
+              <label for="st-menu"><span>SyncHopper in the right-click menu</span><span class="small muted">Adds Send to Koofr and Sync folder to Koofr to File Explorer's right-click menu.</span></label>
+            </div>
+            <div class="check">
+              <input id="st-sidebar" type="checkbox" data-set="feature_sidebar">
+              <label for="st-sidebar"><span>Koofr in File Explorer's sidebar</span><span class="small muted" id="st-sidebar-note">Adds Koofr next to OneDrive and This PC. It opens the folder your synced folders are in.</span></label>
+            </div>
+            <div class="check">
+              <input id="st-start" type="checkbox" data-set="autostart">
+              <label for="st-start"><span>Start with Windows</span><span class="small muted">Open in the tray when you sign in.</span></label>
+            </div>
           </div>
         </section>
-        <section aria-labelledby="st-h-account" class="col gap8">
+      </div>
+      <div class="col">
+        <section class="group" aria-labelledby="st-h-sync">
+          <h2 id="st-h-sync">Syncing</h2>
+          <div class="panel">
+            <div class="setting">
+              <label for="st-every">Check Koofr for changes every</label>
+              <select id="st-every" data-set="check_interval_min" data-num></select>
+            </div>
+            <div class="setting">
+              <label for="st-par">Files transferred at a time</label>
+              <select id="st-par" data-set="transfers" data-num></select>
+            </div>
+            <div class="setting">
+              <label for="st-del">Ask before deleting more than</label>
+              <select id="st-del" data-set="max_delete_percent" data-num></select>
+            </div>
+            <div class="check">
+              <input id="st-auto" type="checkbox" data-set="auto_add_folders">
+              <label for="st-auto"><span>Automatically sync new folders added to your Koofr folder</span><span class="small muted">New folders you put there get a matching folder in Koofr. If Koofr already has one with that name, SyncHopper asks first. When this is off, SyncHopper tells you about new folders instead.</span></label>
+            </div>
+          </div>
+        </section>
+        <section class="group" aria-labelledby="st-h-account">
           <h2 id="st-h-account">Account</h2>
-          <div class="setting">
-            <span id="st-account"></span>
-            <button type="button" class="btn w140" id="st-disconnect">Disconnect</button>
+          <div class="panel">
+            <div class="setting">
+              <span id="st-account"></span>
+              <button type="button" class="btn" id="st-disconnect">Disconnect</button>
+            </div>
           </div>
         </section>
       </div>
@@ -163,93 +176,107 @@
 
 <!-- Advanced settings -->
 <main id="view-advanced" class="view page" hidden>
-  <header class="page-head baseline">
+  <header class="page-head">
+    <button type="button" class="btn subtle icon" data-nav="settings" data-icon="back" data-icon-size="18" aria-label="Back to settings" title="Back to settings"></button>
     <h1>Advanced settings</h1>
-    <button type="button" class="link" data-nav="settings">Back to settings</button>
   </header>
   <div class="scroll">
     <div class="cols">
-      <div class="col gap18">
-        <section aria-labelledby="ad-h-conn" class="col gap8">
+      <div class="col">
+        <section class="group" aria-labelledby="ad-h-conn">
           <h2 id="ad-h-conn">Connection</h2>
-          <div class="check">
-            <input id="ad-http2" type="checkbox" data-set="use_http2">
-            <label for="ad-http2"><span>Use HTTP/2</span><span class="small muted">Off is much faster for uploads to Koofr. Turn on only to test.</span></label>
-          </div>
-          <div class="check">
-            <input id="ad-limit" type="checkbox" data-set="limit_requests">
-            <label for="ad-limit"><span>Limit requests to Koofr</span><span class="small muted">Limits syncs, uploads and the drive to 40 requests per second each, the rate Koofr recommends. Turn this on if Koofr says SyncHopper is sending too many requests. Big syncs may be a little slower, and the drive reconnects when you change this.</span></label>
+          <div class="panel">
+            <div class="check">
+              <input id="ad-http2" type="checkbox" data-set="use_http2">
+              <label for="ad-http2"><span>Use HTTP/2</span><span class="small muted">Off is much faster for uploads to Koofr. Turn on only to test.</span></label>
+            </div>
+            <div class="check">
+              <input id="ad-limit" type="checkbox" data-set="limit_requests">
+              <label for="ad-limit"><span>Limit requests to Koofr</span><span class="small muted">Limits syncs, uploads and the drive to 40 requests per second each, the rate Koofr recommends. Turn this on if Koofr says SyncHopper is sending too many requests. Big syncs may be a little slower, and the drive reconnects when you change this.</span></label>
+            </div>
           </div>
         </section>
-        <section aria-labelledby="ad-h-limits" class="col gap8">
+        <section class="group" aria-labelledby="ad-h-limits">
           <h2 id="ad-h-limits">Limits and conflicts</h2>
-          <div class="setting">
-            <label for="ad-up-mode">Upload speed limit</label>
-            <div class="row gap8">
-              <select id="ad-up-mode" class="w120"><option value="none">No limit</option><option value="custom">Custom</option></select>
-              <span class="row gap8" id="ad-up-wrap" hidden><input id="ad-up" type="number" min="0.1" step="0.1" class="w80" aria-label="Upload speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+          <div class="panel">
+            <div class="setting">
+              <label for="ad-up-mode">Upload speed limit</label>
+              <div class="row gap8">
+                <select id="ad-up-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
+                <span class="row gap8" id="ad-up-wrap" hidden><input id="ad-up" type="number" min="0.1" step="0.1" class="w72" aria-label="Upload speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+              </div>
             </div>
-          </div>
-          <div class="setting">
-            <label for="ad-down-mode">Download speed limit</label>
-            <div class="row gap8">
-              <select id="ad-down-mode" class="w120"><option value="none">No limit</option><option value="custom">Custom</option></select>
-              <span class="row gap8" id="ad-down-wrap" hidden><input id="ad-down" type="number" min="0.1" step="0.1" class="w80" aria-label="Download speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+            <div class="setting">
+              <label for="ad-down-mode">Download speed limit</label>
+              <div class="row gap8">
+                <select id="ad-down-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
+                <span class="row gap8" id="ad-down-wrap" hidden><input id="ad-down" type="number" min="0.1" step="0.1" class="w72" aria-label="Download speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+              </div>
             </div>
-          </div>
-          <div class="setting">
-            <label for="ad-conflict">If a file changed in both places</label>
-            <select id="ad-conflict" data-set="conflict_policy" class="w180">
-              <option value="keep_both">Keep both copies</option>
-              <option value="newest">Newest wins</option>
-            </select>
+            <div class="setting">
+              <label for="ad-conflict">If a file changed in both places</label>
+              <select id="ad-conflict" data-set="conflict_policy">
+                <option value="keep_both">Keep both copies</option>
+                <option value="newest">Newest wins</option>
+              </select>
+            </div>
           </div>
         </section>
-        <section aria-labelledby="ad-h-ignored" class="col gap8">
+        <section class="group" aria-labelledby="ad-h-ignored">
           <h2 id="ad-h-ignored">Ignored files</h2>
-          <div class="setting">
-            <span class="small muted">Temp and lock files are never synced.</span>
-            <button type="button" class="btn w140" id="ad-ignore">Edit list</button>
+          <div class="panel">
+            <div class="setting">
+              <span class="small muted">Temp and lock files are never synced.</span>
+              <button type="button" class="btn" id="ad-ignore">Edit list</button>
+            </div>
           </div>
         </section>
       </div>
-      <div class="col gap18">
-        <section aria-labelledby="ad-h-pause" class="col gap8">
+      <div class="col">
+        <section class="group" aria-labelledby="ad-h-pause">
           <h2 id="ad-h-pause">Pause syncing</h2>
-          <div class="check"><input id="ad-battery" type="checkbox" data-set="pause_on_battery"><label for="ad-battery"><span>While on battery</span></label></div>
-          <div class="check"><input id="ad-metered" type="checkbox" data-set="pause_on_metered"><label for="ad-metered"><span>On metered connections</span></label></div>
+          <div class="panel">
+            <div class="check"><input id="ad-battery" type="checkbox" data-set="pause_on_battery"><label for="ad-battery"><span>While on battery</span></label></div>
+            <div class="check"><input id="ad-metered" type="checkbox" data-set="pause_on_metered"><label for="ad-metered"><span>On metered connections</span></label></div>
+          </div>
         </section>
-        <section aria-labelledby="ad-h-notify" class="col gap8">
+        <section class="group" aria-labelledby="ad-h-notify">
           <h2 id="ad-h-notify">Notifications and updates</h2>
-          <div class="setting">
-            <label for="ad-notify">Notify me about</label>
-            <select id="ad-notify" data-set="notify_level" class="w140">
-              <option value="errors">Errors only</option>
-              <option value="all">Everything</option>
-              <option value="none">Nothing</option>
-            </select>
+          <div class="panel">
+            <div class="setting">
+              <label for="ad-notify">Notify me about</label>
+              <select id="ad-notify" data-set="notify_level">
+                <option value="errors">Errors only</option>
+                <option value="all">Everything</option>
+                <option value="none">Nothing</option>
+              </select>
+            </div>
+            <div class="check">
+              <input id="ad-app-update" type="checkbox" data-set="auto_update_app">
+              <label for="ad-app-update"><span>Check for SyncHopper updates automatically</span><span class="small muted" id="ad-app-note"></span></label>
+            </div>
+            <div class="row sub">
+              <button type="button" class="btn" id="ad-check">Check for updates now</button>
+            </div>
+            <div class="check">
+              <input id="ad-update" type="checkbox" data-set="auto_update_engine">
+              <label for="ad-update"><span>Keep the sync engine up to date automatically</span><span class="small muted" id="ad-engine-note"></span></label>
+            </div>
+            <p class="small muted sub">rclone is free, open-source software by Nick Craig-Wood and the rclone contributors. <button type="button" class="link" id="ad-rclone">rclone.org</button></p>
           </div>
-          <div class="check">
-            <input id="ad-app-update" type="checkbox" data-set="auto_update_app">
-            <label for="ad-app-update"><span>Check for SyncHopper updates automatically</span><span class="small muted" id="ad-app-note"></span></label>
-          </div>
-          <div class="row gap8 indent-check">
-            <button type="button" class="btn" id="ad-check">Check for updates now</button>
-          </div>
-          <div class="check">
-            <input id="ad-update" type="checkbox" data-set="auto_update_engine">
-            <label for="ad-update"><span>Keep the sync engine up to date automatically</span><span class="small muted" id="ad-engine-note"></span></label>
-          </div>
-          <p class="small muted indent-check">rclone is free, open-source software by Nick Craig-Wood and the rclone contributors. <button type="button" class="link" id="ad-rclone">rclone.org</button></p>
         </section>
-        <section aria-labelledby="ad-h-trouble" class="col gap8">
+        <section class="group" aria-labelledby="ad-h-trouble">
           <h2 id="ad-h-trouble">Troubleshooting</h2>
-          <div class="row gap8 wrap">
-            <button type="button" class="btn" id="ad-log">Open log</button>
-            <button type="button" class="btn" id="ad-diag">Copy diagnostic info</button>
-            <button type="button" class="btn" id="ad-repair">Repair a folder</button>
+          <div class="panel">
+            <div class="stack">
+              <div class="row gap8 wrap">
+                <button type="button" class="btn" id="ad-log">Open log</button>
+                <button type="button" class="btn" id="ad-diag">Copy diagnostic info</button>
+                <button type="button" class="btn" id="ad-repair">Repair a folder</button>
+              </div>
+              <p class="small muted">Repair rebuilds a folder's sync record. It never deletes files.</p>
+            </div>
           </div>
-          <p class="small muted">Repair rebuilds a folder's sync record. It never deletes files.</p>
         </section>
       </div>
     </div>
