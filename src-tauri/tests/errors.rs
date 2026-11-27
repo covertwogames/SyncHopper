@@ -48,7 +48,7 @@ async fn koofr_turning_requests_away_waits_and_points_to_the_setting() {
     rig.sync(&id).await;
     assert_eq!(notes_titled(&rig, title), 1);
     let body = rig.host.notes.lock().unwrap().iter().find(|(t, _)| t == title).unwrap().1.clone();
-    assert!(body.contains("turn on Limit requests to Koofr in Advanced settings"), "{body}");
+    assert!(body.contains("turn on Limit requests to Koofr in this account's settings"), "{body}");
 
     // With the limit already on, it just says Koofr is busy.
     rig.app.core.update(|s| s.limit_requests = true);

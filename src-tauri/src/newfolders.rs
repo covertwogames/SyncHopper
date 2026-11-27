@@ -188,7 +188,7 @@ impl NewFolders {
                 }
                 *slot = Some(w);
             }
-            Err(e) => self.core.log(&format!("Could not watch the Koofr folder: {e}")),
+            Err(e) => self.core.log(&format!("Could not watch the {} folder: {e}", self.core.cloud())),
         }
     }
 
@@ -222,6 +222,7 @@ impl NewFolders {
     /// Looks at what is directly in the Koofr folder and deals with anything
     /// new. Safe to call at any time.
     pub async fn scan(&self) {
+        let cloud = self.core.cloud();
         let _one_at_a_time = self.busy.lock().await;
         *self.last_event.lock().unwrap() = None;
         *self.last_scan.lock().unwrap() = Some(Instant::now());
@@ -300,14 +301,14 @@ impl NewFolders {
                 let _ = self.engine.rename_pair(&pair.id, &new_local, None).await;
                 continue;
             }
-            if koofr_refuses_chars(&name) {
+            if self.core.provider.refuses_emoji && koofr_refuses_chars(&name) {
                 let _ = self.engine.rename_pair(&pair.id, &new_local, None).await;
                 let msg = format!(
-                    "Koofr doesn't allow emoji and some other symbols in folder names, so this folder keeps syncing to \"{}\" in Koofr.",
+                    "{cloud} doesn't allow emoji and some other symbols in folder names, so this folder keeps syncing to \"{}\" in {cloud}.",
                     pair.remote
                 );
                 self.add_notice("rename_kept", &name, &new_local, msg.clone());
-                self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in Koofr"), &msg);
+                self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in {cloud}"), &msg);
                 continue;
             }
             if koofr_dirs.is_none() {
@@ -321,23 +322,23 @@ impl NewFolders {
                     let taken = dirs.iter().any(|d| same_name(d, &name)) && !same_name(&name, &pair.remote);
                     if taken {
                         let _ = self.engine.rename_pair(&pair.id, &new_local, None).await;
-                        let msg = format!("Koofr already has a folder called \"{name}\", so this folder keeps syncing to \"{}\" in Koofr.", pair.remote);
+                        let msg = format!("{cloud} already has a folder called \"{name}\", so this folder keeps syncing to \"{}\" in {cloud}.", pair.remote);
                         self.add_notice("rename_kept", &name, &new_local, msg.clone());
-                        self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in Koofr"), &msg);
+                        self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in {cloud}"), &msg);
                     } else {
                         match self.engine.rename_pair(&pair.id, &new_local, Some(&name)).await {
                             Ok(()) => {
-                                self.core.notify(Notice::Info, &format!("Renamed \"{old_name}\" to \"{name}\""), "The folder was renamed in Koofr too.");
+                                self.core.notify(Notice::Info, &format!("Renamed \"{old_name}\" to \"{name}\""), &format!("The folder was renamed in {cloud} too."));
                             }
                             Err(e) => {
                                 let msg = format!(
-                                    "Koofr would not rename \"{}\" to \"{name}\", so this folder keeps syncing to \"{}\" in Koofr. {}",
+                                    "{cloud} would not rename \"{}\" to \"{name}\", so this folder keeps syncing to \"{}\" in {cloud}. {}",
                                     pair.remote,
                                     pair.remote,
-                                    crate::rclone::friendly_error(&e)
+                                    crate::rclone::friendly_error(self.core.provider, &e)
                                 );
                                 self.add_notice("rename_kept", &name, &new_local, msg.clone());
-                                self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in Koofr"), &msg);
+                                self.core.notify(Notice::Problem, &format!("\"{name}\" was not renamed in {cloud}"), &msg);
                             }
                         }
                     }
@@ -349,7 +350,7 @@ impl NewFolders {
         for name in new_dirs {
             let local = base.join(&name).to_string_lossy().to_string();
             if !s.auto_add_folders {
-                let msg = format!("\"{name}\" is in your Koofr folder but isn't synced. Sync it to keep a copy in Koofr.");
+                let msg = format!("\"{name}\" is in your {cloud} folder but isn't synced. Sync it to keep a copy in {cloud}.");
                 self.add_notice("not_synced", &name, &local, msg.clone());
                 self.core.notify_folder(Notice::Problem, &format!("\"{name}\" isn't synced yet"), &msg, &local);
                 continue;
@@ -368,8 +369,8 @@ impl NewFolders {
             let synced_elsewhere = s.pairs.iter().find(|p| same_name(&p.remote, &name) || p.remote.to_lowercase().starts_with(&format!("{}/", name.to_lowercase())));
             if in_koofr || synced_elsewhere.is_some() {
                 let msg = match synced_elsewhere {
-                    Some(p) => format!("Koofr's \"{name}\" folder is already synced to {}. Pick a different Koofr folder for this one.", p.local),
-                    None => format!("Koofr already has a folder called \"{name}\". Syncing would combine the two, so SyncHopper is checking with you first."),
+                    Some(p) => format!("{cloud}'s \"{name}\" folder is already synced to {}. Pick a different {cloud} folder for this one.", p.local),
+                    None => format!("{cloud} already has a folder called \"{name}\". Syncing would combine the two, so SyncHopper is checking with you first."),
                 };
                 self.add_notice("clash", &name, &local, msg.clone());
                 self.core.notify_folder(Notice::Problem, &format!("\"{name}\" isn't synced yet"), &msg, &local);
@@ -377,8 +378,8 @@ impl NewFolders {
             }
             match self.engine.add_pair(&local, &name) {
                 Ok(_) => {
-                    self.core.log(&format!("Started syncing {local}, a new folder in the Koofr folder"));
-                    self.core.notify(Notice::Info, &format!("Now syncing \"{name}\""), "It was added to Koofr. Anything you put in it syncs from now on.");
+                    self.core.log(&format!("Started syncing {local}, a new folder in the {cloud} folder"));
+                    self.core.notify(Notice::Info, &format!("Now syncing \"{name}\""), &format!("It was added to {cloud}. Anything you put in it syncs from now on."));
                 }
                 Err(e) => {
                     let msg = format!("\"{name}\" could not be synced. {e}");
@@ -397,13 +398,13 @@ impl NewFolders {
             all.retain(|n| base.join(n).exists());
             let (title, msg) = if all.len() == 1 {
                 (
-                    "A file in your Koofr folder isn't synced".to_string(),
-                    format!("{} is sitting loose in your Koofr folder. Only the folders in it sync, so move it into one of them.", names_list(&all)),
+                    format!("A file in your {cloud} folder isn't synced"),
+                    format!("{} is sitting loose in your {cloud} folder. Only the folders in it sync, so move it into one of them.", names_list(&all)),
                 )
             } else {
                 (
-                    "Files in your Koofr folder aren't synced".to_string(),
-                    format!("{} are sitting loose in your Koofr folder. Only the folders in it sync, so move them into one of them.", names_list(&all)),
+                    format!("Files in your {cloud} folder aren't synced"),
+                    format!("{} are sitting loose in your {cloud} folder. Only the folders in it sync, so move them into one of them.", names_list(&all)),
                 )
             };
             let mut list = self.notices.lock().unwrap();
@@ -420,12 +421,13 @@ impl NewFolders {
 
     /// Names of the folders at the top of Koofr.
     async fn koofr_dirs(&self) -> Result<Vec<String>, String> {
+        let cloud = self.core.cloud();
         let rc = self.core.rclone()?;
         rc.list_dirs(&self.core.remote("")).await.map_err(|e| {
             if is_network_error(&e) {
-                self.core.log(&format!("Could not check Koofr for new folders, will try again: {e}"));
+                self.core.log(&format!("Could not check {cloud} for new folders, will try again: {e}"));
             } else {
-                self.core.log(&format!("Could not list the folders in Koofr: {e}"));
+                self.core.log(&format!("Could not list the folders in {cloud}: {e}"));
             }
             e
         })

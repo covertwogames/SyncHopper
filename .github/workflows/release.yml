@@ -7,6 +7,14 @@
 #   - SyncHopper_<version>_x64-setup.exe.sig  the update signature
 #   - latest.json                         what installed copies check for updates
 #
+# Test builds: a tag that ends in -test, such as v0.4.90-test, is published
+# as a pre-release. Installed copies look for updates at the latest full
+# release, so they never see a test build. It is only installed by someone
+# who downloads it from its release page. The version in tauri.conf.json is
+# the tag without the "v" and the "-test" (0.4.90 here), and must be lower
+# than the version of the release it is testing, so that a PC with the test
+# build is offered that release when it comes out.
+#
 # Two kinds of signing happen here:
 #   - Code signing with Cover Two's Azure Artifact Signing certificate, so
 #     Windows (Smart App Control, SmartScreen) shows Cover Two Strategies LLC
@@ -77,7 +85,9 @@ jobs:
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $tag = "${{ github.ref_name }}"
-          if ("v$version" -ne $tag) {
+          $test = $tag.EndsWith("-test")
+          $plain = if ($test) { $tag.Substring(0, $tag.Length - "-test".Length) } else { $tag }
+          if ("v$version" -ne $plain) {
             Write-Error "The tag $tag does not match the app version $version in src-tauri/tauri.conf.json."
             exit 1
           }
@@ -90,6 +100,7 @@ jobs:
             exit 1
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_BUILD=$(if ($test) { '1' } else { '0' })" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Release builds only download the signed sync engine (engine.yml
       # publishes it), so make sure it is there before releasing.
@@ -283,6 +294,10 @@ jobs:
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag (Get-ChildItem release).FullName --clobber
+          } elseif ($env:TEST_BUILD -eq "1") {
+            # A pre-release is never the "latest" release, so the update check
+            # in installed copies does not see it.
+            gh release create $tag (Get-ChildItem release).FullName --title "SyncHopper $env:VERSION (test build)" --notes "A test build. It is not offered to installed copies as an update. To try it, download SyncHopper-setup.exe from this page and run it." --prerelease --latest=false
           } else {
             gh release create $tag (Get-ChildItem release).FullName --title "SyncHopper $env:VERSION" --notes "Download SyncHopper-setup.exe to install. Installed copies update themselves." --latest
           }

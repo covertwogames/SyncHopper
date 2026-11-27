@@ -155,6 +155,9 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 ::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-hover); }
 
 /* Views */
+/* The window: the accounts column, then whichever screen is showing. */
+.shell { display: flex; height: 100%; }
+.stage { flex: 1 1 auto; min-width: 0; height: 100%; }
 .view { height: 100%; }
 .center { display: flex; align-items: center; justify-content: center; }
 .page { display: flex; flex-direction: column; gap: 14px; padding: 16px 28px; }
@@ -166,6 +169,47 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 .page-foot.ruled { padding-top: 14px; border-top: 1px solid var(--line); }
 /* The scrollbar sits at the window edge, in space that is always kept for it. */
 .scroll { flex: 1 1 auto; min-height: 0; overflow-y: scroll; display: flex; flex-direction: column; gap: 14px; margin-right: -28px; padding-right: 16px; }
+
+/* The accounts column. Each row is a button: an icon, a name, and for an
+   account a line saying how it is doing. The one being shown gets a filled
+   background and an accent mark, as in Windows 11's own settings. */
+.accounts { width: 212px; flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; padding: 16px 0 12px 12px; }
+.accounts + .stage > .page { padding-left: 16px; }
+.accounts .cap { padding: 6px 12px; font-size: 12px; line-height: 16px; font-weight: 600; color: var(--muted); }
+.acct-list { display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; }
+.acct {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  padding: 6px 8px 6px 12px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  flex-shrink: 0;
+}
+.acct:hover { background: var(--subtle); }
+.acct:active { background: var(--subtle-press); }
+.acct > .ico { color: var(--muted); }
+.acct .who { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.acct .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct .state { font-size: 12px; line-height: 16px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct .flag { flex-shrink: 0; display: flex; }
+.acct .flag.warn { color: var(--warn); }
+.acct .flag.busy { color: var(--accent-text); }
+.acct.current { background: var(--subtle); }
+.acct.current > .ico { color: var(--text); }
+.acct.current::before { content: ""; position: absolute; left: 0; top: 15px; bottom: 15px; width: 3px; border-radius: 2px; background: var(--accent); }
+.acct.one { min-height: 36px; }
+.acct.one .name { font-weight: 400; }
+.acct.one.current .name { font-weight: 600; }
+.acct.one.current::before { top: 10px; bottom: 10px; }
+.accounts .grow { flex: 1 1 auto; }
 
 /* Buttons and links */
 .btn {
@@ -272,8 +316,12 @@ input[type="checkbox"]:disabled:checked, input[type="checkbox"]:disabled:checked
 .setting { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; }
 .setting > label, .setting > span:first-child { min-width: 0; }
 .setting select, .setting .btn { flex-shrink: 0; }
-#view-settings .setting select { width: 180px; }
+#view-settings .setting select, #view-general .setting select { width: 180px; }
 #view-settings #st-letter { width: 96px; }
+#view-general .setting select.w104 { width: 104px; }
+/* A name with a second, quieter line under it */
+.two { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.two > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .w72 { width: 72px; }
 .w104 { width: 104px; }
 .cols { display: flex; align-items: flex-start; gap: 20px; }
@@ -318,6 +366,17 @@ input[type="checkbox"]:disabled:checked, input[type="checkbox"]:disabled:checked
 .rows .btn.main { width: 96px; padding: 0; }
 .rows .gap-main { width: 96px; flex-shrink: 0; }
 .rows .gap-more { width: 32px; flex-shrink: 0; }
+/* A sign-in that is waiting in the browser: the status, then what to do */
+.wait { display: inline-flex; flex-direction: column; gap: 2px; vertical-align: middle; }
+.wait-links { display: flex; gap: 16px; padding-left: 26px; }
+
+/* A list of things to choose from, such as the cloud providers */
+.rows.pick > li { cursor: default; }
+.rows.pick > li:hover { background: var(--subtle); }
+.rows.pick > li:first-child { border-radius: 7px 7px 0 0; }
+.rows.pick > li:last-child { border-radius: 0 0 7px 7px; }
+.rows.pick > li:only-child { border-radius: 7px; }
+.rows.pick > li > .go { color: var(--muted); display: flex; }
 .note-card { padding: 16px; border: 1px dashed var(--ctl-edge); border-radius: 8px; color: var(--muted); }
 
 /* Notices across the top of a screen */

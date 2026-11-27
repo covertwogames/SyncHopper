@@ -2,6 +2,7 @@
 //! running it and reading its log output.
 
 use crate::platform;
+use crate::providers::Provider;
 use crate::util::{strip_ansi, Cancel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -299,13 +300,22 @@ pub fn tidy_engine_folder(data: &Path) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Rclone {
     pub exe: PathBuf,
     pub config: PathBuf,
     pub cache: PathBuf,
     /// Added to every command, for example the request limit.
     pub extra: Vec<String>,
+    /// What the saved sign-ins are locked with, when they are.
+    pub pass: Option<String>,
+}
+
+impl std::fmt::Debug for Rclone {
+    /// Leaves the key out, so it can never end up in a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rclone").field("exe", &self.exe).field("config", &self.config).field("locked", &self.pass.is_some()).finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -417,6 +427,14 @@ impl Rclone {
         c.arg("--config").arg(&self.config);
         c.arg("--cache-dir").arg(&self.cache);
         c.args(&self.extra);
+        // The saved sign-ins may be locked. The key goes in through the
+        // environment, never the command line, and the engine must not stop
+        // to ask for it when it is missing.
+        c.env("RCLONE_ASK_PASSWORD", "false");
+        match &self.pass {
+            Some(pass) => c.env("RCLONE_CONFIG_PASS", pass),
+            None => c.env_remove("RCLONE_CONFIG_PASS"),
+        };
         c.stdin(Stdio::null());
         c.kill_on_drop(true);
         platform::hide_window(&mut c);
@@ -434,7 +452,7 @@ impl Rclone {
             .map_err(|e| spawn_failure(&self.exe, &e))?;
         let out = tokio::time::timeout(timeout, child.wait_with_output())
             .await
-            .map_err(|_| "Koofr took too long to answer.".to_string())?
+            .map_err(|_| "The service took too long to answer.".to_string())?
             .map_err(|e| e.to_string())?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -511,6 +529,122 @@ impl Rclone {
         self.capture(&["mkdir", target], Duration::from_secs(120)).await.map(|_| ())
     }
 
+    /// Has the engine sign an account in on the service's own page. The
+    /// engine opens the browser, waits on this PC for the answer, and
+    /// writes the result into its settings file as account `name`.
+    /// `on_link` is told the page's address, for when the browser doesn't
+    /// open by itself.
+    pub async fn browser_sign_in(&self, name: &str, kind: &str, cancel: &Cancel, mut on_link: impl FnMut(&str)) -> Result<(), String> {
+        let args = ["config".to_string(), "create".to_string(), name.to_string(), kind.to_string()];
+        let mut child = self
+            .spawn(&args, |c| {
+                c.stdout(Stdio::null()).stderr(Stdio::piped());
+            })
+            .await
+            .map_err(|e| spawn_failure(&self.exe, &e))?;
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let mut lines = BufReader::new(stderr).lines();
+        let mut last = String::new();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(text)) => {
+                        let text = strip_ansi(text.trim());
+                        if let Some(i) = text.find("link: ") {
+                            on_link(text[i + 6..].trim());
+                        } else if !text.is_empty() && !text.contains("Config file") {
+                            last = text;
+                        }
+                    }
+                    _ => break,
+                },
+                _ = cancel.cancelled() => {
+                    let _ = child.kill().await;
+                    return Err(SIGN_IN_CANCELLED.to_string());
+                }
+            }
+        }
+        match child.wait().await {
+            Ok(status) if status.success() => Ok(()),
+            _ if last.is_empty() => Err("The sync engine stopped before the sign-in finished.".to_string()),
+            _ => Err(last),
+        }
+    }
+
+    // ----- saved sign-ins -----------------------------------------------
+    //
+    // The engine keeps every account's sign-in in its own settings file,
+    // one `[name]` section per account. SyncHopper has the engine lock that
+    // file with a key (see `app::Hub::secure_signins`), so the file is
+    // always written through the two functions below and never by hand.
+
+    /// The saved sign-ins as plain text. Empty when there are none yet.
+    pub async fn signins(&self) -> Result<String, String> {
+        if !self.config.is_file() {
+            return Ok(String::new());
+        }
+        if config_locked(&self.config) {
+            self.capture(&["config", "show"], Duration::from_secs(30)).await
+        } else {
+            std::fs::read_to_string(&self.config).map_err(|e| format!("Could not read the saved sign-ins: {e}"))
+        }
+    }
+
+    /// Replaces the saved sign-ins with `text`, locked with this engine's
+    /// key when it has one. The new file is checked before it takes the old
+    /// one's place, so a failure leaves the old file as it was.
+    pub async fn save_signins(&self, text: &str) -> Result<(), String> {
+        if section_names(text).is_empty() {
+            return match std::fs::remove_file(&self.config) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Could not remove the saved sign-ins: {e}")),
+                _ => Ok(()),
+            };
+        }
+        let pending = self.config.with_extension("conf.new");
+        std::fs::write(&pending, text).map_err(|e| format!("Could not save the sign-in: {e}"))?;
+        if let Err(e) = self.lock_and_check(&pending, text).await {
+            let _ = std::fs::remove_file(&pending);
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&self.config);
+        std::fs::rename(&pending, &self.config).map_err(|e| format!("Could not save the sign-in: {e}"))
+    }
+
+    /// Has the engine lock the file at `pending` with this engine's key,
+    /// then makes sure it opens with that key and holds the same accounts.
+    async fn lock_and_check(&self, pending: &Path, text: &str) -> Result<(), String> {
+        let Some(pass) = &self.pass else { return Ok(()) };
+        let failed = || "The sync engine could not lock the saved sign-in.".to_string();
+        let plain = Rclone { config: pending.to_path_buf(), pass: None, extra: Vec::new(), ..self.clone() };
+        let args = ["config".to_string(), "encryption".to_string(), "set".to_string()];
+        let mut child = plain
+            .spawn(&args, |c| {
+                c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            })
+            .await
+            .map_err(|e| spawn_failure(&self.exe, &e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // The engine asks for the key twice. It goes in through stdin so
+            // it never shows in a process list.
+            stdin.write_all(format!("{pass}\n{pass}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+            stdin.shutdown().await.ok();
+        }
+        let out = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .map_err(|_| "The sync engine did not answer.".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() || !config_locked(pending) {
+            return Err(failed());
+        }
+        let locked = Rclone { config: pending.to_path_buf(), extra: Vec::new(), ..self.clone() };
+        let back = locked.capture(&["config", "show"], Duration::from_secs(30)).await.map_err(|_| failed())?;
+        if section_names(&back) == section_names(text) {
+            Ok(())
+        } else {
+            Err(failed())
+        }
+    }
+
     /// Runs a long job, feeding every log line to `on_line`. Stops the job
     /// when `cancel` fires.
     pub async fn run_logged(
@@ -570,6 +704,67 @@ impl Rclone {
         };
         res
     }
+}
+
+/// What `Rclone::browser_sign_in` returns when the wait was cancelled.
+pub const SIGN_IN_CANCELLED: &str = "cancelled";
+
+/// The line that marks a settings file the engine has locked.
+const LOCKED_MARK: &str = "RCLONE_ENCRYPT_V0:";
+
+/// True when the engine's settings file at `path` is locked with a key.
+pub fn config_locked(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 256];
+    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    String::from_utf8_lossy(&head[..n]).lines().any(|l| l.trim() == LOCKED_MARK)
+}
+
+/// Sign-in text split into its sections: each account's name and the lines
+/// under it.
+fn sections(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') && t.len() > 2 {
+            out.push((t[1..t.len() - 1].to_string(), Vec::new()));
+        } else if !t.is_empty() {
+            if let Some((_, lines)) = out.last_mut() {
+                lines.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The names of the accounts in sign-in text, in order.
+pub fn section_names(text: &str) -> Vec<String> {
+    sections(text).into_iter().map(|(name, _)| name).collect()
+}
+
+/// One account's lines in sign-in text, without its `[name]` line.
+pub fn section(text: &str, name: &str) -> Option<String> {
+    sections(text).into_iter().find(|(n, _)| n == name).map(|(_, lines)| lines.join("\n"))
+}
+
+/// Sign-in text with one account's lines replaced or added, or with the
+/// account taken out when `body` is None.
+pub fn with_section(text: &str, name: &str, body: Option<&str>) -> String {
+    let mut all = sections(text);
+    all.retain(|(n, _)| n != name);
+    if let Some(body) = body {
+        all.push((name.to_string(), body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()));
+    }
+    let mut out = String::new();
+    for (n, lines) in all {
+        out.push_str(&format!("[{n}]\n"));
+        for l in lines {
+            out.push_str(&l);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Reads "rclone v1.76.0" style text into ("1.76.0", (1, 76)).
@@ -822,6 +1017,10 @@ pub const NETWORK_WORDS: &[&str] = &[
     "semaphore timeout period has expired",
 ];
 
+/// What the engine's name for every account after the first starts with.
+/// `error_words` relies on it to tell an account's path from other text.
+pub const REMOTE_PREFIX: &str = "shacct";
+
 /// True when the text describes a dropped or failed connection.
 pub fn is_network_error(raw: &str) -> bool {
     let l = error_words(raw);
@@ -834,10 +1033,26 @@ pub fn is_network_error(raw: &str) -> bool {
 /// open in another program is not "storage full" or "wrong password".
 ///
 /// A path starts at a drive (`C:\`), a network or long path (`\\`), a
-/// slash after a space or quote, or `koofr:`, and runs up to a quote, the
+/// slash after a space or quote, or an account's name in the engine
+/// (`koofr:`, `shacct1a2b:`), and runs up to a quote, the
 /// end of a line, or a colon that ends it (Windows names can't hold a
 /// colon). A web address runs up to a quote or a space.
 pub fn error_words(raw: &str) -> String {
+    /// The length of an account's engine name with its colon, when the text
+    /// starts with one: "koofr:" for the first account, "shacct" and some
+    /// letters and digits for every later one.
+    fn remote_prefix(c: &[char]) -> Option<usize> {
+        let starts = |s: &str| s.chars().enumerate().all(|(k, ch)| c.get(k).map(|x| x.to_ascii_lowercase()) == Some(ch));
+        if starts("koofr:") {
+            return Some(6);
+        }
+        if !starts(REMOTE_PREFIX) {
+            return None;
+        }
+        let id = c[REMOTE_PREFIX.len()..].iter().take_while(|ch| ch.is_ascii_alphanumeric()).count();
+        (id > 0 && c.get(REMOTE_PREFIX.len() + id) == Some(&':')).then_some(REMOTE_PREFIX.len() + id + 1)
+    }
+
     let c: Vec<char> = raw.chars().collect();
     let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, ch)| c.get(i + k).map(|x| x.to_ascii_lowercase()) == Some(ch));
     let mut out = String::with_capacity(raw.len());
@@ -850,7 +1065,7 @@ pub fn error_words(raw: &str) -> String {
             && ((c[i] == '\\' && c.get(i + 1) == Some(&'\\'))
                 || (c[i].is_ascii_alphabetic() && c.get(i + 1) == Some(&':') && matches!(c.get(i + 2), Some('\\') | Some('/')))
                 || (c[i] == '/' && c.get(i + 1).is_some_and(|n| !n.is_whitespace() && *n != '/'))
-                || (at(i, "koofr:") && c.get(i + 6).is_some_and(|n| !n.is_whitespace())));
+                || remote_prefix(&c[i..]).is_some_and(|n| c.get(i + n).is_some_and(|x| !x.is_whitespace())));
         if !url && !path {
             out.extend(c[i].to_lowercase());
             i += 1;
@@ -888,8 +1103,8 @@ pub fn reports_status(words: &str, code: &str) -> bool {
 
 /// A plain-language version of an error from the sync engine. Text it does
 /// not recognise is passed through, shortened if very long.
-pub fn friendly_error(raw: &str) -> String {
-    friendly_known(raw).unwrap_or_else(|| {
+pub fn friendly_error(p: &Provider, raw: &str) -> String {
+    friendly_known(p, raw).unwrap_or_else(|| {
         let t = raw.trim();
         if t.chars().count() > 220 {
             format!("{}...", t.chars().take(220).collect::<String>())
@@ -901,41 +1116,90 @@ pub fn friendly_error(raw: &str) -> String {
 
 /// A plain-language version of an error, or None when it is not one SyncHopper
 /// recognises.
-pub fn friendly_known(raw: &str) -> Option<String> {
+pub fn friendly_known(p: &Provider, raw: &str) -> Option<String> {
     let l = error_words(raw);
     let has = |words: &[&str]| words.iter().any(|w| l.contains(w));
     let code = |c: &str| reports_status(&l, c);
+    let cloud = p.name;
     let text = if is_blocked_message(raw) {
-        BLOCKED_TEXT
+        BLOCKED_TEXT.to_string()
+    } else if is_locked_signins(raw) {
+        LOCKED_SIGNINS_TEXT.to_string()
     } else if code("429") || has(&["too many requests"]) {
-        "Koofr says SyncHopper is sending too many requests. If this keeps happening, turn on Limit requests to Koofr in Advanced settings."
-    } else if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
-        "Koofr did not accept the saved email and app password. Open Settings and run setup again to reconnect."
+        format!("{cloud} says SyncHopper is sending too many requests. {}", throttle_hint(p))
+    } else if is_auth_error(&l) {
+        format!("{cloud} did not accept the saved sign-in. Open this account's settings and choose Reconnect.")
     } else if has(&["being used by another process", "sharing violation"]) {
-        "A file is open in another program. It will sync once that program closes it."
+        "A file is open in another program. It will sync once that program closes it.".to_string()
     } else if has(&["source file is being updated", "size changed"]) {
-        "A file was still being written while it synced. It will be tried again."
+        "A file was still being written while it synced. It will be tried again.".to_string()
     } else if has(&["too long"]) {
-        "A file name is too long for Windows."
+        "A file name is too long for Windows.".to_string()
     } else if has(&["not enough space", "no space left", "disk full"]) {
-        "This PC is out of disk space."
+        "This PC is out of disk space.".to_string()
     } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
-        "Your Koofr storage is full."
+        format!("Your {cloud} storage is full.")
     } else if has(&["access is denied", "permission denied"]) {
-        "Windows would not let the app read or write a file."
+        "Windows would not let the app read or write a file.".to_string()
     } else if is_network_error(raw) || has(&["bad gateway", "service unavailable", "gateway timeout"]) || code("502") || code("503") || code("504") {
-        "Could not reach Koofr. It will be tried again automatically."
+        format!("Could not reach {cloud}. It will be tried again automatically.")
     } else if has(&["directory not found"]) {
-        "A folder was not found."
+        "A folder was not found.".to_string()
     } else {
         return None;
     };
-    Some(text.to_string())
+    Some(text)
+}
+
+/// What to do when the service says SyncHopper is asking too often.
+pub fn throttle_hint(p: &Provider) -> String {
+    match p.request_limit {
+        Some(_) => format!("If this keeps happening, turn on Limit requests to {} in this account's settings.", p.name),
+        None => "SyncHopper waits and tries again by itself.".to_string(),
+    }
+}
+
+/// True when the words (from `error_words`) say the service turned down the
+/// saved sign-in.
+pub fn is_auth_error(words: &str) -> bool {
+    reports_status(words, "401")
+        || [
+            "unauthorized",
+            "invalid credentials",
+            "authentication failed",
+            "couldn't login",
+            // pCloud
+            "log in required",
+            "log in failed",
+            "invalid 'access_token'",
+            "invalid access token",
+            "invalid_grant",
+            // The saved sign-ins don't have this account any more.
+            "didn't find section in config file",
+            // Filen
+            "invalid api key",
+            "api key not found",
+            "wrong email or password",
+            "invalid email or password",
+        ]
+        .iter()
+        .any(|w| words.contains(w))
+}
+
+/// What a folder or account shows when the saved sign-ins can't be read on
+/// this PC, for example after the app's files were copied from another PC.
+pub const LOCKED_SIGNINS_TEXT: &str = "SyncHopper can't read the saved sign-in on this PC. Open this account's settings and choose Reconnect.";
+
+/// True when the engine says it could not unlock the saved sign-ins.
+pub fn is_locked_signins(raw: &str) -> bool {
+    let l = raw.to_lowercase();
+    l.contains("unable to decrypt configuration") || l.contains("couldn't decrypt configuration")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::KOOFR;
 
     const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/engine");
 
@@ -1039,8 +1303,8 @@ mod tests {
         let blocked = format!("{BLOCKED_PREFIX} (C:\\x\\rclone.exe): An Application Control policy has blocked this file. (os error 4551)");
         assert!(is_blocked_message(&blocked));
         assert!(is_blocked_message(BLOCKED_TEXT));
-        assert_eq!(friendly_error(&blocked), BLOCKED_TEXT);
-        assert_eq!(friendly_known(&blocked).as_deref(), Some(BLOCKED_TEXT));
+        assert_eq!(friendly_error(&KOOFR, &blocked), BLOCKED_TEXT);
+        assert_eq!(friendly_known(&KOOFR, &blocked).as_deref(), Some(BLOCKED_TEXT));
         assert!(!BLOCKED_TEXT.contains('\u{2014}'));
     }
 
@@ -1112,24 +1376,77 @@ mod tests {
 
     #[test]
     fn friendly() {
-        assert!(friendly_error("open C:\\x.pst: The process cannot access the file because it is being used by another process.").contains("open in another program"));
-        assert!(friendly_error("dial tcp: lookup app.koofr.net: no such host").contains("Could not reach Koofr"));
-        assert_eq!(friendly_error("something odd"), "something odd");
-        assert!(friendly_error("Failed to create file system: unexpected status code 401").contains("did not accept"));
-        assert_eq!(friendly_error("Failed to copy IMG_14012.jpg: odd"), "Failed to copy IMG_14012.jpg: odd");
-        assert!(friendly_error("HTTP error 503 returned").contains("Could not reach Koofr"));
+        assert!(friendly_error(&KOOFR, "open C:\\x.pst: The process cannot access the file because it is being used by another process.").contains("open in another program"));
+        assert!(friendly_error(&KOOFR, "dial tcp: lookup app.koofr.net: no such host").contains("Could not reach Koofr"));
+        assert_eq!(friendly_error(&KOOFR, "something odd"), "something odd");
+        assert!(friendly_error(&KOOFR, "Failed to create file system: unexpected status code 401").contains("did not accept"));
+        assert_eq!(friendly_error(&KOOFR, "Failed to copy IMG_14012.jpg: odd"), "Failed to copy IMG_14012.jpg: odd");
+        assert!(friendly_error(&KOOFR, "HTTP error 503 returned").contains("Could not reach Koofr"));
         // What Windows says when a connection opened before sleep is dead.
         let woke = r#"error reading destination directory: Get "https://app.koofr.net/api/v2/mounts/x/files/list?path=%2FApps": write tcp 192.168.1.76:51559->176.9.109.126:443: wsasend: An existing connection was forcibly closed by the remote host."#;
-        assert!(friendly_error(woke).contains("Could not reach Koofr"));
+        assert!(friendly_error(&KOOFR, woke).contains("Could not reach Koofr"));
         assert!(is_network_error("read tcp 10.0.0.2:1->1.2.3.4:443: wsarecv: An established connection was aborted by the software in your host machine."));
         assert!(is_network_error("dial tcp 1.2.3.4:443: connectex: A connection attempt failed because the connected party did not properly respond after a period of time"));
-        assert!(friendly_known("something odd").is_none());
+        assert!(friendly_known(&KOOFR, "something odd").is_none());
         // A number or word in a name is never taken for the error itself.
-        assert_eq!(friendly_known("open C:\\Users\\r\\Invoice 401.pdf: something odd"), None);
-        assert_eq!(friendly_known("open /home/r/Sales quota.xlsx: something odd"), None);
-        assert_eq!(friendly_known("Failed to copy Invoice 401.pdf: odd"), None);
+        assert_eq!(friendly_known(&KOOFR, "open C:\\Users\\r\\Invoice 401.pdf: something odd"), None);
+        assert_eq!(friendly_known(&KOOFR, "open /home/r/Sales quota.xlsx: something odd"), None);
+        assert_eq!(friendly_known(&KOOFR, "Failed to copy Invoice 401.pdf: odd"), None);
         let busy = "Invalid response status! Got 429, expected 200; headers: map[], content: ";
-        assert!(friendly_error(busy).contains("Limit requests to Koofr"));
-        assert!(friendly_error("HTTP 429 Too Many Requests").contains("too many requests"));
+        assert!(friendly_error(&KOOFR, busy).contains("Limit requests to Koofr"));
+        assert!(friendly_error(&KOOFR, "HTTP 429 Too Many Requests").contains("too many requests"));
+    }
+
+    #[test]
+    fn every_accounts_paths_are_left_out_of_error_words() {
+        // A later account's name in the engine starts with "shacct".
+        let w = error_words("too many deletes (>50%, 2 of 3) on Path2 \"shacct18ebf41faaec:Quota 401/x\". Run with --force");
+        assert!(!w.contains("quota") && !w.contains("401") && w.contains("too many deletes"), "{w}");
+        let w = error_words("Failed to create file system for \"shacct9:\": didn't find section in config file (\"shacct9\")");
+        assert!(w.contains("didn't find section in config file"), "{w}");
+        assert!(is_auth_error(&w));
+        // Other words with a colon are kept.
+        let w = error_words("dial tcp: lookup api.pcloud.com: no such host");
+        assert!(w.contains("no such host") && w.contains("dial tcp"), "{w}");
+        assert!(error_words("shacct: not a name").contains("shacct: not a name"));
+    }
+
+    #[test]
+    fn sign_in_text_is_edited_one_account_at_a_time() {
+        let text = "[koofr]\r\ntype = koofr\r\nuser = a@b.c\r\n\r\n[shacct1]\ntype = pcloud\ntoken = {\"access_token\":\"x[y]\"}\nhostname = eapi.pcloud.com\n";
+        assert_eq!(section_names(text), vec!["koofr", "shacct1"]);
+        assert_eq!(section(text, "koofr").unwrap(), "type = koofr\nuser = a@b.c");
+        assert_eq!(section(text, "shacct1").unwrap(), "type = pcloud\ntoken = {\"access_token\":\"x[y]\"}\nhostname = eapi.pcloud.com");
+        assert!(section(text, "nobody").is_none());
+        let replaced = with_section(text, "koofr", Some("type = koofr\nuser = new@b.c\n"));
+        assert_eq!(section_names(&replaced), vec!["shacct1", "koofr"]);
+        assert_eq!(section(&replaced, "koofr").unwrap(), "type = koofr\nuser = new@b.c");
+        assert_eq!(section(&replaced, "shacct1"), section(text, "shacct1"), "the other account is untouched");
+        let removed = with_section(&replaced, "shacct1", None);
+        assert_eq!(section_names(&removed), vec!["koofr"]);
+        assert_eq!(section_names(&with_section(&removed, "koofr", None)), Vec::<String>::new());
+        assert_eq!(section_names(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sign_in_problems_are_told_apart() {
+        for raw in [
+            "Invalid response status! Got 401, expected 200",
+            "couldn't login: wrong email or password",
+            "Failed to create file system for \"shacct1:\": Log in required. (Error 1000)",
+            "invalid 'access_token' provided. (Error 2094)",
+        ] {
+            assert!(is_auth_error(&error_words(raw)), "{raw}");
+            assert!(friendly_error(&crate::providers::PCLOUD, raw).starts_with("pCloud did not accept the saved sign-in."), "{raw}");
+        }
+        let locked = "CRITICAL: Failed to load config file \"C:\\Users\\r\\AppData\\Local\\x\\rclone.conf\": unable to decrypt configuration and not allowed to ask for password - set RCLONE_CONFIG_PASS to your configuration password";
+        assert!(is_locked_signins(locked));
+        assert_eq!(friendly_error(&KOOFR, locked), LOCKED_SIGNINS_TEXT);
+        assert!(!is_locked_signins("dial tcp: no such host"));
+        // What to do about too many requests depends on the service.
+        let busy = "Invalid response status! Got 429, expected 200";
+        assert!(friendly_error(&KOOFR, busy).contains("turn on Limit requests to Koofr in this account's settings"));
+        assert_eq!(friendly_error(&crate::providers::FILEN, busy), "Filen says SyncHopper is sending too many requests. SyncHopper waits and tries again by itself.");
+        assert_eq!(friendly_error(&crate::providers::PCLOUD, "Got 507, expected 200: quota"), "Your pCloud storage is full.");
     }
 }

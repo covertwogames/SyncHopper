@@ -1,4 +1,4 @@
-//! One-way uploads: files and folders sent straight to Koofr without being
+//! One-way uploads: files and folders sent straight to the account without being
 //! kept in sync.
 
 use crate::core::{Core, Notice};
@@ -210,7 +210,7 @@ impl Uploads {
                 if is_blocked_message(&raw) {
                     self.core.engine_blocked(&raw);
                 }
-                ("failed", Some(friendly_error(&raw)))
+                ("failed", Some(friendly_error(self.core.provider, &raw)))
             }
         };
         self.core.log(&format!("[upload] {path} {state} {}", error.clone().unwrap_or_default()));
@@ -247,11 +247,11 @@ impl Uploads {
             if failed > 0 {
                 self.core.notify(
                     Notice::Problem,
-                    &format!("{failed} {} to Koofr failed", plural(failed)),
+                    &format!("{failed} {} to {} failed", plural(failed), self.core.cloud()),
                     "Open SyncHopper to see what went wrong and try again.",
                 );
             } else if done > 0 {
-                self.core.notify(Notice::Info, "Uploads finished", &format!("{done} {} to Koofr finished.", plural(done)));
+                self.core.notify(Notice::Info, "Uploads finished", &format!("{done} {} to {} finished.", plural(done), self.core.cloud()));
             }
         }
     }

@@ -5,12 +5,14 @@
 //! has a package identity. This library is that object. It runs in a separate
 //! Windows helper process, so a problem here can't take File Explorer down.
 //!
-//! The menu shows a "SyncHopper" entry with "Send to Koofr" and, for a single
-//! folder, "Sync folder to Koofr". Picking one starts SyncHopper with
+//! The menu shows a "SyncHopper" entry with a send item and, for a single
+//! folder, a sync item. Picking one starts SyncHopper with
 //! `--upload <path>...` or `--add-folder <path>`. SyncHopper writes the
 //! settings this reads to HKEY_CURRENT_USER\Software\SyncHopper\Menu:
-//! `Upload` and `AddFolder` (1 to show the item, 0 to hide it) and `Exe` (the
-//! path of SyncHopper's program file).
+//! `Upload` and `AddFolder` (1 to show the item, 0 to hide it), `Exe` (the
+//! path of SyncHopper's program file), and `SendTitle` and `AddFolderTitle`
+//! (the wording of the two items, which names the cloud service when there
+//! is only one account).
 
 #![cfg(windows)]
 #![allow(non_snake_case)]
@@ -47,6 +49,17 @@ fn flag(name: &str) -> bool {
         .and_then(|k| k.get_u32(name))
         .map(|v| v != 0)
         .unwrap_or(false)
+}
+
+/// The wording SyncHopper saved for an item, or `fallback` when it saved none.
+fn title(name: &str, fallback: &str) -> String {
+    windows_registry::CURRENT_USER
+        .open(SETTINGS_KEY)
+        .and_then(|k| k.get_string(name))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// SyncHopper's program file: the path SyncHopper saved, or the program
@@ -169,10 +182,11 @@ struct Item {
 
 impl IExplorerCommand_Impl for Item_Impl {
     fn GetTitle(&self, _items: Ref<IShellItemArray>) -> windows_core::Result<PWSTR> {
-        shell_string(match self.kind {
-            Kind::Send => "Send to Koofr",
-            Kind::SyncFolder => "Sync folder to Koofr",
-        })
+        let text = match self.kind {
+            Kind::Send => title("SendTitle", "Send to..."),
+            Kind::SyncFolder => title("AddFolderTitle", "Sync folder to..."),
+        };
+        shell_string(&text)
     }
 
     fn GetIcon(&self, _items: Ref<IShellItemArray>) -> windows_core::Result<PWSTR> {

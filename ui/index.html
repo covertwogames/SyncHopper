@@ -8,6 +8,18 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="shell" class="shell">
+
+<!-- The accounts column. Hidden during setup. The list is built by app.js. -->
+<nav id="accounts" class="accounts" aria-label="Accounts" hidden>
+  <p class="cap">Accounts</p>
+  <div id="acct-list" class="acct-list"></div>
+  <button type="button" class="acct one" id="acct-add" data-nav="add" data-icon="plus" data-icon-size="20"><span class="who"><span class="name">Add cloud provider</span></span></button>
+  <div class="grow"></div>
+  <button type="button" class="acct one" id="acct-general" data-nav="general" data-icon="gear" data-icon-size="20"><span class="who"><span class="name">General settings</span></span></button>
+</nav>
+
+<div class="stage">
 
 <!-- Shown for a moment while the app starts -->
 <main id="view-loading" class="view center">
@@ -34,13 +46,13 @@
 <main id="view-main" class="view page" hidden>
   <header class="page-head split">
     <div class="titles">
-      <h1>Koofr</h1>
+      <h1 id="main-title"></h1>
       <p id="main-account" class="small muted"></p>
     </div>
     <div class="row gap8">
       <button type="button" class="btn primary" data-nav="upload" data-icon="upload">Upload</button>
       <button type="button" class="btn" id="add-folder" data-icon="plus">Add folder</button>
-      <button type="button" class="btn subtle icon" data-nav="settings" data-icon="gear" data-icon-size="18" aria-label="Settings" title="Settings"></button>
+      <button type="button" class="btn subtle icon" id="main-settings" data-nav="settings" data-icon="gear" data-icon-size="18" aria-label="Account settings" title="Account settings"></button>
     </div>
   </header>
   <div id="main-banners" role="status"></div>
@@ -63,14 +75,14 @@
   <header class="page-head">
     <button type="button" class="btn subtle icon" data-nav="main" data-icon="back" data-icon-size="18" aria-label="Back to folders" title="Back to folders"></button>
     <div class="titles">
-      <h1>Upload to Koofr</h1>
-      <p class="small muted">Files go straight to Koofr. They are not kept in sync with this PC.</p>
+      <h1 id="up-title"></h1>
+      <p class="small muted" id="up-sub"></p>
     </div>
   </header>
   <div class="field">
-    <label for="up-dest">Koofr folder</label>
+    <label for="up-dest" id="up-dest-label"></label>
     <div class="row gap8">
-      <input id="up-dest" type="text" class="grow" placeholder="Top of your Koofr" autocomplete="off" spellcheck="false">
+      <input id="up-dest" type="text" class="grow" autocomplete="off" spellcheck="false">
       <button type="button" class="btn" id="up-browse">Browse</button>
     </div>
   </div>
@@ -92,15 +104,32 @@
   </footer>
 </main>
 
-<!-- Settings -->
+<!-- One account's own settings. Wording that names the service is filled in by app.js. -->
 <main id="view-settings" class="view page" hidden>
   <header class="page-head">
     <button type="button" class="btn subtle icon" data-nav="main" data-icon="back" data-icon-size="18" aria-label="Back to folders" title="Back to folders"></button>
-    <h1>Settings</h1>
+    <h1 id="st-title"></h1>
   </header>
   <div class="scroll">
     <div class="cols wide-right">
       <div class="col">
+        <section class="group" aria-labelledby="st-h-account">
+          <h2 id="st-h-account">Account</h2>
+          <div class="panel">
+            <div class="setting">
+              <span class="two"><span class="strong" id="st-name"></span><span class="small muted selectable" id="st-account"></span></span>
+              <button type="button" class="btn" id="st-rename">Rename</button>
+            </div>
+            <div class="setting">
+              <span class="small muted" id="st-reconnect-note"></span>
+              <button type="button" class="btn" id="st-reconnect">Reconnect</button>
+            </div>
+            <div class="setting">
+              <span class="small muted" id="st-disconnect-note"></span>
+              <button type="button" class="btn" id="st-disconnect">Disconnect</button>
+            </div>
+          </div>
+        </section>
         <section class="group" aria-labelledby="st-h-features">
           <h2 id="st-h-features">Features</h2>
           <div class="panel">
@@ -110,23 +139,24 @@
             </div>
             <div class="check">
               <input id="st-drive" type="checkbox" data-set="feature_drive">
-              <label for="st-drive"><span>Koofr drive</span><span class="small muted" id="st-drive-note">Turning this on installs a small driver.</span></label>
+              <label for="st-drive"><span id="st-drive-label"></span><span class="small muted" id="st-drive-note"></span></label>
             </div>
             <div class="setting sub" id="st-letter-row" hidden>
               <label for="st-letter">Drive letter</label>
               <select id="st-letter" data-set="drive_letter"></select>
             </div>
             <div class="check">
-              <input id="st-menu" type="checkbox" data-set="feature_context_menu">
-              <label for="st-menu"><span>SyncHopper in the right-click menu</span><span class="small muted">Adds Send to Koofr and Sync folder to Koofr to File Explorer's right-click menu.</span></label>
-            </div>
-            <div class="check">
               <input id="st-sidebar" type="checkbox" data-set="feature_sidebar">
-              <label for="st-sidebar"><span>Koofr in File Explorer's sidebar</span><span class="small muted" id="st-sidebar-note">Adds Koofr next to OneDrive and This PC. It opens the folder your synced folders are in.</span></label>
+              <label for="st-sidebar"><span id="st-sidebar-label"></span><span class="small muted" id="st-sidebar-note"></span></label>
             </div>
-            <div class="check">
-              <input id="st-start" type="checkbox" data-set="autostart">
-              <label for="st-start"><span>Start with Windows</span><span class="small muted">Open in the tray when you sign in.</span></label>
+          </div>
+        </section>
+        <section class="group" aria-labelledby="st-h-trouble">
+          <h2 id="st-h-trouble">Troubleshooting</h2>
+          <div class="panel">
+            <div class="setting">
+              <span class="small muted">Repair rebuilds a folder's sync record. It never deletes files.</span>
+              <button type="button" class="btn" id="ad-repair">Repair a folder</button>
             </div>
           </div>
         </section>
@@ -135,109 +165,62 @@
         <section class="group" aria-labelledby="st-h-sync">
           <h2 id="st-h-sync">Syncing</h2>
           <div class="panel">
+            <div class="setting" id="st-base-row">
+              <span class="two"><span>Folders on this PC</span><span class="small muted selectable" id="st-base"></span></span>
+              <button type="button" class="btn" id="st-base-open">Open</button>
+            </div>
             <div class="setting">
-              <label for="st-every">Check Koofr for changes every</label>
+              <label for="st-every" id="st-every-label"></label>
               <select id="st-every" data-set="check_interval_min" data-num></select>
             </div>
             <div class="setting">
               <label for="st-par">Files transferred at a time</label>
               <select id="st-par" data-set="transfers" data-num></select>
             </div>
-            <div class="setting">
-              <label for="st-del">Ask before deleting more than</label>
-              <select id="st-del" data-set="max_delete_percent" data-num></select>
-            </div>
             <div class="check">
               <input id="st-auto" type="checkbox" data-set="auto_add_folders">
-              <label for="st-auto"><span>Automatically sync new folders added to your Koofr folder</span><span class="small muted">New folders you put there get a matching folder in Koofr. If Koofr already has one with that name, SyncHopper asks first. When this is off, SyncHopper tells you about new folders instead.</span></label>
+              <label for="st-auto"><span id="st-auto-label"></span><span class="small muted" id="st-auto-note"></span></label>
             </div>
           </div>
         </section>
-        <section class="group" aria-labelledby="st-h-account">
-          <h2 id="st-h-account">Account</h2>
+        <section class="group" aria-labelledby="st-h-only" id="st-only" hidden>
+          <h2 id="st-h-only"></h2>
           <div class="panel">
-            <div class="setting">
-              <span id="st-account"></span>
-              <button type="button" class="btn" id="st-disconnect">Disconnect</button>
+            <div class="check" id="st-http2-row">
+              <input id="ad-http2" type="checkbox" data-set="use_http2">
+              <label for="ad-http2"><span>Use HTTP/2</span><span class="small muted" id="st-http2-note"></span></label>
+            </div>
+            <div class="check" id="st-limit-row">
+              <input id="ad-limit" type="checkbox" data-set="limit_requests">
+              <label for="ad-limit"><span id="st-limit-label"></span><span class="small muted" id="st-limit-note"></span></label>
             </div>
           </div>
         </section>
       </div>
     </div>
   </div>
-  <footer class="page-foot ruled">
-    <div class="row gap20">
-      <button type="button" class="btn" id="st-rerun">Run setup again</button>
-      <button type="button" class="link" data-nav="advanced">Advanced settings</button>
-    </div>
-    <button type="button" class="btn primary" data-nav="main">Done</button>
-  </footer>
 </main>
 
-<!-- Advanced settings -->
-<main id="view-advanced" class="view page" hidden>
-  <header class="page-head">
-    <button type="button" class="btn subtle icon" data-nav="settings" data-icon="back" data-icon-size="18" aria-label="Back to settings" title="Back to settings"></button>
-    <h1>Advanced settings</h1>
+<!-- Settings that apply to every account -->
+<main id="view-general" class="view page" hidden>
+  <header class="page-head split">
+    <h1>General settings</h1>
+    <button type="button" class="btn" id="ad-defaults">Restore defaults</button>
   </header>
   <div class="scroll">
-    <div class="cols">
+    <div class="cols wide-right">
       <div class="col">
-        <section class="group" aria-labelledby="ad-h-conn">
-          <h2 id="ad-h-conn">Connection</h2>
+        <section class="group" aria-labelledby="ge-h-start">
+          <h2 id="ge-h-start">Startup and menus</h2>
           <div class="panel">
             <div class="check">
-              <input id="ad-http2" type="checkbox" data-set="use_http2">
-              <label for="ad-http2"><span>Use HTTP/2</span><span class="small muted">Off is much faster for uploads to Koofr. Turn on only to test.</span></label>
+              <input id="st-start" type="checkbox" data-set="autostart">
+              <label for="st-start"><span>Start with Windows</span><span class="small muted">Open in the tray when you sign in.</span></label>
             </div>
             <div class="check">
-              <input id="ad-limit" type="checkbox" data-set="limit_requests">
-              <label for="ad-limit"><span>Limit requests to Koofr</span><span class="small muted">Limits syncs, uploads and the drive to 40 requests per second each, the rate Koofr recommends. Turn this on if Koofr says SyncHopper is sending too many requests. Big syncs may be a little slower, and the drive reconnects when you change this.</span></label>
+              <input id="st-menu" type="checkbox" data-set="feature_context_menu">
+              <label for="st-menu"><span>SyncHopper in the right-click menu</span><span class="small muted" id="st-menu-note"></span></label>
             </div>
-          </div>
-        </section>
-        <section class="group" aria-labelledby="ad-h-limits">
-          <h2 id="ad-h-limits">Limits and conflicts</h2>
-          <div class="panel">
-            <div class="setting">
-              <label for="ad-up-mode">Upload speed limit</label>
-              <div class="row gap8">
-                <select id="ad-up-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
-                <span class="row gap8" id="ad-up-wrap" hidden><input id="ad-up" type="number" min="0.1" step="0.1" class="w72" aria-label="Upload speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
-              </div>
-            </div>
-            <div class="setting">
-              <label for="ad-down-mode">Download speed limit</label>
-              <div class="row gap8">
-                <select id="ad-down-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
-                <span class="row gap8" id="ad-down-wrap" hidden><input id="ad-down" type="number" min="0.1" step="0.1" class="w72" aria-label="Download speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
-              </div>
-            </div>
-            <div class="setting">
-              <label for="ad-conflict">If a file changed in both places</label>
-              <select id="ad-conflict" data-set="conflict_policy">
-                <option value="keep_both">Keep both copies</option>
-                <option value="newest">Newest wins</option>
-              </select>
-            </div>
-          </div>
-        </section>
-        <section class="group" aria-labelledby="ad-h-ignored">
-          <h2 id="ad-h-ignored">Ignored files</h2>
-          <div class="panel">
-            <div class="setting">
-              <span class="small muted">Temp and lock files are never synced.</span>
-              <button type="button" class="btn" id="ad-ignore">Edit list</button>
-            </div>
-          </div>
-        </section>
-      </div>
-      <div class="col">
-        <section class="group" aria-labelledby="ad-h-pause">
-          <h2 id="ad-h-pause">Pause syncing</h2>
-          <div class="panel">
-            <div class="check"><input id="ad-battery" type="checkbox" data-set="pause_on_battery"><label for="ad-battery"><span>While on battery</span></label></div>
-            <div class="check"><input id="ad-metered" type="checkbox" data-set="pause_on_metered"><label for="ad-metered"><span>On metered connections</span></label></div>
           </div>
         </section>
         <section class="group" aria-labelledby="ad-h-notify">
@@ -265,27 +248,85 @@
             <p class="small muted sub">rclone is free, open-source software by Nick Craig-Wood and the rclone contributors. <button type="button" class="link" id="ad-rclone">rclone.org</button></p>
           </div>
         </section>
+      </div>
+      <div class="col">
+        <section class="group" aria-labelledby="ad-h-limits">
+          <h2 id="ad-h-limits">Syncing, all accounts</h2>
+          <div class="panel">
+            <div class="setting">
+              <label for="st-del">Ask before deleting more than</label>
+              <select id="st-del" data-set="max_delete_percent" data-num></select>
+            </div>
+            <div class="setting">
+              <label for="ad-conflict">If a file changed in both places</label>
+              <select id="ad-conflict" data-set="conflict_policy">
+                <option value="keep_both">Keep both copies</option>
+                <option value="newest">Newest wins</option>
+              </select>
+            </div>
+            <div class="setting">
+              <label for="ad-up-mode">Upload speed limit</label>
+              <div class="row gap8">
+                <select id="ad-up-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
+                <span class="row gap8" id="ad-up-wrap" hidden><input id="ad-up" type="number" min="0.1" step="0.1" class="w72" aria-label="Upload speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+              </div>
+            </div>
+            <div class="setting">
+              <label for="ad-down-mode">Download speed limit</label>
+              <div class="row gap8">
+                <select id="ad-down-mode" class="w104"><option value="none">No limit</option><option value="custom">Custom</option></select>
+                <span class="row gap8" id="ad-down-wrap" hidden><input id="ad-down" type="number" min="0.1" step="0.1" class="w72" aria-label="Download speed limit in megabytes per second"><span class="small muted nowrap">MB/s</span></span>
+              </div>
+            </div>
+            <p class="small muted" id="ge-limit-note" hidden>With more than one account, each account can use up to these speeds.</p>
+          </div>
+        </section>
+        <section class="group" aria-labelledby="ad-h-pause">
+          <h2 id="ad-h-pause">Pause syncing</h2>
+          <div class="panel">
+            <div class="check"><input id="ad-battery" type="checkbox" data-set="pause_on_battery"><label for="ad-battery"><span>While on battery</span></label></div>
+            <div class="check"><input id="ad-metered" type="checkbox" data-set="pause_on_metered"><label for="ad-metered"><span>On metered connections</span></label></div>
+          </div>
+        </section>
+        <section class="group" aria-labelledby="ad-h-ignored">
+          <h2 id="ad-h-ignored">Ignored files</h2>
+          <div class="panel">
+            <div class="setting">
+              <span class="small muted">Temp and lock files are never synced.</span>
+              <button type="button" class="btn" id="ad-ignore">Edit list</button>
+            </div>
+          </div>
+        </section>
         <section class="group" aria-labelledby="ad-h-trouble">
           <h2 id="ad-h-trouble">Troubleshooting</h2>
           <div class="panel">
-            <div class="stack">
-              <div class="row gap8 wrap">
-                <button type="button" class="btn" id="ad-log">Open log</button>
-                <button type="button" class="btn" id="ad-diag">Copy diagnostic info</button>
-                <button type="button" class="btn" id="ad-repair">Repair a folder</button>
-              </div>
-              <p class="small muted">Repair rebuilds a folder's sync record. It never deletes files.</p>
+            <div class="row gap8 wrap">
+              <button type="button" class="btn" id="ad-log">Open log</button>
+              <button type="button" class="btn" id="ad-diag">Copy diagnostic info</button>
             </div>
           </div>
         </section>
       </div>
     </div>
   </div>
-  <footer class="page-foot ruled">
-    <button type="button" class="btn" id="ad-defaults">Restore defaults</button>
-    <button type="button" class="btn primary" data-nav="settings">Done</button>
-  </footer>
 </main>
+
+<!-- Add cloud provider. The list is built by app.js. -->
+<main id="view-add" class="view page" hidden>
+  <header class="page-head">
+    <h1>Add a cloud provider</h1>
+  </header>
+  <div class="scroll">
+    <section class="group" aria-labelledby="add-h">
+      <h2 id="add-h">Choose a provider</h2>
+      <ul id="add-list" class="panel rows pick"></ul>
+    </section>
+    <p class="small muted">You can add the same provider more than once, for example a personal and a work account.</p>
+  </div>
+</main>
+
+</div><!-- .stage -->
+</div><!-- #shell -->
 
 <!-- Pop-up menu for a folder row -->
 <div id="row-menu" class="menu" role="menu" hidden></div>

@@ -130,14 +130,15 @@ async fn settings_changes_are_limited_cleaned_and_restorable() {
     let s = rig.app.core.settings();
     assert!(s.auto_update_app, "update checks are an advanced setting, so restore defaults turns them back on");
     assert!(!s.feature_sidebar, "the sidebar entry is a feature, not an advanced setting");
-    assert!(!s.use_http2 && !s.pause_on_battery && s.pause_on_metered);
+    assert!(!s.pause_on_battery && s.pause_on_metered);
+    assert!(s.use_http2, "how one account talks to its service is that account's setting, not a general one");
     assert_eq!(s.conflict_policy, "keep_both");
     assert_eq!(s.upload_limit_mbps, 0.0);
     assert_eq!(s.check_interval_min, 30, "basic sync options are not part of restore defaults");
     assert!(!s.auto_add_folders, "neither is syncing new folders by themselves");
 
     // Saved to disk, so it survives a restart.
-    let saved = synchopper_lib::config::load(&rig.app.core.data.join("settings.json"));
+    let saved = synchopper_lib::config::open(&rig.app.core.data.join("settings.json")).store.view("koofr");
     assert_eq!(saved.check_interval_min, 30);
     assert_eq!(saved.account_email, "tester@example.com");
 }

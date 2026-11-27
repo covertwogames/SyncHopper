@@ -1,4 +1,4 @@
-//! SyncHopper: two-way sync for Koofr, built on rclone.
+//! SyncHopper: two-way sync for cloud storage accounts, built on rclone.
 //!
 //! This file is the window layer: the tray icon, the commands the screens
 //! call, and the plumbing between Tauri and the app logic in `app.rs`.
@@ -10,11 +10,12 @@ pub mod engine;
 pub mod mount;
 pub mod newfolders;
 pub mod platform;
+pub mod providers;
 pub mod rclone;
 pub mod uploads;
 pub mod util;
 
-use crate::app::{App, Preview, SetupChoices};
+use crate::app::{Hub, Preview, SetupChoices, SignIn};
 use crate::core::Host;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +90,9 @@ impl Host for TauriHost {
 /// The notification type that carries a "Sync it" button.
 const FOLDER_ACTIONS: &str = "folder";
 
+/// Carried by a notification whose click should open a particular screen.
+const NOTICE_VIEW: &str = "view";
+
 /// Sets up the "Sync it" button on notifications about folders and what a
 /// click on a notification does. Windows only reports clicks while the
 /// notification is on screen; the main window shows the same choices.
@@ -100,16 +104,17 @@ fn setup_notification_actions(handle: &AppHandle) {
         .build()]);
     let handle = handle.clone();
     let _ = notes.on_action(move |performed| {
-        let folder = performed
-            .notification()
-            .and_then(|n| n.extra().get("folder").and_then(|v| v.as_str()).map(|s| s.to_string()));
-        let app = handle.state::<Arc<App>>().inner().clone();
+        let extra = |key: &str| performed.notification().and_then(|n| n.extra().get(key).and_then(|v| v.as_str()).map(|s| s.to_string()));
+        let folder = extra("folder");
+        // The screen a click should open, for notifications that name one.
+        let view = extra(NOTICE_VIEW);
+        let hub = handle.state::<Arc<Hub>>().inner().clone();
         let handle = handle.clone();
         let action = performed.action_id().to_string();
         tauri::async_runtime::spawn(async move {
             match (action.as_str(), folder) {
-                ("sync", Some(folder)) => app.request_add_folder(&folder),
-                _ => show_main(&handle, None),
+                ("sync", Some(folder)) => hub.request_add_folder(&folder),
+                _ => show_main(&handle, view.as_deref()),
             }
         });
     });
@@ -140,7 +145,6 @@ struct UpdateView {
 struct Updates {
     view: Mutex<UpdateView>,
     pending: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
-    notified_for: Mutex<String>,
     dirty: Arc<AtomicBool>,
 }
 
@@ -181,6 +185,11 @@ fn engine_channel(pubkey: Option<String>) -> Option<rclone::EngineChannel> {
     Some(rclone::EngineChannel { manifest_url, pubkey })
 }
 
+/// What the notification about a new version says. Clicking it opens the
+/// window, where the update is one more click.
+const UPDATE_NOTICE_TITLE: &str = "SyncHopper update";
+const UPDATE_NOTICE_BODY: &str = "An update for SyncHopper is available. Click here to open SyncHopper and install it.";
+
 /// Asks the release page whether a newer SyncHopper exists.
 async fn check_for_update(handle: &AppHandle, manual: bool) -> Result<(), String> {
     let updates = handle.state::<Arc<Updates>>().inner().clone();
@@ -204,12 +213,12 @@ async fn check_for_update(handle: &AppHandle, manual: bool) -> Result<(), String
         Ok(updater) => updater.check().await.map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
-    let app = handle.state::<Arc<App>>().inner().clone();
+    let hub = handle.state::<Arc<Hub>>().inner().clone();
     match result {
         Ok(Some(update)) => {
             let version = update.version.clone();
             let notes = update.body.clone().unwrap_or_default();
-            app.core.log(&format!("SyncHopper {version} is available"));
+            hub.shared.log(&format!("SyncHopper {version} is available"));
             *updates.pending.lock().await = Some(update);
             updates.set(|u| {
                 u.status = "available".into();
@@ -217,18 +226,20 @@ async fn check_for_update(handle: &AppHandle, manual: bool) -> Result<(), String
                 u.notes = notes;
                 u.checked_at = util::now_secs();
             });
-            let first_time = {
-                let mut seen = updates.notified_for.lock().unwrap();
-                let fresh = *seen != version;
-                *seen = version.clone();
-                fresh
-            };
-            if first_time && !manual {
-                app.core.notify(
-                    core::Notice::Info,
-                    &format!("SyncHopper {version} is available"),
-                    "Open SyncHopper to install it. It only takes a moment.",
-                );
+            // Each new version is announced once, ever, and not at all when
+            // notifications are set to Nothing. Someone who just pressed
+            // Check for updates is looking at the answer already.
+            let first_time = hub.shared.general().update_notified != version;
+            if first_time {
+                if !manual && hub.shared.notices_on() {
+                    // A click opens the main screen, where the install
+                    // button is, whatever screen the window was left on.
+                    let _ = handle.notification().builder().title(UPDATE_NOTICE_TITLE).body(UPDATE_NOTICE_BODY).extra(NOTICE_VIEW, "main").show();
+                }
+                if manual || hub.shared.notices_on() {
+                    let seen = version.clone();
+                    hub.shared.change(move |s| s.general.update_notified = seen);
+                }
             }
             Ok(())
         }
@@ -242,7 +253,7 @@ async fn check_for_update(handle: &AppHandle, manual: bool) -> Result<(), String
             Ok(())
         }
         Err(e) => {
-            app.core.log(&format!("Update check failed: {e}"));
+            hub.shared.log(&format!("Update check failed: {e}"));
             updates.set(|u| {
                 u.status = if manual { "error".into() } else { "idle".into() };
                 u.message = format!("Couldn't check for updates: {e}");
@@ -263,14 +274,19 @@ async fn install_update(handle: &AppHandle) -> Result<(), String> {
     let Some(update) = updates.pending.lock().await.clone() else {
         return Err("There is no update waiting to be installed. Check for updates first.".into());
     };
-    let app = handle.state::<Arc<App>>().inner().clone();
-    app.core.log(&format!("Installing SyncHopper {}", update.version));
+    let hub = handle.state::<Arc<Hub>>().inner().clone();
+    hub.shared.log(&format!("Installing SyncHopper {}", update.version));
     // Let anything in progress stop cleanly first. Interrupted syncs pick up
     // where they left off after the restart.
-    app.engine.stop_all();
-    app.uploads.cancel_all();
-    app.drive.stop();
-    app.engine.wait_idle().await;
+    let apps = hub.apps();
+    for app in &apps {
+        app.engine.stop_all();
+        app.uploads.cancel_all();
+        app.drive.stop();
+    }
+    for app in &apps {
+        app.engine.wait_idle().await;
+    }
     updates.set(|u| {
         u.status = "downloading".into();
         u.percent = 0;
@@ -301,14 +317,16 @@ async fn install_update(handle: &AppHandle) -> Result<(), String> {
             handle.restart();
         }
         Err(e) => {
-            app.core.log(&format!("Update install failed: {e}"));
+            hub.shared.log(&format!("Update install failed: {e}"));
             updates.set(|u| {
                 u.status = "error".into();
                 u.message = format!("The update could not be installed: {e}");
             });
             // Put back what was stopped for the install.
-            app.drive.apply().await;
-            app.engine.sync_now(None);
+            for app in hub.ready() {
+                app.drive.apply().await;
+                app.engine.sync_now(None);
+            }
             Err(format!("The update could not be installed: {e}"))
         }
     }
@@ -318,8 +336,8 @@ async fn install_update(handle: &AppHandle) -> Result<(), String> {
 async fn update_loop(handle: AppHandle) {
     tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
-        let app = handle.state::<Arc<App>>().inner().clone();
-        if app.core.settings().auto_update_app {
+        let hub = handle.state::<Arc<Hub>>().inner().clone();
+        if hub.shared.general().auto_update_app {
             let _ = check_for_update(&handle, false).await;
         }
         tokio::time::sleep(Duration::from_secs(12 * 3600)).await;
@@ -328,15 +346,22 @@ async fn update_loop(handle: AppHandle) {
 
 /// The app state plus the update state, as one object for the screens.
 fn full_state(handle: &AppHandle) -> serde_json::Value {
-    let app = handle.state::<Arc<App>>().inner().clone();
-    let mut v = app.snapshot();
+    let hub = handle.state::<Arc<Hub>>().inner().clone();
+    let mut v = hub.snapshot();
     if let (Some(obj), Some(updates)) = (v.as_object_mut(), handle.try_state::<Arc<Updates>>()) {
         obj.insert("update".into(), serde_json::to_value(updates.view()).unwrap_or_default());
     }
     v
 }
 
-type Ctx<'a> = State<'a, Arc<App>>;
+type Ctx<'a> = State<'a, Arc<Hub>>;
+
+/// What the screens get back from signing in to a new account.
+#[derive(serde::Serialize)]
+struct Connected {
+    account: String,
+    about: rclone::About,
+}
 
 // ----- commands the screens call ---------------------------------------
 
@@ -346,18 +371,39 @@ fn get_state(handle: AppHandle) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn request_add_folder(app: Ctx<'_>, folder: String) {
-    app.request_add_folder(&folder);
+fn request_add_folder(hub: Ctx<'_>, account: Option<String>, folder: String) -> Result<(), String> {
+    match account {
+        // The window picked the account: the request moves to it.
+        Some(id) => {
+            let app = hub.app(&id)?;
+            for other in hub.apps() {
+                if other.id() != id {
+                    other.clear_add_request();
+                }
+            }
+            app.request_add_folder(&folder);
+        }
+        None => hub.request_add_folder(&folder),
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn clear_add_request(app: Ctx<'_>) {
-    app.clear_add_request();
+fn clear_add_request(hub: Ctx<'_>) {
+    for app in hub.apps() {
+        app.clear_add_request();
+    }
 }
 
 #[tauri::command]
-fn dismiss_folder_notice(app: Ctx<'_>, id: String) {
-    app.folders.dismiss(&id);
+fn clear_pending(hub: Ctx<'_>) {
+    hub.clear_pending();
+}
+
+#[tauri::command]
+fn dismiss_folder_notice(hub: Ctx<'_>, account: String, id: String) -> Result<(), String> {
+    hub.app(&account)?.folders.dismiss(&id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -371,85 +417,107 @@ async fn install_app_update(handle: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn ignore_file(app: Ctx<'_>, id: String, path: String) -> Result<(), String> {
-    app.engine.ignore_file(&id, &path)
+async fn ignore_file(hub: Ctx<'_>, account: String, id: String, path: String) -> Result<(), String> {
+    hub.app(&account)?.engine.ignore_file(&id, &path)
 }
 
 #[tauri::command]
-async fn unignore_file(app: Ctx<'_>, id: String, path: String) -> Result<(), String> {
-    app.engine.unignore_file(&id, &path)
+async fn unignore_file(hub: Ctx<'_>, account: String, id: String, path: String) -> Result<(), String> {
+    hub.app(&account)?.engine.unignore_file(&id, &path)
 }
 
 #[tauri::command]
-async fn retry_engine(app: Ctx<'_>) -> Result<(), String> {
-    app.check_engine(crate::app::EngineCheck::Manual).await;
+async fn retry_engine(hub: Ctx<'_>) -> Result<(), String> {
+    hub.commons.check_engine(crate::app::EngineCheck::Manual).await;
     Ok(())
 }
 
+/// Signs in to a new account. For services that sign in on their own page
+/// this returns once the user has finished there.
 #[tauri::command]
-async fn connect(app: Ctx<'_>, email: String, password: String) -> Result<rclone::About, String> {
-    app.connect(&email, &password).await
+async fn add_account(hub: Ctx<'_>, provider: String, signin: SignIn) -> Result<Connected, String> {
+    let (account, about) = hub.add_account(&provider, signin).await?;
+    Ok(Connected { account, about })
 }
 
 #[tauri::command]
-async fn disconnect(app: Ctx<'_>) -> Result<(), String> {
-    app.disconnect().await;
-    Ok(())
+async fn reconnect(hub: Ctx<'_>, account: String, signin: SignIn) -> Result<rclone::About, String> {
+    hub.reconnect(&account, signin).await
 }
 
 #[tauri::command]
-fn default_base_folder(app: Ctx<'_>) -> String {
-    let saved = app.core.settings().base_folder;
-    if saved.is_empty() {
-        platform::default_base_folder()
-    } else {
-        saved
+fn cancel_sign_in(hub: Ctx<'_>) {
+    for app in hub.apps() {
+        app.cancel_sign_in();
     }
 }
 
 #[tauri::command]
-async fn list_remote(app: Ctx<'_>, path: String) -> Result<Vec<String>, String> {
-    app.list_remote(&path).await
+async fn remove_account(hub: Ctx<'_>, account: String) -> Result<(), String> {
+    hub.inner().remove_account(&account).await
 }
 
 #[tauri::command]
-async fn make_remote_dir(app: Ctx<'_>, path: String) -> Result<(), String> {
-    app.make_remote_dir(&path).await
+async fn rename_account(hub: Ctx<'_>, account: String, name: String) -> Result<(), String> {
+    hub.rename_account(&account, &name).await
+}
+
+/// Where a new or existing account would keep its folders on this PC.
+#[tauri::command]
+fn default_base_folder(hub: Ctx<'_>, account: String) -> Result<String, String> {
+    let app = hub.app(&account)?;
+    let saved = app.core.settings().base_folder;
+    Ok(if saved.is_empty() {
+        platform::default_base_folder(account == config::FIRST_ACCOUNT, &app.core.label())
+    } else {
+        saved
+    })
 }
 
 #[tauri::command]
-async fn preview_pair(app: Ctx<'_>, local: String, remote: String) -> Result<Preview, String> {
-    app.preview(&local, &remote).await
+async fn list_remote(hub: Ctx<'_>, account: String, path: String) -> Result<Vec<String>, String> {
+    hub.app(&account)?.list_remote(&path).await
 }
 
 #[tauri::command]
-async fn finish_setup(app: Ctx<'_>, choices: SetupChoices) -> Result<Vec<String>, String> {
-    app.finish_setup(choices).await
+async fn make_remote_dir(hub: Ctx<'_>, account: String, path: String) -> Result<(), String> {
+    hub.app(&account)?.make_remote_dir(&path).await
 }
 
 #[tauri::command]
-async fn update_settings(app: Ctx<'_>, patch: serde_json::Value) -> Result<(), String> {
-    app.update_settings(patch).await
+async fn preview_pair(hub: Ctx<'_>, account: String, local: String, remote: String) -> Result<Preview, String> {
+    hub.app(&account)?.preview(&local, &remote).await
 }
 
 #[tauri::command]
-async fn restore_defaults(app: Ctx<'_>) -> Result<(), String> {
-    app.restore_defaults().await
+async fn finish_setup(hub: Ctx<'_>, account: String, choices: SetupChoices) -> Result<Vec<String>, String> {
+    hub.app(&account)?.finish_setup(choices).await
 }
 
 #[tauri::command]
-async fn add_pair(app: Ctx<'_>, local: String, remote: String) -> Result<(), String> {
-    app.engine.add_pair(&local, &remote).map(|_| ())
+async fn update_settings(hub: Ctx<'_>, account: String, patch: serde_json::Value) -> Result<(), String> {
+    hub.app(&account)?.update_settings(patch).await
 }
 
 #[tauri::command]
-async fn remove_pair(app: Ctx<'_>, id: String) -> Result<(), String> {
-    app.engine.remove_pair(&id);
+async fn restore_defaults(hub: Ctx<'_>, account: String) -> Result<(), String> {
+    hub.app(&account)?.restore_defaults().await
+}
+
+#[tauri::command]
+async fn add_pair(hub: Ctx<'_>, account: String, local: String, remote: String) -> Result<(), String> {
+    hub.app(&account)?.engine.add_pair(&local, &remote).map(|_| ())
+}
+
+#[tauri::command]
+async fn remove_pair(hub: Ctx<'_>, account: String, id: String) -> Result<(), String> {
+    hub.app(&account)?.engine.remove_pair(&id);
     Ok(())
 }
 
 #[tauri::command]
-async fn pair_action(app: Ctx<'_>, id: String, action: String) -> Result<(), String> {
+async fn pair_action(hub: Ctx<'_>, account: String, id: String, action: String) -> Result<(), String> {
+    let app = hub.app(&account)?;
     let e = &app.engine;
     match action.as_str() {
         "sync" => e.sync_now(Some(&id)),
@@ -467,25 +535,27 @@ async fn pair_action(app: Ctx<'_>, id: String, action: String) -> Result<(), Str
 }
 
 #[tauri::command]
-async fn sync_all(app: Ctx<'_>) -> Result<(), String> {
-    app.engine.sync_now(None);
+async fn sync_all(hub: Ctx<'_>, account: String) -> Result<(), String> {
+    hub.app(&account)?.engine.sync_now(None);
     Ok(())
 }
 
 #[tauri::command]
-async fn set_paused_all(app: Ctx<'_>, paused: bool) -> Result<(), String> {
-    app.engine.set_paused_all(paused);
+async fn set_paused_all(hub: Ctx<'_>, account: String, paused: bool) -> Result<(), String> {
+    hub.app(&account)?.engine.set_paused_all(paused);
     Ok(())
 }
 
 #[tauri::command]
-async fn upload_add(app: Ctx<'_>, paths: Vec<String>, dest: String) -> Result<usize, String> {
+async fn upload_add(hub: Ctx<'_>, account: String, paths: Vec<String>, dest: String) -> Result<usize, String> {
+    let app = hub.app(&account)?;
     app.set_upload_dest(&dest);
     Ok(app.uploads.add(paths, &dest))
 }
 
 #[tauri::command]
-async fn upload_action(app: Ctx<'_>, action: String, id: Option<u64>) -> Result<(), String> {
+async fn upload_action(hub: Ctx<'_>, account: String, action: String, id: Option<u64>) -> Result<(), String> {
+    let app = hub.app(&account)?;
     match (action.as_str(), id) {
         ("cancel_all", _) => app.uploads.cancel_all(),
         ("clear", _) => app.uploads.clear_finished(),
@@ -496,12 +566,14 @@ async fn upload_action(app: Ctx<'_>, action: String, id: Option<u64>) -> Result<
 }
 
 #[tauri::command]
-fn set_upload_dest(app: Ctx<'_>, dest: String) {
-    app.set_upload_dest(&dest);
+fn set_upload_dest(hub: Ctx<'_>, account: String, dest: String) -> Result<(), String> {
+    hub.app(&account)?.set_upload_dest(&dest);
+    Ok(())
 }
 
 #[tauri::command]
-async fn drive_action(app: Ctx<'_>, action: String) -> Result<(), String> {
+async fn drive_action(hub: Ctx<'_>, account: String, action: String) -> Result<(), String> {
+    let app = hub.app(&account)?;
     match action.as_str() {
         "install" => {
             let drive = app.drive.clone();
@@ -552,32 +624,43 @@ async fn pick_upload(handle: AppHandle, folders: bool) -> Result<Vec<String>, St
     Ok(pick(&handle, folders, true, None).await)
 }
 
+/// Opens a web page, file or folder. `account` says whose drive or folder
+/// is meant, for the targets that belong to one account.
 #[tauri::command]
-fn open_target(app: Ctx<'_>, handle: AppHandle, kind: String, value: Option<String>) -> Result<(), String> {
+fn open_target(hub: Ctx<'_>, handle: AppHandle, kind: String, account: Option<String>, value: Option<String>) -> Result<(), String> {
     let opener = handle.opener();
-    let s = app.core.settings();
+    let settings = || -> Result<config::Settings, String> { Ok(hub.app(account.as_deref().unwrap_or_default())?.core.settings()) };
     let result = match kind.as_str() {
-        "koofr_password_page" => opener.open_url(app::KOOFR_PASSWORD_URL, None::<&str>),
+        "koofr_password_page" => opener.open_url(providers::KOOFR_PASSWORD_URL, None::<&str>),
+        "filen_cli_page" => opener.open_url(providers::FILEN_CLI_URL, None::<&str>),
         "winfsp_page" => opener.open_url(app::WINFSP_URL, None::<&str>),
         "rclone_site" => opener.open_url(app::RCLONE_URL, None::<&str>),
+        // The sign-in page the engine is waiting on. It is always on this PC.
+        "signin_link" => {
+            let link = value.unwrap_or_default();
+            if !link.starts_with("http://127.0.0.1:") && !link.starts_with("http://localhost:") {
+                return Err("That sign-in link can't be opened.".into());
+            }
+            opener.open_url(link, None::<&str>)
+        }
         "log" => {
-            let path = app.core.log_path();
+            let path = hub.shared.log_path();
             if !path.exists() {
-                app.core.log("Log opened");
+                hub.shared.log("Log opened");
             }
             opener.open_path(path.to_string_lossy(), None::<&str>)
         }
-        "drive" => opener.open_path(format!("{}:\\", s.drive_letter), None::<&str>),
+        "drive" => opener.open_path(format!("{}:\\", settings()?.drive_letter), None::<&str>),
         "base_folder" => {
-            let base = s.base_folder.trim().to_string();
+            let base = settings()?.base_folder.trim().to_string();
             if base.is_empty() {
-                return Err("There is no Koofr folder on this PC yet.".into());
+                return Err("This account has no folder on this PC yet.".into());
             }
             opener.open_path(base, None::<&str>)
         }
         "pair_folder" => {
             let id = value.unwrap_or_default();
-            match s.pairs.iter().find(|p| p.id == id) {
+            match settings()?.pairs.iter().find(|p| p.id == id) {
                 Some(p) => opener.open_path(p.local.clone(), None::<&str>),
                 None => return Err("That folder is no longer synced.".into()),
             }
@@ -588,8 +671,8 @@ fn open_target(app: Ctx<'_>, handle: AppHandle, kind: String, value: Option<Stri
 }
 
 #[tauri::command]
-fn diagnostics(app: Ctx<'_>) -> String {
-    app.diagnostics()
+fn diagnostics(hub: Ctx<'_>) -> String {
+    hub.diagnostics()
 }
 
 #[tauri::command]
@@ -605,7 +688,7 @@ fn build_tray(handle: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(handle, "open", "Open SyncHopper", true, None::<&str>)?;
     let sync = MenuItem::with_id(handle, "sync", "Sync now", true, None::<&str>)?;
     let pause = MenuItem::with_id(handle, "pause", "Pause syncing", true, None::<&str>)?;
-    let upload = MenuItem::with_id(handle, "upload", "Upload to Koofr", true, None::<&str>)?;
+    let upload = MenuItem::with_id(handle, "upload", "Upload files", true, None::<&str>)?;
     let quit = MenuItem::with_id(handle, "quit", "Quit SyncHopper", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(handle)?;
     let sep2 = PredefinedMenuItem::separator(handle)?;
@@ -617,22 +700,26 @@ fn build_tray(handle: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|handle, event| {
-            let app = handle.state::<Arc<App>>().inner().clone();
+            let hub = handle.state::<Arc<Hub>>().inner().clone();
             match event.id.as_ref() {
                 "open" => show_main(handle, None),
                 "upload" => {
-                    let view = if app.core.settings().setup_complete { Some("upload") } else { None };
+                    let view = if hub.ready().is_empty() { None } else { Some("upload") };
                     show_main(handle, view);
                 }
-                "sync" => app.engine.sync_now(None),
+                // The tray speaks for every account at once.
+                "sync" => hub.ready().iter().for_each(|app| app.engine.sync_now(None)),
                 "pause" => {
-                    let paused = app.engine.sync_view().paused_all;
-                    app.engine.set_paused_all(!paused);
+                    let paused = hub.paused_all();
+                    hub.ready().iter().for_each(|app| app.engine.set_paused_all(!paused));
                 }
                 "quit" => {
-                    app.engine.stop_all();
-                    app.uploads.cancel_all();
-                    app.drive.stop();
+                    for app in hub.apps() {
+                        app.cancel_sign_in();
+                        app.engine.stop_all();
+                        app.uploads.cancel_all();
+                        app.drive.stop();
+                    }
                     let handle = handle.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -656,7 +743,7 @@ fn build_tray(handle: &AppHandle) -> tauri::Result<()> {
 
 /// Sends fresh state to the screens and keeps the tray text current,
 /// at most a few times a second.
-async fn state_pump(handle: AppHandle, app: Arc<App>, dirty: Arc<AtomicBool>) {
+async fn state_pump(handle: AppHandle, hub: Arc<Hub>, dirty: Arc<AtomicBool>) {
     let mut last_tip = String::new();
     let mut last_paused = None;
     loop {
@@ -665,14 +752,14 @@ async fn state_pump(handle: AppHandle, app: Arc<App>, dirty: Arc<AtomicBool>) {
             continue;
         }
         let _ = handle.emit("state", full_state(&handle));
-        let tip = app.status_line();
+        let tip = hub.status_line();
         if tip != last_tip {
             if let Some(tray) = handle.tray_by_id("main") {
                 let _ = tray.set_tooltip(Some(tip.as_str()));
             }
             last_tip = tip;
         }
-        let paused = app.engine.sync_view().paused_all;
+        let paused = hub.paused_all();
         if last_paused != Some(paused) {
             if let Some(tray) = handle.try_state::<Tray>() {
                 if let Some(item) = tray.pause_item.lock().unwrap().as_ref() {
@@ -695,8 +782,8 @@ fn data_dir(handle: &AppHandle) -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("SyncHopper"))
 }
 
-/// Development builds can point the app at a plain folder instead of Koofr,
-/// so the whole flow can be tried without an account.
+/// Development builds can point the app at a plain folder instead of a cloud
+/// service, so the whole flow can be tried without an account.
 fn test_remote() -> Option<String> {
     #[cfg(debug_assertions)]
     if let Ok(dir) = std::env::var("SYNCHOPPER_TEST_REMOTE") {
@@ -718,10 +805,10 @@ pub fn run() {
             // A second launch lands here, inside the copy that is already
             // running. Hand the work to the async runtime and return at once
             // so the second copy can exit.
-            let app = handle.state::<Arc<App>>().inner().clone();
+            let hub = handle.state::<Arc<Hub>>().inner().clone();
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                if !app.handle_args(&argv) {
+                if !hub.handle_args(&argv) {
                     show_main(&handle, None);
                 }
             });
@@ -739,36 +826,29 @@ pub fn run() {
             handle.manage(Arc::new(Updates {
                 view: Mutex::new(UpdateView { enabled: can_update, status: "idle".into(), ..Default::default() }),
                 pending: tokio::sync::Mutex::new(None),
-                notified_for: Mutex::new(String::new()),
                 dirty: dirty.clone(),
             }));
             let host = Arc::new(TauriHost { handle: handle.clone(), dirty: dirty.clone() });
-            let test = test_remote();
-            let app = App::new(
-                data_dir(&handle),
-                test.clone().unwrap_or_else(|| "koofr:".to_string()),
-                test.is_some(),
-                host,
-            );
+            let hub = Hub::new(data_dir(&handle), test_remote(), host);
             if let Some(channel) = engine_channel(pubkey.clone()) {
-                app.use_engine_channel(channel);
+                hub.commons.use_engine_channel(channel);
             }
-            handle.manage(app.clone());
+            handle.manage(hub.clone());
             setup_notification_actions(&handle);
             build_tray(&handle)?;
 
             let args: Vec<String> = std::env::args().collect();
             let minimized = args.iter().any(|a| a == "--minimized");
-            let setup_done = app.core.settings().setup_complete;
+            let setup_done = !hub.ready().is_empty();
             if !(minimized && setup_done) {
                 show_main(&handle, None);
             }
 
-            tauri::async_runtime::spawn(state_pump(handle.clone(), app.clone(), dirty));
+            tauri::async_runtime::spawn(state_pump(handle.clone(), hub.clone(), dirty));
             if can_update {
                 tauri::async_runtime::spawn(update_loop(handle.clone()));
             }
-            let starter = app.clone();
+            let starter = hub.clone();
             tauri::async_runtime::spawn(async move {
                 starter.start().await;
                 starter.handle_args(&args);
@@ -780,11 +860,11 @@ pub fn run() {
                 // Closing the window keeps the app running in the tray.
                 api.prevent_close();
                 let _ = window.hide();
-                let app = window.state::<Arc<App>>().inner().clone();
-                let s = app.core.settings();
-                if !s.tray_hint_shown && s.notify_level != "none" {
-                    app.core.update(|s| s.tray_hint_shown = true);
-                    app.core.host.notify(
+                let hub = window.state::<Arc<Hub>>().inner().clone();
+                let g = hub.shared.general();
+                if !g.tray_hint_shown && g.notify_level != "none" {
+                    hub.shared.change(|s| s.general.tray_hint_shown = true);
+                    hub.shared.host.notify(
                         "SyncHopper is still running",
                         "It keeps syncing from the tray, next to the clock. Right-click its icon to quit.",
                     );
@@ -805,8 +885,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             retry_engine,
-            connect,
-            disconnect,
+            add_account,
+            reconnect,
+            cancel_sign_in,
+            remove_account,
+            rename_account,
             default_base_folder,
             list_remote,
             make_remote_dir,
@@ -834,6 +917,7 @@ pub fn run() {
             unignore_file,
             request_add_folder,
             clear_add_request,
+            clear_pending,
             dismiss_folder_notice,
         ])
         .run(context)

@@ -1,12 +1,21 @@
 //! The sync engine: a queue of folder syncs run one at a time through
 //! rclone's two-way sync, with a timer, a file watcher, and recovery from
 //! the ways a sync can fail.
+//!
+//! There is one engine per account, so accounts sync side by side and a
+//! wait for one service never holds up another. This file was written when
+//! Koofr was the only service: names with "koofr" in them (`koofr_wait`,
+//! the "koofr" side, the "koofr_name" kind) mean the cloud side, whichever
+//! service the account is with. What people read always names the real
+//! service, through `Core::cloud`.
 
 use crate::config::{same_state, FileState, Pair, Settings, Skipped};
 use crate::core::{Core, Notice};
 use crate::platform;
+use crate::providers::Provider;
 use crate::rclone::{
-    error_words, friendly_error, friendly_known, is_blocked_message, is_network_error, reports_status, LogLine, Rclone, RunResult, Stats,
+    error_words, friendly_error, friendly_known, is_auth_error, is_blocked_message, is_locked_signins, is_network_error, reports_status,
+    throttle_hint, LogLine, Rclone, RunResult, Stats,
 };
 use crate::util::{
     clean_remote, file_name, glob_match, go_unquote, koofr_refuses_chars, new_id, norm_local, now_secs, parse_time_ns, paths_overlap,
@@ -47,10 +56,8 @@ pub const FILE_UNEXPECTED: &str = "Something unexpected stopped this file from s
 /// changes). Up to this many changed files are synced anyway without asking,
 /// since a person could easily have edited them all.
 pub const ALL_CHANGED_AUTO: u64 = 20;
-/// The longest path Koofr accepts, in characters.
-pub const KOOFR_MAX_PATH: usize = 1023;
-/// At most this many names Koofr refuses are listed per folder. Any beyond
-/// it are still caught when they fail.
+/// At most this many names the service refuses are listed per folder. Any
+/// beyond it are still caught when they fail.
 const KOOFR_NAME_SCAN_MAX: usize = 1000;
 /// How long a failing file is retried quietly before it is shown as
 /// needing attention.
@@ -418,7 +425,7 @@ pub fn issue_kind(msg: &str) -> &'static str {
         "blocked"
     } else if code("429") || has(&["too many requests"]) {
         "throttled"
-    } else if code("401") || has(&["unauthorized", "invalid credentials", "authentication failed", "couldn't login"]) {
+    } else if is_auth_error(&l) || is_locked_signins(msg) {
         "auth"
     } else if code("507") || has(&["quota", "insufficient storage", "storage is full"]) {
         "quota"
@@ -507,14 +514,16 @@ fn retry_delay(kind: &str, tries: u32) -> u64 {
 }
 
 /// Plain-language reason for a file that could not sync.
-pub fn file_reason(kind: &str, object_type: &str, raw: &str) -> String {
-    let from_koofr = object_type.to_lowercase().contains("koofr");
+pub fn file_reason(p: &Provider, kind: &str, object_type: &str, raw: &str) -> String {
+    let cloud = p.name;
+    // The engine names the kind of object after the service it is on.
+    let from_koofr = object_type.to_lowercase().contains(p.kind);
     let l = error_words(raw);
     match kind {
-        "server" if from_koofr => "Koofr couldn't send this file. This is usually a temporary problem on Koofr's side.".into(),
-        "server" => "Koofr had a problem with this file. This is usually a temporary problem on Koofr's side.".into(),
-        "network" => "The connection to Koofr dropped while this file was syncing.".into(),
-        "throttled" => "Koofr said SyncHopper was sending too many requests. If this keeps happening, turn on Limit requests to Koofr in Advanced settings.".into(),
+        "server" if from_koofr => format!("{cloud} couldn't send this file. This is usually a temporary problem on {cloud}'s side."),
+        "server" => format!("{cloud} had a problem with this file. This is usually a temporary problem on {cloud}'s side."),
+        "network" => format!("The connection to {cloud} dropped while this file was syncing."),
+        "throttled" => format!("{cloud} said SyncHopper was sending too many requests. {}", throttle_hint(p)),
         "busy" => {
             if l.contains("being updated") || l.contains("size changed") {
                 "This file was still being written while it synced.".into()
@@ -537,17 +546,17 @@ pub fn file_reason(kind: &str, object_type: &str, raw: &str) -> String {
         "drive" => drive_problem_text(raw).into(),
         // Only reached for a file tried on its own; whole-folder waits use
         // `cert_hint` with their own headline.
-        "cert" => format!("SyncHopper couldn't connect securely to Koofr. {}", cert_hint(raw)),
+        "cert" => format!("SyncHopper couldn't connect securely to {cloud}. {}", cert_hint(raw)),
         "denied" => "Windows wouldn't let SyncHopper read or write this file.".into(),
         "permanent" => {
             if l.contains("too long") {
                 "This file's name or path is too long for Windows.".into()
             } else {
-                "This file's name can't be used on Windows or in Koofr.".into()
+                format!("This file's name can't be used on Windows or in {cloud}.")
             }
         }
-        "rejected" => "Koofr refused this file. This usually means its name can't be used there, for example when a folder with the same name already exists in Koofr.".into(),
-        _ => friendly_known(raw).unwrap_or_else(|| FILE_UNEXPECTED.to_string()),
+        "rejected" => format!("{cloud} refused this file. This usually means its name can't be used there, for example when a folder with the same name already exists in {cloud}."),
+        _ => friendly_known(p, raw).unwrap_or_else(|| FILE_UNEXPECTED.to_string()),
     }
 }
 
@@ -590,28 +599,30 @@ pub fn drive_root(local: &str) -> Option<String> {
     Some(format!("\\\\{server}\\{share}\\"))
 }
 
-/// Why Koofr would refuse a path inside a synced folder, if it would:
-/// characters Koofr doesn't allow in a name, or a path longer than Koofr
-/// accepts. `rel` uses forward slashes; a trailing slash marks a folder.
-pub fn koofr_name_problem(remote: &str, rel: &str) -> Option<String> {
+/// Why the account's service would refuse a path inside a synced folder, if
+/// it would: characters it doesn't allow in a name, or a path longer than it
+/// accepts. Only Koofr has such rules so far. `rel` uses forward slashes; a
+/// trailing slash marks a folder.
+pub fn koofr_name_problem(p: &Provider, remote: &str, rel: &str) -> Option<String> {
+    let cloud = p.name;
     let is_dir = rel.ends_with('/');
     let trimmed = rel.trim_end_matches('/');
     let (parent, name) = match trimmed.rsplit_once('/') {
         Some((p, n)) => (p, n),
         None => ("", trimmed),
     };
-    if koofr_refuses_chars(name) {
+    if p.refuses_emoji && koofr_refuses_chars(name) {
         let what = if is_dir { "folder" } else { "file" };
-        return Some(format!("Koofr doesn't allow emoji and some other symbols in {what} names. Rename this {what} to sync it."));
+        return Some(format!("{cloud} doesn't allow emoji and some other symbols in {what} names. Rename this {what} to sync it."));
     }
-    if koofr_refuses_chars(parent) {
-        return Some("Koofr doesn't allow emoji and some other symbols in folder names. Rename the folder it's in to sync it.".into());
+    if p.refuses_emoji && koofr_refuses_chars(parent) {
+        return Some(format!("{cloud} doesn't allow emoji and some other symbols in folder names. Rename the folder it's in to sync it."));
     }
     let remote = remote.trim_matches('/');
     let full = if remote.is_empty() { format!("/{trimmed}") } else { format!("/{remote}/{trimmed}") };
-    if full.chars().count() > KOOFR_MAX_PATH {
+    if let Some(max) = p.max_path.filter(|max| full.chars().count() > *max) {
         return Some(format!(
-            "This {}'s path is longer than Koofr allows ({KOOFR_MAX_PATH} characters). Shorten the folder or file names to sync it.",
+            "This {}'s path is longer than {cloud} allows ({max} characters). Shorten the folder or file names to sync it.",
             if is_dir { "folder" } else { "file" }
         ));
     }
@@ -624,8 +635,12 @@ pub fn koofr_name_problem(remote: &str, rel: &str) -> Option<String> {
 /// Returns paths with forward slashes, folders ending in a slash, and the
 /// reason for each. Names matching the ignore list are skipped, as they
 /// are never synced anyway.
-pub fn find_koofr_name_problems(local_root: &Path, remote: &str, ignore: &[String]) -> Vec<(String, String)> {
+pub fn find_koofr_name_problems(p: &Provider, local_root: &Path, remote: &str, ignore: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    if !p.refuses_emoji && p.max_path.is_none() {
+        // Nothing this service refuses, so there is nothing to look for.
+        return out;
+    }
     let mut stack: Vec<(PathBuf, String)> = vec![(local_root.to_path_buf(), String::new())];
     while let Some((dir, rel_dir)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -644,7 +659,7 @@ pub fn find_koofr_name_problems(local_root: &Path, remote: &str, ignore: &[Strin
             }
             let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
             let rel_shown = if ft.is_dir() { format!("{rel}/") } else { rel.clone() };
-            if let Some(reason) = koofr_name_problem(remote, &rel_shown) {
+            if let Some(reason) = koofr_name_problem(p, remote, &rel_shown) {
                 out.push((rel_shown, reason));
             } else if ft.is_dir() {
                 stack.push((e.path(), rel));
@@ -716,12 +731,19 @@ fn escape_glob(path: &str) -> String {
     out
 }
 
+/// The first line of every filter file. See `filters_text` before changing it.
+const FILTERS_HEADER: &str = "# Written by SyncHopper. Change the ignore list in Advanced settings.\n";
+
 /// The rclone filter file for a folder: the ignore list, then the files
 /// that are being left out (because they could not sync, or because the user
 /// chose to ignore them). A left-out folder, stored with a trailing slash,
 /// leaves out the folder and everything in it.
 pub fn filters_text(s: &Settings, pair: &Pair) -> String {
-    let mut out = String::from("# Written by SyncHopper. Change the ignore list in Advanced settings.\n");
+    // This first line must stay exactly as it is, old wording included. The
+    // engine keeps a checksum of the whole file and rebuilds a folder's sync
+    // record when it changes, which brings deleted files back. (The list is
+    // on the General settings screen these days.)
+    let mut out = String::from(FILTERS_HEADER);
     for p in &s.ignore_patterns {
         out.push_str(&format!("- {p}\n"));
     }
@@ -1156,6 +1178,7 @@ impl Engine {
     /// Checks a new folder pairing and saves it.
     pub fn add_pair(self: &Arc<Self>, local: &str, remote: &str) -> Result<Pair, String> {
         let s = self.core.settings();
+        let cloud = self.core.cloud();
         let local = local.trim().to_string();
         let remote = clean_remote(remote);
         let lp = Path::new(&local);
@@ -1174,21 +1197,41 @@ impl Engine {
             return Err("That folder holds SyncHopper's own files. Pick a different one.".into());
         }
         if s.feature_drive && cfg!(windows) && ln.starts_with(&format!("{}:", s.drive_letter.to_lowercase())) {
-            return Err("That folder is on the Koofr drive, which is already Koofr. Pick a folder on this PC.".into());
+            return Err(format!("That folder is on the {cloud} drive, which is already {cloud}. Pick a folder on this PC."));
         }
-        if koofr_refuses_chars(&remote) {
-            return Err("Koofr doesn't allow emoji and some other symbols in folder names. Rename the folder, or pick a different Koofr folder name.".into());
+        let others: Vec<_> = self.core.shared.accounts().into_iter().filter(|a| a.id != self.core.account).collect();
+        for other in &others {
+            if other.feature_drive && cfg!(windows) && ln.starts_with(&format!("{}:", other.drive_letter.to_lowercase())) {
+                return Err(format!("That folder is on the {} drive, which isn't on this PC. Pick a folder on this PC.", other.name));
+            }
+            // The other account's own folder is where its synced folders
+            // live, and new folders put there become its synced folders.
+            let base = other.base_folder.trim();
+            if !base.is_empty() && paths_overlap(&ln, &norm_local(base), sep) {
+                return Err(format!("That folder overlaps the folder {} keeps its synced folders in: {base}", other.name));
+            }
         }
-        if remote.chars().count() + 1 > KOOFR_MAX_PATH {
-            return Err(format!("That Koofr folder's path is longer than Koofr allows ({KOOFR_MAX_PATH} characters)."));
+        if self.core.provider.refuses_emoji && koofr_refuses_chars(&remote) {
+            return Err(format!("{cloud} doesn't allow emoji and some other symbols in folder names. Rename the folder, or pick a different {cloud} folder name."));
+        }
+        if let Some(max) = self.core.provider.max_path.filter(|max| remote.chars().count() + 1 > *max) {
+            return Err(format!("That {cloud} folder's path is longer than {cloud} allows ({max} characters)."));
         }
         for p in &s.pairs {
             if paths_overlap(&ln, &norm_local(&p.local), sep) {
                 return Err(format!("That PC folder overlaps one that is already synced: {}", p.local));
             }
+        }
+        // A folder can only belong to one account.
+        for other in &others {
+            if let Some(p) = other.pairs.iter().find(|p| paths_overlap(&ln, &norm_local(&p.local), sep)) {
+                return Err(format!("That PC folder overlaps one that is already synced with {}: {}", other.name, p.local));
+            }
+        }
+        for p in &s.pairs {
             if paths_overlap(&remote.to_lowercase(), &p.remote.to_lowercase(), '/') {
                 let shown = if p.remote.is_empty() { "the whole account" } else { p.remote.as_str() };
-                return Err(format!("That Koofr folder overlaps one that is already synced: {shown}"));
+                return Err(format!("That {cloud} folder overlaps one that is already synced: {shown}"));
             }
         }
         std::fs::create_dir_all(lp).map_err(|e| format!("Could not create {local}: {e}"))?;
@@ -1273,11 +1316,11 @@ impl Engine {
                     let to = self.core.remote(&target);
                     match rc.capture(&["moveto", &from, &to], Duration::from_secs(600)).await.map(|_| ()) {
                         Ok(()) => {
-                            self.core.log(&format!("Renamed {from} to {to} in Koofr to match the folder on this PC"));
+                            self.core.log(&format!("Renamed {from} to {to} in {} to match the folder on this PC", self.core.cloud()));
                             remote = target;
                         }
                         Err(e) => {
-                            self.core.log(&format!("Could not rename {from} to {to} in Koofr: {e}"));
+                            self.core.log(&format!("Could not rename {from} to {to} in {}: {e}", self.core.cloud()));
                             result = Err(e);
                         }
                     }
@@ -1673,29 +1716,30 @@ impl Engine {
             return self.engine_blocked(pair, interval_min, &raw);
         }
         let name = file_name(&pair.local);
-        let keep_trying = "SyncHopper will keep trying and catch up once Koofr is back.";
+        let cloud = self.core.cloud();
+        let keep_trying = format!("SyncHopper will keep trying and catch up once {cloud} is back.");
         // What the folder shows, which wait it is, and the notification.
         let (waiting_kind, shown, key, title, body): (&str, String, String, String, String) = match kind {
             "network" => {
-                let m = "Can't connect to Koofr right now.";
-                ("koofr", m.into(), "koofr".into(), m.into(), keep_trying.into())
+                let m = format!("Can't connect to {cloud} right now.");
+                ("koofr", m.clone(), "koofr".into(), m, keep_trying)
             }
-            "throttled" if self.core.settings().limit_requests => {
-                let m = "Koofr is busy right now.";
-                ("throttled", m.into(), "throttled".into(), m.into(), keep_trying.into())
+            "throttled" if self.core.settings().limit_requests || self.core.provider.request_limit.is_none() => {
+                let m = format!("{cloud} is busy right now.");
+                ("throttled", m.clone(), "throttled".into(), m, keep_trying)
             }
             "throttled" => (
                 "throttled",
-                "Koofr says SyncHopper is sending too many requests.".into(),
+                format!("{cloud} says SyncHopper is sending too many requests."),
                 "throttled".into(),
-                "Koofr says SyncHopper is sending too many requests".into(),
-                "SyncHopper will keep trying. If this keeps happening, turn on Limit requests to Koofr in Advanced settings.".into(),
+                format!("{cloud} says SyncHopper is sending too many requests"),
+                format!("SyncHopper will keep trying. {}", throttle_hint(self.core.provider)),
             ),
             "cert" => (
                 "cert",
-                format!("SyncHopper couldn't connect securely to Koofr. {}", cert_hint(&raw)),
+                format!("SyncHopper couldn't connect securely to {cloud}. {}", cert_hint(&raw)),
                 "cert".into(),
-                "SyncHopper can't connect securely to Koofr".into(),
+                format!("SyncHopper can't connect securely to {cloud}"),
                 format!("{} SyncHopper will keep trying.", cert_hint(&raw)),
             ),
             "drive" => (
@@ -1706,8 +1750,8 @@ impl Engine {
                 format!("{} SyncHopper will keep trying.", drive_problem_text(&raw)),
             ),
             _ => {
-                let m = "Koofr is having problems right now.";
-                ("koofr", m.into(), "koofr".into(), m.into(), keep_trying.into())
+                let m = format!("{cloud} is having problems right now.");
+                ("koofr", m.clone(), "koofr".into(), m, keep_trying)
             }
         };
         if waiting_kind != "drive" {
@@ -1782,9 +1826,9 @@ impl Engine {
             (quiet, w.shown, w.until, w.retry_at)
         };
         if quiet {
-            self.core.log(&format!("[{}] Couldn't reach Koofr. Trying again shortly: {}", pair.local, raw));
+            self.core.log(&format!("[{}] Couldn't reach {}. Trying again shortly: {}", pair.local, self.core.cloud(), raw));
         } else {
-            self.core.log(&format!("[{}] Koofr unavailable: {}", pair.local, raw));
+            self.core.log(&format!("[{}] {} unavailable: {}", pair.local, self.core.cloud(), raw));
         }
         let synced_before = pair.last_sync > 0;
         self.finish(&pair.id, interval_min, |rt| {
@@ -1885,7 +1929,7 @@ impl Engine {
 
     /// Stops a folder with one of SyncHopper's own messages.
     fn fail(&self, pair: &Pair, interval_min: u32, message: String, details: Vec<String>) {
-        let friendly = friendly_error(&message);
+        let friendly = friendly_error(self.core.provider, &message);
         self.fail_with(pair, interval_min, friendly, &message, details);
     }
 
@@ -1893,7 +1937,7 @@ impl Engine {
     /// does not recognise get a plain headline, with the engine's own words
     /// kept under the technical details.
     fn fail_raw(&self, pair: &Pair, interval_min: u32, raw: String, mut details: Vec<String>) {
-        let headline = friendly_known(&raw).unwrap_or_else(|| UNEXPECTED.to_string());
+        let headline = friendly_known(self.core.provider, &raw).unwrap_or_else(|| UNEXPECTED.to_string());
         if !details.iter().any(|d| d == &raw) {
             details.insert(0, raw.clone());
         }
@@ -1927,7 +1971,7 @@ impl Engine {
         let body = if a.changed {
             "Every file in this folder looks changed since the last sync. SyncHopper is waiting for your OK before syncing them.".to_string()
         } else if a.everything {
-            let place = if a.side == "pc" { "on this PC" } else { "in Koofr" };
+            let place = if a.side == "pc" { "on this PC".to_string() } else { format!("in {}", self.core.cloud()) };
             format!("Everything in this folder is gone {place}. SyncHopper is waiting for you to decide what to do.")
         } else {
             format!("{} of {} files were deleted. SyncHopper is waiting for your OK before passing that on.", a.deleted, a.total)
@@ -1960,7 +2004,7 @@ impl Engine {
             }
             // A name Koofr refuses can never sync as it is, whatever the
             // error looked like.
-            let (kind, reason) = match koofr_name_problem(&pair.remote, &path) {
+            let (kind, reason) = match koofr_name_problem(self.core.provider, &pair.remote, &path) {
                 Some(why) => ("koofr_name", why),
                 None => {
                     let kind = issue_kind(&f.msg);
@@ -2009,14 +2053,14 @@ impl Engine {
         true
     }
 
-    /// The reason shown for a left-out file. A file Koofr turned away for
-    /// too many requests only points to Limit requests to Koofr while that
-    /// setting is off.
+    /// The reason shown for a left-out file. A file the service turned away
+    /// for too many requests only points to the Limit requests setting while
+    /// that setting is off.
     fn reason_for(&self, kind: &str, object_type: &str, raw: &str) -> String {
         if kind == "throttled" && self.core.settings().limit_requests {
-            return "Koofr was too busy to take this file.".into();
+            return format!("{} was too busy to take this file.", self.core.cloud());
         }
-        file_reason(kind, object_type, raw)
+        file_reason(self.core.provider, kind, object_type, raw)
     }
 
     /// Leaves out the names in a folder that Koofr would refuse, before
@@ -2031,7 +2075,7 @@ impl Engine {
     /// finding it on disk proves nothing. Dropping it anyway would only have
     /// it fail, and be announced, all over again.
     fn update_koofr_names(&self, pair: &Pair, s: &Settings, recent: &[Skipped]) -> bool {
-        let found = find_koofr_name_problems(Path::new(&pair.local), &pair.remote, &s.ignore_patterns);
+        let found = find_koofr_name_problems(self.core.provider, Path::new(&pair.local), &pair.remote, &s.ignore_patterns);
         // A capped list may be missing some, so nothing is dropped then.
         let complete = found.len() < KOOFR_NAME_SCAN_MAX;
         let now = now_secs();
@@ -2082,7 +2126,7 @@ impl Engine {
             }
         });
         for path in &added {
-            self.core.log(&format!("[{}] Leaving out {path}: Koofr doesn't accept its name", pair.local));
+            self.core.log(&format!("[{}] Leaving out {path}: {} doesn't accept its name", pair.local, self.core.cloud()));
         }
         for path in &dropped {
             self.core.log(&format!("[{}] {path} is gone, so it is no longer left out", pair.local));
@@ -2173,14 +2217,14 @@ impl Engine {
         let local_text = local.to_string_lossy().to_string();
         match (pc_changed, koofr_changed) {
             (true, false) if pc.is_some() => {
-                self.core.log(&format!("[{}] Retry: sending {} to Koofr", pair.local, k.path));
+                self.core.log(&format!("[{}] Retry: sending {} to {}", pair.local, k.path, self.core.cloud()));
                 let mut args = vec!["copyto".to_string(), local_text, remote];
                 args.extend(flags);
                 Self::run_quiet(rc, args, cancel).await
             }
             (true, false) => {
                 if koofr.is_some() {
-                    self.core.log(&format!("[{}] Retry: {} was deleted on this PC, deleting it in Koofr", pair.local, k.path));
+                    self.core.log(&format!("[{}] Retry: {} was deleted on this PC, deleting it in {}", pair.local, k.path, self.core.cloud()));
                     let mut args = vec!["deletefile".to_string(), remote];
                     args.extend(flags);
                     Self::run_quiet(rc, args, cancel).await?;
@@ -2188,14 +2232,14 @@ impl Engine {
                 Ok(())
             }
             (false, true) if koofr.is_some() => {
-                self.core.log(&format!("[{}] Retry: getting {} from Koofr", pair.local, k.path));
+                self.core.log(&format!("[{}] Retry: getting {} from {}", pair.local, k.path, self.core.cloud()));
                 let mut args = vec!["copyto".to_string(), remote, local_text];
                 args.extend(flags);
                 Self::run_quiet(rc, args, cancel).await
             }
             (false, true) => {
                 if pc.is_some() {
-                    self.core.log(&format!("[{}] Retry: {} was deleted in Koofr, deleting it on this PC", pair.local, k.path));
+                    self.core.log(&format!("[{}] Retry: {} was deleted in {}, deleting it on this PC", pair.local, k.path, self.core.cloud()));
                     std::fs::remove_file(&local).map_err(|e| e.to_string())?;
                 }
                 Ok(())
@@ -2330,7 +2374,7 @@ impl Engine {
                 self.core.host.state_changed();
                 return;
             }
-            let msg = format!("This folder is missing on this PC: {}. Nothing was changed in Koofr.", first.local);
+            let msg = format!("This folder is missing on this PC: {}. Nothing was changed in {}.", first.local, self.core.cloud());
             return self.fail(&first, interval, msg, vec![]);
         }
         self.with_rt(&first.id, |rt| rt.missing_since = None);
@@ -2607,8 +2651,9 @@ impl Engine {
                     }
                 }
                 Verdict::RemoteMissing => {
-                    let shown = if pair.remote.is_empty() { "your Koofr account".to_string() } else { format!("\"{}\"", pair.remote) };
-                    let msg = format!("The Koofr folder {shown} was not found. It may have been renamed or deleted in Koofr. Nothing was changed on this PC.");
+                    let cloud = self.core.cloud();
+                    let shown = if pair.remote.is_empty() { format!("your {cloud} account") } else { format!("\"{}\"", pair.remote) };
+                    let msg = format!("The {cloud} folder {shown} was not found. It may have been renamed or deleted in {cloud}. Nothing was changed on this PC.");
                     return self.fail(&pair, interval, msg, vec![]);
                 }
                 Verdict::Failed { must_resync, files, message, details } => {
@@ -2733,6 +2778,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::KOOFR;
 
     fn err(msg: &str, object: &str, ty: &str) -> LogLine {
         LogLine { level: "error".into(), msg: msg.into(), object: object.into(), object_type: ty.into(), stats: None }
@@ -2845,7 +2891,7 @@ mod tests {
         assert_eq!(retry_delay("server", 1), 300);
         assert_eq!(retry_delay("server", 9), 3600);
         assert!(retry_delay("permanent", 1) > 10 * 365 * 86_400);
-        assert!(file_reason("server", "*koofr.Object", "x").starts_with("Koofr couldn't send"));
+        assert!(file_reason(&KOOFR, "server", "*koofr.Object", "x").starts_with("Koofr couldn't send"));
 
         // Koofr turning requests away, and its wording for a refused file.
         let koofr = |code: u32| format!("Failed to copy: Invalid response status! Got {code}, expected 200; headers: map[Content-Length:[42]], content: x");
@@ -2888,24 +2934,24 @@ mod tests {
         assert_eq!(issue_kind("Failed to copy: Invalid response status! Got 400, expected 200; headers: map[Content-Length:[503]], content: "), "rejected");
         assert_eq!(issue_kind("Post \"https://app.koofr.net/content/api/v2/mounts/x/files/put?path=%2FQuota\": dial tcp: lookup app.koofr.net: no such host"), "network");
         // The OneDrive hint still comes from where the file is.
-        assert!(file_reason("cantaccess", "", "open C:\\Users\\r\\OneDrive\\b.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
+        assert!(file_reason(&KOOFR, "cantaccess", "", "open C:\\Users\\r\\OneDrive\\b.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
         assert_eq!(drive_problem_text("open E:\\write protected stuff\\a.txt: The device is not ready."), "Windows can't reach the drive this folder is on. It may be unplugged.");
 
         // What the user reads for each.
-        assert!(file_reason("locked", "", "").contains("open in another program"));
-        assert!(file_reason("virus", "", "").contains("Protection history"));
-        assert!(file_reason("onedrive", "", "").contains("Always keep on this device"));
-        assert_eq!(file_reason("cantaccess", "", "open D:\\stuff\\a.txt: The file cannot be accessed by the system."), "Windows couldn't open this file.");
-        assert!(file_reason("cantaccess", "", "open C:\\Users\\r\\OneDrive\\a.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
-        assert!(file_reason("unreadable", "", "").contains("drive may be failing"));
-        assert!(file_reason("rejected", "", "").starts_with("Koofr refused this file."));
-        assert!(file_reason("throttled", "", "").contains("Limit requests to Koofr"));
+        assert!(file_reason(&KOOFR, "locked", "", "").contains("open in another program"));
+        assert!(file_reason(&KOOFR, "virus", "", "").contains("Protection history"));
+        assert!(file_reason(&KOOFR, "onedrive", "", "").contains("Always keep on this device"));
+        assert_eq!(file_reason(&KOOFR, "cantaccess", "", "open D:\\stuff\\a.txt: The file cannot be accessed by the system."), "Windows couldn't open this file.");
+        assert!(file_reason(&KOOFR, "cantaccess", "", "open C:\\Users\\r\\OneDrive\\a.txt: The file cannot be accessed by the system.").contains("start OneDrive"));
+        assert!(file_reason(&KOOFR, "unreadable", "", "").contains("drive may be failing"));
+        assert!(file_reason(&KOOFR, "rejected", "", "").starts_with("Koofr refused this file."));
+        assert!(file_reason(&KOOFR, "throttled", "", "").contains("Limit requests to Koofr"));
         assert_eq!(drive_problem_text("The device is not ready."), "Windows can't reach the drive this folder is on. It may be unplugged.");
         assert!(drive_problem_text("The media is write protected.").contains("write-protected"));
         // Anything not recognised gets one plain line; the engine's words go
         // under the technical details.
-        assert_eq!(file_reason("unknown", "", "Failed to copy IMG_15001.jpg: odd"), FILE_UNEXPECTED);
-        assert!(file_reason("unknown", "", "open x: Access is denied.").contains("Windows"));
+        assert_eq!(file_reason(&KOOFR, "unknown", "", "Failed to copy IMG_15001.jpg: odd"), FILE_UNEXPECTED);
+        assert!(file_reason(&KOOFR, "unknown", "", "open x: Access is denied.").contains("Windows"));
 
         // Which ones are tried again, and how soon.
         for k in ["permanent", "koofr_name", "virus"] {
@@ -2923,19 +2969,19 @@ mod tests {
 
     #[test]
     fn names_koofr_refuses() {
-        assert_eq!(koofr_name_problem("Docs", "notes.txt"), None);
-        assert_eq!(koofr_name_problem("Docs", "Caf\u{e9} \u{2600}/r\u{e9}sum\u{e9}.txt"), None);
-        let file = koofr_name_problem("Docs", "Trip/beach \u{1F3D6}.jpg").unwrap();
+        assert_eq!(koofr_name_problem(&KOOFR, "Docs", "notes.txt"), None);
+        assert_eq!(koofr_name_problem(&KOOFR, "Docs", "Caf\u{e9} \u{2600}/r\u{e9}sum\u{e9}.txt"), None);
+        let file = koofr_name_problem(&KOOFR, "Docs", "Trip/beach \u{1F3D6}.jpg").unwrap();
         assert!(file.contains("Rename this file"), "{file}");
-        let dir = koofr_name_problem("Docs", "Party \u{1F389}/").unwrap();
+        let dir = koofr_name_problem(&KOOFR, "Docs", "Party \u{1F389}/").unwrap();
         assert!(dir.contains("Rename this folder"), "{dir}");
-        let inside = koofr_name_problem("Docs", "Party \u{1F389}/a.jpg").unwrap();
+        let inside = koofr_name_problem(&KOOFR, "Docs", "Party \u{1F389}/a.jpg").unwrap();
         assert!(inside.contains("Rename the folder it's in"), "{inside}");
         // The whole Koofr path counts, the synced folder's own path included.
         let deep = format!("{}/{}.txt", "d".repeat(500), "f".repeat(515));
-        assert_eq!(koofr_name_problem("", &deep), None, "1021 characters with the leading slash");
-        assert!(koofr_name_problem("Docs", &deep).unwrap().contains("longer than Koofr allows"));
-        assert!(koofr_name_problem("Docs", &format!("{}/", "d".repeat(1020))).unwrap().contains("This folder's path"));
+        assert_eq!(koofr_name_problem(&KOOFR, "", &deep), None, "1021 characters with the leading slash");
+        assert!(koofr_name_problem(&KOOFR, "Docs", &deep).unwrap().contains("longer than Koofr allows"));
+        assert!(koofr_name_problem(&KOOFR, "Docs", &format!("{}/", "d".repeat(1020))).unwrap().contains("This folder's path"));
     }
 
     #[test]
@@ -2951,7 +2997,7 @@ mod tests {
         put("Party \u{1F389}/inside/a.jpg");
         mk("empty \u{1F4E6}");
         put("~$lock \u{1F600}.docx");
-        let mut found = find_koofr_name_problems(root, "Docs", &["~$*".to_string()]);
+        let mut found = find_koofr_name_problems(&KOOFR, root, "Docs", &["~$*".to_string()]);
         found.sort();
         let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
         // A refused folder is listed once, without what's inside it; names
@@ -3146,5 +3192,37 @@ mod tests {
         // A left-out folder leaves out everything in it, and the folder too.
         assert!(t.contains("- /Party \u{1F389}/**\n"), "{t}");
         assert!(t.contains("- /old\\*/**\n"), "{t}");
+    }
+
+    #[test]
+    fn only_koofr_has_name_rules_and_messages_name_the_service() {
+        use crate::providers::{FILEN, PCLOUD};
+        let emoji = "Party \u{1F389}/";
+        assert!(koofr_name_problem(&KOOFR, "Docs", emoji).is_some());
+        assert!(koofr_name_problem(&PCLOUD, "Docs", emoji).is_none());
+        assert!(koofr_name_problem(&FILEN, "Docs", &"x".repeat(2000)).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Party \u{1F389}")).unwrap();
+        assert_eq!(find_koofr_name_problems(&KOOFR, dir.path(), "Docs", &[]).len(), 1);
+        assert!(find_koofr_name_problems(&PCLOUD, dir.path(), "Docs", &[]).is_empty());
+        assert_eq!(file_reason(&PCLOUD, "server", "*pcloud.Object", "x"), "pCloud couldn't send this file. This is usually a temporary problem on pCloud's side.");
+        assert_eq!(file_reason(&PCLOUD, "server", "*local.Object", "x"), "pCloud had a problem with this file. This is usually a temporary problem on pCloud's side.");
+        assert_eq!(file_reason(&FILEN, "network", "", "x"), "The connection to Filen dropped while this file was syncing.");
+        assert!(!file_reason(&FILEN, "throttled", "", "x").contains("Limit requests"));
+        assert!(file_reason(&KOOFR, "throttled", "", "x").contains("turn on Limit requests to Koofr in this account's settings"));
+    }
+
+    #[test]
+    fn the_filter_file_is_the_same_bytes_earlier_versions_wrote() {
+        // What 0.4.1 writes for a folder with the default ignore list and
+        // nothing left out. A single changed byte here makes every folder
+        // of every installed copy rebuild its sync record after an update.
+        let text = filters_text(&Settings::default(), &Pair::default());
+        let expected = "# Written by SyncHopper. Change the ignore list in Advanced settings.\n- ~$*\n- *.tmp\n- Thumbs.db\n- desktop.ini\n- .DS_Store\n- *.partial\n- *.crdownload\n";
+        assert_eq!(text, expected);
+        // The checksum the engine stored next to it on a real 0.4.1 setup.
+        use md5::{Digest, Md5};
+        let sum: String = Md5::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(sum, "4780c0569c9e1ac03f1e624cf585ddaf");
     }
 }

@@ -89,11 +89,18 @@ const MENU_SETTINGS_KEY: &str = r"HKCU\Software\SyncHopper\Menu";
 /// identity (src-tauri/windows/menu/AppxManifest.xml).
 pub const MENU_PACKAGE: &str = "CoverTwoGames.SyncHopper";
 
+/// The wording of the two right-click items. With one account they name its
+/// service ("Send to Koofr"); with more, SyncHopper asks which account.
+pub struct MenuLabels {
+    pub send: String,
+    pub add_folder: String,
+}
+
 /// Adds or removes the classic right-click entries: a "SyncHopper" submenu
-/// with "Send to Koofr" and, for folders, "Sync folder to Koofr". On Windows
-/// 11 these sit under "Show more options"; they are used when the Windows 11
-/// entry can't be.
-pub async fn set_legacy_menu(enabled: bool, add_folder: bool, exe: &Path) -> Result<(), String> {
+/// with a send item and, for folders, a sync item. On Windows 11 these sit
+/// under "Show more options"; they are used when the Windows 11 entry can't
+/// be.
+pub async fn set_legacy_menu(enabled: bool, add_folder: bool, exe: &Path, labels: &MenuLabels) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
@@ -118,11 +125,11 @@ pub async fn set_legacy_menu(enabled: bool, add_folder: bool, exe: &Path) -> Res
             vec!["add", key, "/v", "MUIVerb", "/d", "SyncHopper", "/f"],
             vec!["add", key, "/v", "SubCommands", "/d", "", "/f"],
             vec!["add", key, "/v", "Icon", "/d", &icon, "/f"],
-            vec!["add", &send_key, "/ve", "/d", "Send to Koofr", "/f"],
+            vec!["add", &send_key, "/ve", "/d", &labels.send, "/f"],
             vec!["add", &send_cmd, "/ve", "/d", &send, "/f"],
         ];
         if folders && add_folder {
-            steps.push(vec!["add", &add_key, "/ve", "/d", "Sync folder to Koofr", "/f"]);
+            steps.push(vec!["add", &add_key, "/ve", "/d", &labels.add_folder, "/f"]);
             steps.push(vec!["add", &add_cmd, "/ve", "/d", &add, "/f"]);
         }
         for args in steps {
@@ -135,9 +142,9 @@ pub async fn set_legacy_menu(enabled: bool, add_folder: bool, exe: &Path) -> Res
     Ok(())
 }
 
-/// Tells the Windows 11 menu entry which items to show and where SyncHopper
-/// is. It reads these every time the menu opens.
-pub async fn set_menu_flags(upload: bool, add_folder: bool, exe: &Path) -> Result<(), String> {
+/// Tells the Windows 11 menu entry which items to show, how they are worded
+/// and where SyncHopper is. It reads these every time the menu opens.
+pub async fn set_menu_flags(upload: bool, add_folder: bool, exe: &Path, labels: &MenuLabels) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
@@ -147,6 +154,8 @@ pub async fn set_menu_flags(upload: bool, add_folder: bool, exe: &Path) -> Resul
         vec!["add", MENU_SETTINGS_KEY, "/v", "Upload", "/t", "REG_DWORD", "/d", on(upload), "/f"],
         vec!["add", MENU_SETTINGS_KEY, "/v", "AddFolder", "/t", "REG_DWORD", "/d", on(add_folder), "/f"],
         vec!["add", MENU_SETTINGS_KEY, "/v", "Exe", "/t", "REG_SZ", "/d", &exe, "/f"],
+        vec!["add", MENU_SETTINGS_KEY, "/v", "SendTitle", "/t", "REG_SZ", "/d", &labels.send, "/f"],
+        vec!["add", MENU_SETTINGS_KEY, "/v", "AddFolderTitle", "/t", "REG_SZ", "/d", &labels.add_folder, "/f"],
     ] {
         reg(&args).await?;
     }
@@ -229,9 +238,20 @@ pub async fn ensure_menu_package(exe: &Path, version: &str) -> Result<bool, Stri
     powershell_checked(&script, Duration::from_secs(120)).await.map(|_| true)
 }
 
-/// The ID of SyncHopper's entry in File Explorer's sidebar. It never changes,
-/// so the uninstaller (src-tauri/windows/hooks.nsh) can find and remove it.
-pub const SIDEBAR_CLSID: &str = "{09F3086A-BAFB-4D17-ABA8-5765ABD60793}";
+/// The IDs of SyncHopper's entries in File Explorer's sidebar, one per
+/// account that has an entry. They never change, so the uninstaller
+/// (src-tauri/windows/hooks.nsh, which lists the same IDs) can find and
+/// remove them. The first is the one version 0.4 and earlier used.
+pub const SIDEBAR_CLSIDS: [&str; 8] = [
+    "{09F3086A-BAFB-4D17-ABA8-5765ABD60793}",
+    "{5C4BD8AC-E81E-437A-B19D-B58E36B7DA07}",
+    "{2E1A3065-D893-4417-AB0F-357C1FE30567}",
+    "{5A133181-FBF5-4C02-8532-2CA1D26C6549}",
+    "{75225F19-ECA4-4813-8872-2D739733D1FB}",
+    "{2962C468-7746-4B68-958D-79F6029180FB}",
+    "{AA411EE0-2BE3-45B9-ADF6-98DC292C27A5}",
+    "{8A030C30-8A43-46AC-A6BE-914CE6819652}",
+];
 
 async fn reg(args: &[&str]) -> Result<(), String> {
     let (ok, _, err) = run("reg", args, Duration::from_secs(15)).await?;
@@ -250,15 +270,19 @@ async fn refresh_explorer() {
     .await;
 }
 
-/// Adds a "Koofr" entry to File Explorer's sidebar that opens `target`, or
-/// removes it when `target` is None. Uses the registry steps Microsoft
-/// documents for cloud storage providers, for the current user only.
-pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String> {
+/// Adds an entry called `name` to File Explorer's sidebar that opens
+/// `target`, or removes it when `target` is None. `slot` says which of
+/// SyncHopper's entries it is. Uses the registry steps Microsoft documents
+/// for cloud storage providers, for the current user only.
+pub async fn set_sidebar(slot: usize, name: &str, target: Option<&Path>, exe: &Path) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
-    let clsid_key = format!(r"HKCU\Software\Classes\CLSID\{SIDEBAR_CLSID}");
-    let namespace_key = format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{SIDEBAR_CLSID}");
+    let Some(clsid) = SIDEBAR_CLSIDS.get(slot).copied() else {
+        return Err("SyncHopper has no File Explorer entry left for this account.".into());
+    };
+    let clsid_key = format!(r"HKCU\Software\Classes\CLSID\{clsid}");
+    let namespace_key = format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{clsid}");
     let hide_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
     match target {
         Some(folder) => {
@@ -270,7 +294,7 @@ pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String
             let bag_key = format!(r"{clsid_key}\Instance\InitPropertyBag");
             let folder_key = format!(r"{clsid_key}\ShellFolder");
             let steps: Vec<Vec<&str>> = vec![
-                vec!["add", &clsid_key, "/ve", "/t", "REG_SZ", "/d", "Koofr", "/f"],
+                vec!["add", &clsid_key, "/ve", "/t", "REG_SZ", "/d", name, "/f"],
                 vec!["add", &icon_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", &icon, "/f"],
                 vec!["add", &clsid_key, "/v", "System.IsPinnedToNameSpaceTree", "/t", "REG_DWORD", "/d", "0x1", "/f"],
                 vec!["add", &clsid_key, "/v", "SortOrderIndex", "/t", "REG_DWORD", "/d", "0x42", "/f"],
@@ -280,8 +304,8 @@ pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String
                 vec!["add", &bag_key, "/v", "TargetFolderPath", "/t", "REG_EXPAND_SZ", "/d", &folder, "/f"],
                 vec!["add", &folder_key, "/v", "FolderValueFlags", "/t", "REG_DWORD", "/d", "0x28", "/f"],
                 vec!["add", &folder_key, "/v", "Attributes", "/t", "REG_DWORD", "/d", "0xF080004D", "/f"],
-                vec!["add", &namespace_key, "/ve", "/t", "REG_SZ", "/d", "Koofr", "/f"],
-                vec!["add", hide_key, "/v", SIDEBAR_CLSID, "/t", "REG_DWORD", "/d", "0x1", "/f"],
+                vec!["add", &namespace_key, "/ve", "/t", "REG_SZ", "/d", name, "/f"],
+                vec!["add", hide_key, "/v", clsid, "/t", "REG_DWORD", "/d", "0x1", "/f"],
             ];
             for args in steps {
                 reg(&args).await.map_err(|e| format!("Windows would not add the File Explorer entry: {e}"))?;
@@ -290,7 +314,7 @@ pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String
         None => {
             // Missing keys are fine, so results are not checked.
             let _ = reg(&["delete", &namespace_key, "/f"]).await;
-            let _ = reg(&["delete", hide_key, "/v", SIDEBAR_CLSID, "/f"]).await;
+            let _ = reg(&["delete", hide_key, "/v", clsid, "/f"]).await;
             let _ = reg(&["delete", &clsid_key, "/f"]).await;
         }
     }
@@ -298,7 +322,7 @@ pub async fn set_sidebar(target: Option<&Path>, exe: &Path) -> Result<(), String
     Ok(())
 }
 
-/// True when the WinFsp driver that the Koofr drive needs is installed.
+/// True when the WinFsp driver that the network drive needs is installed.
 pub async fn winfsp_installed() -> bool {
     if !cfg!(windows) {
         return false;
@@ -316,7 +340,7 @@ pub async fn winfsp_installed() -> bool {
 /// Installs WinFsp with winget. Windows shows its own permission prompt.
 pub async fn install_winfsp() -> Result<(), String> {
     if !cfg!(windows) {
-        return Err("The Koofr drive is only available on Windows.".into());
+        return Err("The network drive is only available on Windows.".into());
     }
     let result = run(
         "winget",
@@ -385,14 +409,117 @@ pub async fn kill_orphans(config_path: &Path) {
     }
 }
 
-/// The folder suggested for synced folders: a "Koofr" folder in the user's
-/// home folder.
-pub fn default_base_folder() -> String {
+/// The folder suggested for an account's synced folders. The first account
+/// gets the folder version 0.4 and earlier suggested, "Koofr" in the user's
+/// home folder. Every other account gets its own folder inside a
+/// "SyncHopper" folder there.
+pub fn default_base_folder(first: bool, account_name: &str) -> String {
     let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
     if home.is_empty() {
         return String::new();
     }
-    PathBuf::from(home).join("Koofr").to_string_lossy().to_string()
+    if first {
+        return PathBuf::from(home).join("Koofr").to_string_lossy().to_string();
+    }
+    let name: String = account_name.trim().chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect();
+    let name = name.trim_matches([' ', '.']).to_string();
+    PathBuf::from(home)
+        .join("SyncHopper")
+        .join(if name.is_empty() { "Account".to_string() } else { name })
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Locks a small piece of data so only this Windows user on this PC can
+/// read it back. Used for the key to the saved sign-ins. None when Windows
+/// can't do it.
+///
+/// Other systems have no equivalent wired in yet, so there the data is
+/// returned as it is. The Mac and Linux versions need the keychain here.
+pub fn protect(data: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        dpapi::run(data, true)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(data.to_vec())
+    }
+}
+
+/// Reads back what `protect` locked. None when it can't be read here, for
+/// example when the file came from another PC or another Windows user.
+pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        dpapi::run(data, false)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(data.to_vec())
+    }
+}
+
+/// Windows' own data protection, which ties data to the signed-in user.
+#[cfg(windows)]
+mod dpapi {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Blob {
+        len: u32,
+        data: *mut u8,
+    }
+
+    /// Never show a prompt.
+    const UI_FORBIDDEN: u32 = 0x1;
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            data_in: *const Blob,
+            description: *const u16,
+            entropy: *const Blob,
+            reserved: *mut c_void,
+            prompt: *const c_void,
+            flags: u32,
+            data_out: *mut Blob,
+        ) -> i32;
+        fn CryptUnprotectData(
+            data_in: *const Blob,
+            description: *mut *mut u16,
+            entropy: *const Blob,
+            reserved: *mut c_void,
+            prompt: *const c_void,
+            flags: u32,
+            data_out: *mut Blob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    pub fn run(data: &[u8], protect: bool) -> Option<Vec<u8>> {
+        let input = Blob { len: u32::try_from(data.len()).ok()?, data: data.as_ptr() as *mut u8 };
+        let mut output = Blob { len: 0, data: std::ptr::null_mut() };
+        let ok = unsafe {
+            if protect {
+                CryptProtectData(&input, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), UI_FORBIDDEN, &mut output)
+            } else {
+                CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), UI_FORBIDDEN, &mut output)
+            }
+        };
+        if ok == 0 || output.data.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(output.data, output.len as usize) }.to_vec();
+        unsafe {
+            LocalFree(output.data as *mut c_void);
+        }
+        Some(bytes)
+    }
 }
 
 /// A value that stays the same for a folder when it is renamed or moved on
@@ -432,4 +559,43 @@ pub fn hidden_entry(name: &str, meta: &std::fs::Metadata) -> bool {
     #[cfg(not(windows))]
     let _ = meta;
     name.starts_with('.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_account_gets_a_folder_of_its_own() {
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let home = PathBuf::from(home);
+        assert_eq!(default_base_folder(true, "Koofr"), home.join("Koofr").to_string_lossy());
+        assert_eq!(default_base_folder(false, "pCloud"), home.join("SyncHopper").join("pCloud").to_string_lossy());
+        // Characters Windows refuses in a folder name are swapped out.
+        assert_eq!(default_base_folder(false, "Work: a/b?"), home.join("SyncHopper").join("Work_ a_b_").to_string_lossy());
+        assert_eq!(default_base_folder(false, " .. "), home.join("SyncHopper").join("Account").to_string_lossy());
+    }
+
+    #[test]
+    fn sidebar_entries_have_ids_of_their_own() {
+        let mut ids: Vec<&str> = SIDEBAR_CLSIDS.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), SIDEBAR_CLSIDS.len());
+        assert_eq!(SIDEBAR_CLSIDS[0], "{09F3086A-BAFB-4D17-ABA8-5765ABD60793}", "the first is the one earlier versions used");
+        // The uninstaller removes every one of them.
+        let hooks = include_str!("../windows/hooks.nsh");
+        for id in SIDEBAR_CLSIDS {
+            assert!(hooks.contains(&format!("SYNCHOPPER_REMOVE_SIDEBAR \"{id}\"")), "{id} is missing from hooks.nsh");
+        }
+    }
+
+    #[test]
+    fn what_is_locked_reads_back() {
+        let locked = protect(b"a key").expect("this system can lock");
+        assert_eq!(unprotect(&locked).as_deref(), Some(&b"a key"[..]));
+    }
 }

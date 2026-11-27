@@ -1,20 +1,103 @@
 // SyncHopper screens. Plain JavaScript, no build step.
 // The Rust side sends one "state" object with everything to show, and the
 // screens call named commands to make things happen.
+//
+// The state holds what is true for the whole app plus a list of accounts.
+// The screens show one account at a time: `S` is the state with that
+// account's part laid over it, so S.pairs, S.settings, S.drive and so on
+// are always the shown account's.
 
 (function () {
   "use strict";
 
   const T = window.__TAURI__;
-  const invoke = (cmd, args) => T.core.invoke(cmd, args || {});
+  // Commands that are about one account. The account being shown, or being
+  // set up, is filled in for them.
+  const PER_ACCOUNT = new Set([
+    "dismiss_folder_notice", "ignore_file", "unignore_file", "reconnect", "remove_account", "rename_account",
+    "default_base_folder", "list_remote", "make_remote_dir", "preview_pair", "finish_setup", "update_settings",
+    "restore_defaults", "add_pair", "remove_pair", "pair_action", "sync_all", "set_paused_all", "upload_add",
+    "upload_action", "set_upload_dest", "drive_action", "open_target",
+  ]);
+  const invoke = (cmd, args) => {
+    const a = Object.assign({}, args || {});
+    if (PER_ACCOUNT.has(cmd) && a.account === undefined) a.account = activeAccount();
+    return T.core.invoke(cmd, a);
+  };
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
-  let S = null; // latest state from the app
+  let RAW = null; // latest state from the app: general things and every account
+  let S = null; // RAW with the shown account's part laid over it
+  let cur = null; // id of the account being shown
   let view = "loading";
   let wiz = null; // setup wizard working values
   let review = null; // open review dialog: { id, kind, modal }
-  const VIEWS = ["loading", "wizard", "main", "upload", "settings", "advanced"];
+  const VIEWS = ["loading", "wizard", "main", "upload", "settings", "general", "add"];
+  // The screens that have the accounts column beside them.
+  const WITH_COLUMN = ["main", "upload", "settings", "general", "add"];
+
+  // ----- accounts -----------------------------------------------------------
+
+  // The accounts whose setup is finished. One that has signed in but is
+  // still in setup is not shown anywhere but in the setup screens.
+  function readyAccounts() {
+    return RAW ? RAW.accounts.filter((a) => a.setup_complete) : [];
+  }
+
+  function activeAccount() {
+    return wiz && wiz.account ? wiz.account : cur;
+  }
+
+  function providerOf(id) {
+    return (RAW.providers || []).find((p) => p.id === id) || {};
+  }
+
+  // What the screens see while there is no account to show yet: during the
+  // first setup, before signing in.
+  function blankAccount() {
+    const p = wiz && wiz.provider ? providerOf(wiz.provider) : {};
+    return {
+      id: null,
+      provider: p.id || null,
+      cloud: p.name || "",
+      name: p.name || "",
+      setup_complete: false,
+      account: { email: "", used: null, total: null },
+      signing_in: null,
+      settings: Object.assign({ feature_sync: true, feature_drive: false, drive_letter: p.letter || "K", feature_sidebar: true, upload_dest: "", base_folder: "" }, RAW.general),
+      sync: { paused_all: false, auto_pause: null },
+      pairs: [],
+      drive: { enabled: false, supported: RAW.windows, state: "off", letter: p.letter || "K", message: "", free_letters: [] },
+      uploads: [],
+      folder_notices: [],
+      add_request: null,
+    };
+  }
+
+  // Works out which account is shown and lays it over the general state.
+  function compose() {
+    const ready = readyAccounts();
+    if (!ready.some((a) => a.id === cur)) cur = ready.length ? ready[0].id : null;
+    let acct = null;
+    if (wiz) acct = wiz.account ? RAW.accounts.find((a) => a.id === wiz.account) : null;
+    else acct = ready.find((a) => a.id === cur);
+    S = Object.assign({}, RAW, acct || blankAccount());
+  }
+
+  // Asks the app for fresh state right now, rather than waiting for it.
+  async function refresh() {
+    const fresh = await invoke("get_state").catch(() => null);
+    if (fresh) {
+      RAW = fresh;
+      compose();
+    }
+  }
+
+  // The name of the service the shown account is with: Koofr, pCloud, Filen.
+  function C() {
+    return S.cloud || "your account";
+  }
 
   // ----- small helpers ----------------------------------------------------
 
@@ -97,6 +180,7 @@
     gear: '<path d="M8.63 4.47L8.87 2.48L11.13 2.48L11.37 4.47L12.94 5.12L14.52 3.89L16.11 5.48L14.88 7.06L15.53 8.63L17.52 8.87L17.52 11.13L15.53 11.37L14.88 12.94L16.11 14.52L14.52 16.11L12.94 14.88L11.37 15.53L11.13 17.52L8.87 17.52L8.63 15.53L7.06 14.88L5.48 16.11L3.89 14.52L5.12 12.94L4.47 11.37L2.48 11.13L2.48 8.87L4.47 8.63L5.12 7.06L3.89 5.48L5.48 3.89L7.06 5.12z"/><circle cx="10" cy="10" r="2.5"/>',
     back: '<path d="M16 10H4.5M9 5.5L4.5 10 9 14.5"/>',
     chevron: '<path d="M8 5.5l4.5 4.5L8 14.5"/>',
+    cloud: '<path d="M6.3 15.2a3.3 3.3 0 0 1-.6-6.55 4.4 4.4 0 0 1 8.5-.5 3.6 3.6 0 0 1 .3 7.05z"/>',
   };
 
   function icon(name, size) {
@@ -250,13 +334,13 @@
     }
   });
 
-  // A dialog for walking through Koofr folders and choosing one.
-  function browseKoofr(startPath, title) {
+  // A dialog for walking through the account's folders and choosing one.
+  function browseCloud(startPath, title) {
     return new Promise((resolve) => {
       let path = String(startPath || "").split("/").filter(Boolean);
       let token = 0;
       const modal = openModal({
-        title: title || "Choose a Koofr folder",
+        title: title || "Choose a " + C() + " folder",
         body:
           '<div class="crumbs" id="br-crumbs"></div>' +
           '<div class="browser-list"><ul class="list pick" id="br-list"></ul><p class="small muted list-note" id="br-note"></p></div>' +
@@ -274,7 +358,7 @@
       async function load() {
         const mine = ++token;
         const crumbs = $("#br-crumbs", modal.el);
-        const parts = [{ label: "Koofr", depth: 0 }].concat(path.map((p, i) => ({ label: p, depth: i + 1 })));
+        const parts = [{ label: C(), depth: 0 }].concat(path.map((p, i) => ({ label: p, depth: i + 1 })));
         crumbs.innerHTML = parts
           .map((p, i) =>
             i === parts.length - 1
@@ -349,61 +433,242 @@
     VIEWS.forEach((v) => {
       $("#view-" + v).hidden = v !== name;
     });
+    $("#accounts").hidden = !WITH_COLUMN.includes(name);
     closeRowMenu();
     if (name === "upload" && S) $("#up-dest").value = S.settings.upload_dest || "";
-    if (name === "settings" || name === "advanced") syncControls(true);
+    if (name === "settings" || name === "general") syncControls(true);
     render();
   }
 
   function render() {
     if (!S) return;
+    renderAccounts();
     if (view === "main") renderMain();
     else if (view === "upload") renderUpload();
-    else if (view === "settings" || view === "advanced") syncControls(false);
+    else if (view === "settings" || view === "general") syncControls(false);
+    else if (view === "add") renderAdd();
     else if (view === "wizard") wizardTick();
     updateReview();
+    updateReconnect();
   }
 
   function onState(state) {
-    S = state;
+    const shown = cur;
+    RAW = state;
+    compose();
+    const any = readyAccounts().length > 0;
     if (view === "loading") {
-      if (S.setup_complete) {
+      if (any) {
         go("main");
-        takeAddRequest();
-      } else startWizard(false);
+        takeRequests();
+      } else startWizard(null);
       return;
     }
-    if (!S.setup_complete && view !== "wizard") {
+    if (!any && view !== "wizard") {
+      // The last account was disconnected: setup starts over.
       openModals.slice().forEach((m) => m.cancel());
-      startWizard(false);
+      startWizard(null);
       return;
     }
-    render();
+    if (shown && cur !== shown && view !== "wizard") {
+      // The account that was showing is gone. Its screens go with it.
+      openModals.slice().forEach((m) => m.cancel());
+      go("main");
+    } else render();
+    takeRequests();
+  }
+
+  // Shows another account.
+  function showAccount(id) {
+    if (!readyAccounts().some((a) => a.id === id)) return;
+    cur = id;
+    compose();
+    go("main");
+  }
+
+  function takeRequests() {
     takeAddRequest();
+    takePending();
+  }
+
+  // The <option>s for choosing among the accounts.
+  function accountOptions(selected, firstLabel) {
+    return (
+      (firstLabel ? '<option value="">' + esc(firstLabel) + "</option>" : "") +
+      readyAccounts().map((a) => '<option value="' + esc(a.id) + '"' + (a.id === selected ? " selected" : "") + ">" + esc(a.name) + "</option>").join("")
+    );
   }
 
   // A folder sent here from outside the window, such as with "Sync folder to
-  // Koofr" in File Explorer. Shown once, then handed back.
+  // Koofr" in File Explorer. Shown once, then handed back. It arrives on one
+  // account; with more than one, the dialog lets the user move it.
   let takingRequest = false;
   function takeAddRequest() {
-    const req = S.add_request;
-    if (!req || takingRequest || !S.setup_complete || view === "wizard") return;
+    if (takingRequest || view === "wizard" || !RAW) return;
+    const holder = readyAccounts().find((a) => a.add_request);
+    if (!holder) return;
+    const req = holder.add_request;
     // An update can arrive before the request is handed back; don't open
     // the same dialog twice.
     takingRequest = true;
     run("clear_add_request").finally(() => (takingRequest = false));
+    if (holder.id !== cur) {
+      cur = holder.id;
+      compose();
+    }
     if (view !== "main") go("main");
+    else render();
+    const moveTo = (id) => run("request_add_folder", { account: id, folder: req.local });
     if (req.blocked) {
-      openModal({ title: "Sync folder to Koofr", body: "<p>" + esc(req.blocked) + "</p>", buttons: [{ label: "OK", kind: "primary" }] });
+      const others = readyAccounts().length > 1;
+      const modal = openModal({
+        title: "Sync folder to " + S.name,
+        body:
+          "<p>" + esc(req.blocked) + "</p>" +
+          (others ? '<div class="field"><label for="bl-acct">Sync it with another account</label><select id="bl-acct">' + accountOptions(null, "Choose an account") + "</select></div>" : ""),
+        buttons: [{ label: "OK", kind: "primary" }],
+      });
+      const pick = $("#bl-acct", modal.el);
+      if (pick)
+        pick.addEventListener("change", () => {
+          if (!pick.value || pick.value === cur) return;
+          modal.close();
+          moveTo(pick.value);
+        });
       return;
     }
-    addFolderDialog(req);
+    addFolderDialog(req, moveTo);
+  }
+
+  // Files sent here with the right-click menu while there is more than one
+  // account: ask which account they are for.
+  let pendingModal = null;
+  function takePending() {
+    const p = RAW && RAW.pending;
+    if (!p || p.kind !== "upload" || view === "wizard") return;
+    const count = p.paths.length;
+    const body =
+      "<p>" + esc(plural(count, "item")) + " from File Explorer. Which account " + (count === 1 ? "is it" : "are they") + " for?</p>" +
+      '<ul class="box list pick">' +
+      readyAccounts().map((a) => '<li tabindex="0" role="button" data-id="' + esc(a.id) + '">' + icon("cloud", 18) + '<span class="name">' + esc(a.name) + "</span></li>").join("") +
+      "</ul>";
+    if (pendingModal) {
+      pendingModal.setBody(body);
+      return;
+    }
+    const modal = openModal({
+      title: "Send to which account?",
+      body: body,
+      buttons: [{ label: "Cancel" }],
+      onClose: () => {
+        pendingModal = null;
+        run("clear_pending");
+      },
+    });
+    pendingModal = modal;
+    const pick = (e) => {
+      const li = e.target.closest("li[data-id]");
+      if (!li || (e.type === "keydown" && e.key !== "Enter" && e.key !== " ")) return;
+      const acct = readyAccounts().find((a) => a.id === li.dataset.id);
+      const paths = ((RAW.pending || {}).paths || []).slice();
+      modal.close();
+      if (!acct) return;
+      cur = acct.id;
+      compose();
+      go("upload");
+      run("upload_add", { account: acct.id, paths: paths, dest: acct.settings.upload_dest || "" });
+    };
+    modal.el.addEventListener("click", pick);
+    modal.el.addEventListener("keydown", pick);
   }
 
   document.addEventListener("click", (e) => {
     const nav = e.target.closest("[data-nav]");
     if (nav) go(nav.dataset.nav);
   });
+
+  // ----- the accounts column ------------------------------------------------
+
+  // One line on how an account is doing, and whether it needs a mark.
+  function accountSummary(a) {
+    if (RAW.engine.state === "error" || RAW.engine.state === "blocked") return { text: "Can't sync right now", flag: "warn" };
+    const pairs = a.settings.feature_sync ? a.pairs : [];
+    const working = (p) => p.phase === "syncing" || p.phase === "checking" || p.phase === "queued";
+    const needs = pairs.filter((p) => !p.paused && ((p.approval && !working(p)) || p.phase === "error" || (p.files || []).some((f) => f.flagged) || p.conflicts.length)).length;
+    if (needs) return { text: plural(needs, "folder needs", "folders need") + " you", flag: "warn" };
+    if (a.drive.enabled && (a.drive.state === "error" || a.drive.state === "needs_driver")) return { text: "Drive needs attention", flag: "warn" };
+    if (pairs.some((p) => !p.paused && p.phase === "waiting")) return { text: "Waiting", flag: null };
+    const busy = pairs.filter((p) => !p.paused && working(p)).length;
+    if (busy) return { text: "Syncing " + plural(busy, "folder"), flag: "busy" };
+    if ((a.uploads || []).some((u) => u.state === "waiting" || u.state === "uploading")) return { text: "Uploading", flag: "busy" };
+    if (a.sync.paused_all || a.sync.auto_pause) return { text: "Paused", flag: null };
+    if (!a.settings.feature_sync) return { text: a.drive.enabled ? "Drive only" : "Uploads only", flag: null };
+    if (!pairs.length) return { text: "No folders yet", flag: null };
+    if (pairs.every((p) => p.paused)) return { text: "Paused", flag: null };
+    return { text: "Up to date", flag: null };
+  }
+
+  function renderAccounts() {
+    if (!RAW) return;
+    const onAccount = view === "main" || view === "upload" || view === "settings";
+    const html = readyAccounts()
+      .map((a) => {
+        const sum = accountSummary(a);
+        return (
+          '<button type="button" class="acct' + (onAccount && a.id === cur ? " current" : "") + '" data-acct="' + esc(a.id) + '"' + (onAccount && a.id === cur ? ' aria-current="true"' : "") + ">" +
+          icon("cloud") +
+          '<span class="who"><span class="name">' + esc(a.name) + '</span><span class="state">' + esc(sum.text) + "</span></span>" +
+          (sum.flag ? '<span class="flag ' + sum.flag + '">' + icon(sum.flag === "warn" ? "warn" : "sync", 16) + "</span>" : "") +
+          "</button>"
+        );
+      })
+      .join("");
+    setHtml($("#acct-list"), html);
+    $("#acct-add").classList.toggle("current", view === "add");
+    $("#acct-general").classList.toggle("current", view === "general");
+  }
+
+  $("#acct-list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-acct]");
+    if (b) showAccount(b.dataset.acct);
+  });
+
+  // ----- add cloud provider -------------------------------------------------
+
+  const SIGN_IN_HINT = {
+    password: "Email and an app password",
+    browser: "Sign in through your browser",
+    api_key: "Email, password and an API key",
+  };
+
+  // The rows of the list of services to choose from.
+  function providerRows() {
+    return (RAW.providers || [])
+      .map(
+        (p) =>
+          '<li tabindex="0" role="button" data-provider="' + esc(p.id) + '">' + icon("cloud") +
+          '<div class="frow-main"><span class="name">' + esc(p.name) + '</span><span class="path">' + esc(SIGN_IN_HINT[p.sign_in] || "") + "</span></div>" +
+          '<span class="go">' + icon("chevron", 16) + "</span></li>"
+      )
+      .join("");
+  }
+
+  function renderAdd() {
+    setHtml($("#add-list"), providerRows());
+  }
+
+  // Calls `chosen` with the service's id when a row in `root` is picked.
+  function onProviderPick(root, chosen) {
+    const pick = (e) => {
+      const li = e.target.closest("li[data-provider]");
+      if (!li || (e.type === "keydown" && e.key !== "Enter" && e.key !== " ")) return;
+      e.preventDefault();
+      chosen(li.dataset.provider);
+    };
+    root.addEventListener("click", pick);
+    root.addEventListener("keydown", pick);
+  }
+  onProviderPick($("#add-list"), (id) => startWizard(id));
 
   // ----- main screen ------------------------------------------------------
 
@@ -429,7 +694,7 @@
     if (p.paused) {
       Object.assign(st, { icon: "pause", label: "Paused", sub: "This folder is not syncing", btn: "Resume", act: "resume" });
     } else if (p.approval && !busy) {
-      const where = p.approval.side === "pc" ? "on this PC" : "in Koofr";
+      const where = p.approval.side === "pc" ? "on this PC" : "in " + C();
       Object.assign(st, {
         tone: "warn",
         icon: "warn",
@@ -460,14 +725,14 @@
         tone: p.phase === "queued" ? "quiet" : "busy",
         icon: p.phase === "queued" ? "clock" : "sync",
         label: p.phase === "queued" ? "Waiting to sync" : "Checking for changes",
-        sub: p.phase === "queued" ? "Another folder is syncing first" : "Comparing this PC with Koofr",
+        sub: p.phase === "queued" ? "Another folder is syncing first" : "Comparing this PC with " + C(),
         btn: "Pause",
         act: "pause",
       });
     } else if (p.phase === "waiting") {
       Object.assign(st, {
-        label: p.waiting_kind === "drive" ? "Waiting for the drive" : "Waiting for Koofr",
-        sub: (p.waiting || "Koofr is having problems right now.") + " " + retryText(p.retry_at),
+        label: p.waiting_kind === "drive" ? "Waiting for the drive" : "Waiting for " + C(),
+        sub: (p.waiting || C() + " is having problems right now.") + " " + retryText(p.retry_at),
         btn: "Try now",
         act: "sync",
       });
@@ -539,13 +804,20 @@
 
   function renderMain() {
     const acct = S.account;
-    let line = acct.email || "";
-    if (acct.used != null && acct.total != null) line += " \u00b7 " + fmtBytes(acct.used) + " of " + fmtBytes(acct.total) + " used";
-    setText($("#main-account"), line);
+    setText($("#main-title"), S.name);
+    $("#main-settings").title = S.name + " settings";
+    $("#main-settings").setAttribute("aria-label", S.name + " settings");
+    // The sign-in name, then the space used. A different name from the
+    // service's own is followed by the service, so it is clear what it is.
+    const parts = [];
+    if (S.name !== C()) parts.push(C());
+    if (acct.email) parts.push(acct.email);
+    if (acct.used != null && acct.total != null) parts.push(fmtBytes(acct.used) + " of " + fmtBytes(acct.total) + " used");
+    setText($("#main-account"), parts.join(" \u00b7 "));
 
     // Banners
     const banners = [];
-    if (S.test_mode) banners.push(banner("info", "Test mode: syncing with a folder on this PC in place of Koofr."));
+    if (S.test_mode) banners.push(banner("info", "Test mode: syncing with a folder on this PC in place of " + esc(C()) + "."));
     const eng = engineText();
     if (eng) banners.push(banner("warn", esc(eng), engineStuck() ? '<button type="button" class="btn" data-banner="engine">Try again</button>' : ""));
     const up = S.update || {};
@@ -589,7 +861,7 @@
       setText($(".name", li), p.name);
       $(".name", li).title = p.name;
       setText($(".path", li), p.local);
-      $(".path", li).title = p.local + "   Koofr: /" + p.remote;
+      $(".path", li).title = p.local + "   " + C() + ": /" + p.remote;
       setHtml($(".frow-status", li), statusHtml(st));
       const btn = $(".btn.main", li);
       setText(btn, st.btn);
@@ -603,10 +875,10 @@
     const empty = $("#main-empty");
     if (!syncOn) {
       empty.hidden = false;
-      setText(empty, "Synced folders are turned off. Turn them on in Settings to keep folders on this PC.");
+      setText(empty, "Synced folders are turned off for this account. Turn them on in its settings to keep folders on this PC.");
     } else if (!pairs.length) {
       empty.hidden = false;
-      setText(empty, "No folders are kept on this PC yet. Add one and it will stay in sync with Koofr.");
+      setText(empty, "No folders are kept on this PC yet. Add one and it will stay in sync with " + C() + ".");
     } else {
       empty.hidden = true;
     }
@@ -614,7 +886,7 @@
     $("#main-footnote").hidden = !syncOn;
     setText(
       $("#main-footnote"),
-      syncOn ? "Checks Koofr for changes every " + plural(S.settings.check_interval_min, "minute") + ". Changes on this PC sync right away." : ""
+      syncOn ? "Checks " + C() + " for changes every " + plural(S.settings.check_interval_min, "minute") + ". Changes on this PC sync right away." : ""
     );
     renderDrive();
   }
@@ -636,7 +908,7 @@
     const html =
       '<div class="frow">' +
       icon("drive") +
-      '<div class="frow-main"><span class="name">Koofr drive (' + esc(d.letter) + ':)</span><span class="desc">' + esc(m[3]) + "</span></div>" +
+      '<div class="frow-main"><span class="name">' + esc(C()) + " drive (" + esc(d.letter) + ':)</span><span class="desc">' + esc(m[3]) + "</span></div>" +
       '<div class="frow-status">' +
       statusHtml({
         tone: m[0],
@@ -659,7 +931,7 @@
     if (b.dataset.banner === "resume") run("set_paused_all", { paused: false });
     if (b.dataset.banner === "engine") run("retry_engine");
     if (b.dataset.banner === "update") installUpdate();
-    if (b.dataset.banner === "fsync") run("request_add_folder", { folder: b.dataset.local });
+    if (b.dataset.banner === "fsync") run("request_add_folder", { account: cur, folder: b.dataset.local });
     if (b.dataset.banner === "fopen") run("open_target", { kind: "base_folder" });
     if (b.dataset.banner === "fdismiss") run("dismiss_folder_notice", { id: b.dataset.id });
   });
@@ -746,7 +1018,7 @@
   async function repairPair(p) {
     const ok = await confirmDialog(
       "Repair " + p.name + "?",
-      "This rebuilds the folder's sync record by comparing this PC with Koofr again. Files missing on either side are copied across and nothing is deleted. A file you deleted very recently can come back once.",
+      "This rebuilds the folder's sync record by comparing this PC with " + C() + " again. Files missing on either side are copied across and nothing is deleted. A file you deleted very recently can come back once.",
       "Repair"
     );
     if (ok && (await run("pair_action", { id: p.id, action: "repair" })) !== undefined) toast("Rebuilding the sync record for " + p.name + ".");
@@ -755,7 +1027,7 @@
   async function removePair(p) {
     const ok = await confirmDialog(
       "Stop syncing " + p.name + "?",
-      "The files stay where they are, on this PC and in Koofr. They just stop being kept in step. You can add the folder again later.",
+      "The files stay where they are, on this PC and in " + C() + ". They just stop being kept in step. You can add the folder again later.",
       "Stop syncing",
       true
     );
@@ -795,29 +1067,30 @@
   function reviewBody(p, kind) {
     const out = [];
     const a = p.approval;
+    const c = esc(C());
     if (kind === "deletes-pc") {
       out.push("<p><b>" + num(a.deleted) + " of " + num(a.total) + " files</b> in this folder were deleted on this PC.</p>");
-      out.push("<p>If that was on purpose, SyncHopper can delete them from Koofr too. If not, it can copy them back to this PC.</p>");
+      out.push("<p>If that was on purpose, SyncHopper can delete them from " + c + " too. If not, it can copy them back to this PC.</p>");
     } else if (kind === "deletes-koofr") {
-      out.push("<p><b>" + num(a.deleted) + " of " + num(a.total) + " files</b> in this folder were deleted in Koofr.</p>");
-      out.push("<p>If that was on purpose, SyncHopper can delete them from this PC too. Files deleted this way do not go to the Recycle Bin. If not, it can copy them back to Koofr.</p>");
+      out.push("<p><b>" + num(a.deleted) + " of " + num(a.total) + " files</b> in this folder were deleted in " + c + ".</p>");
+      out.push("<p>If that was on purpose, SyncHopper can delete them from this PC too. Files deleted this way do not go to the Recycle Bin. If not, it can copy them back to " + c + ".</p>");
     } else if (kind === "empty-pc") {
-      out.push("<p>Everything in this folder is gone from this PC. Koofr still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
-      out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to this PC. If you really want the folder empty, delete the files in Koofr yourself and syncing will carry on.</p>");
+      out.push("<p>Everything in this folder is gone from this PC. " + c + " still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
+      out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to this PC. If you really want the folder empty, delete the files in " + c + " yourself and syncing will carry on.</p>");
     } else if (kind === "empty-koofr") {
-      out.push("<p>Everything in this folder is gone from Koofr, or the folder was renamed or deleted there. This PC still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
-      out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to Koofr. If you really want the folder empty, delete the files on this PC yourself and syncing will carry on.</p>");
+      out.push("<p>Everything in this folder is gone from " + c + ", or the folder was renamed or deleted there. This PC still has <b>" + plural(a.deleted, "file") + "</b> from it.</p>");
+      out.push("<p>SyncHopper never empties a whole folder by itself. You can copy the files back to " + c + ". If you really want the folder empty, delete the files on this PC yourself and syncing will carry on.</p>");
     } else if (kind === "changed") {
       const count = a.deleted > 0 ? " (<b>" + plural(a.deleted, "file") + "</b>)" : "";
       out.push("<p>Every file in this folder looks changed since the last sync" + count + ". That can happen after a clock change or restoring a backup. Sync them anyway?</p>");
     } else if (kind === "waiting") {
-      out.push("<p><b>" + esc(p.waiting || "Koofr is having problems right now.") + "</b></p>");
-      let next = "SyncHopper tries again by itself and catches up once Koofr is back.";
+      out.push("<p><b>" + esc(p.waiting || C() + " is having problems right now.") + "</b></p>");
+      let next = "SyncHopper tries again by itself and catches up once " + C() + " is back.";
       if (p.waiting_kind === "drive") next = "SyncHopper tries again by itself and catches up once it can use the drive again.";
       else if (p.waiting_kind === "cert") next = "SyncHopper tries again by itself and catches up once it can connect securely.";
       else if (p.waiting_kind === "throttled") {
         next = "SyncHopper tries again by itself.";
-        if (!S.settings.limit_requests) next += " If this keeps happening, turn on Limit requests to Koofr in Advanced settings.";
+        if (providerOf(S.provider).request_limit && !S.settings.limit_requests) next += " If this keeps happening, turn on Limit requests to " + C() + " in this account's settings.";
       }
       out.push("<p>Nothing is wrong with your files. " + esc(next) + " " + esc(retryText(p.retry_at)) + "</p>");
       if (p.details.length) out.push("<details><summary>Technical details</summary><pre>" + esc(p.details.join("\n")) + "</pre></details>");
@@ -839,7 +1112,7 @@
     }
     if ((kind === "error" || kind === "skipped" || kind === "conflicts") && p.conflicts.length) {
       const newest = S.settings.conflict_policy === "newest";
-      out.push("<p>" + (p.conflicts.length === 1 ? "This file was" : "These files were") + " changed on this PC and in Koofr before they could sync:</p>");
+      out.push("<p>" + (p.conflicts.length === 1 ? "This file was" : "These files were") + " changed on this PC and in " + c + " before they could sync:</p>");
       out.push('<ul class="plain">' + p.conflicts.map((c) => "<li>" + esc(c) + "</li>").join("") + "</ul>");
       out.push(
         "<p class=\"small muted\">" +
@@ -861,8 +1134,8 @@
       return run("pair_action", { id: id, action: action });
     };
     if (kind === "deletes-pc" || kind === "deletes-koofr") {
-      const other = kind === "deletes-pc" ? "Koofr" : "this PC";
-      const here = kind === "deletes-pc" ? "this PC" : "Koofr";
+      const other = kind === "deletes-pc" ? C() : "this PC";
+      const here = kind === "deletes-pc" ? "this PC" : C();
       return [
         { label: "Decide later", left: true },
         { label: "Copy them back to " + here, action: act("restore") },
@@ -870,7 +1143,7 @@
       ];
     }
     if (kind === "empty-pc" || kind === "empty-koofr") {
-      const here = kind === "empty-pc" ? "this PC" : "Koofr";
+      const here = kind === "empty-pc" ? "this PC" : C();
       return [
         { label: "Decide later", left: true },
         { label: "Stop syncing this folder", action: () => { review = null; return run("remove_pair", { id: id }); } },
@@ -899,7 +1172,7 @@
     if (kind.startsWith("empty-")) return p.name + " was emptied";
     if (kind === "changed") return "Check before syncing " + p.name;
     if (kind === "error") return p.name + " could not sync";
-    if (kind === "waiting") return p.name + (p.waiting_kind === "drive" ? " is waiting for its drive" : " is waiting for Koofr");
+    if (kind === "waiting") return p.name + (p.waiting_kind === "drive" ? " is waiting for its drive" : " is waiting for " + C());
     if (kind === "skipped") return "Files left out of " + p.name;
     if (kind === "conflicts") return "Changed in both places";
     return p.name;
@@ -994,17 +1267,20 @@
   $("#add-folder").addEventListener("click", () => addFolderDialog());
 
   // `prefill`, when given, holds a folder on this PC to start from: local,
-  // remote (the suggested Koofr folder) and an optional note.
-  async function addFolderDialog(prefill) {
+  // remote (the suggested folder in the account) and an optional note.
+  // `moveTo`, given with it, hands the folder to another account.
+  async function addFolderDialog(prefill, moveTo) {
     const base = await invoke("default_base_folder").catch(() => "");
+    const choose = !!(prefill && moveTo && readyAccounts().length > 1);
     let localTouched = !!(prefill && prefill.local);
     let token = 0;
     const modal = openModal({
       title: "Add a folder",
       width: 600,
       body:
-        '<p class="muted small">Pick a folder in Koofr and where to keep it on this PC. The two are then kept the same.</p>' +
-        '<div class="field"><label for="af-remote">Koofr folder</label><div class="row gap8"><input id="af-remote" type="text" class="grow" autocomplete="off" spellcheck="false" placeholder="For example Documents"><button type="button" class="btn" id="af-rbrowse">Browse</button></div></div>' +
+        '<p class="muted small">Pick a folder in ' + esc(C()) + " and where to keep it on this PC. The two are then kept the same.</p>" +
+        (choose ? '<div class="field"><label for="af-acct">Account</label><select id="af-acct">' + accountOptions(cur) + "</select></div>" : "") +
+        '<div class="field"><label for="af-remote">' + esc(C()) + ' folder</label><div class="row gap8"><input id="af-remote" type="text" class="grow" autocomplete="off" spellcheck="false" placeholder="For example Documents"><button type="button" class="btn" id="af-rbrowse">Browse</button></div></div>' +
         '<div class="field"><label for="af-local">Folder on this PC</label><div class="row gap8"><input id="af-local" type="text" class="grow" autocomplete="off" spellcheck="false"><button type="button" class="btn" id="af-lbrowse">Browse</button></div></div>' +
         (prefill && prefill.note ? banner("info", esc(prefill.note)) : "") +
         '<p id="af-preview" class="small muted" role="status"></p>' +
@@ -1021,7 +1297,7 @@
               m.setError("Pick a folder on this PC.");
               return false;
             }
-            if (!remote && !(await confirmDialog("Sync your whole Koofr account?", "Leaving the Koofr folder empty keeps your entire account on this PC. That can be a lot of data.", "Sync everything"))) return false;
+            if (!remote && !(await confirmDialog("Sync your whole " + C() + " account?", "Leaving the " + C() + " folder empty keeps your entire account on this PC. That can be a lot of data.", "Sync everything"))) return false;
             try {
               await invoke("add_pair", { local: local, remote: remote });
             } catch (e) {
@@ -1040,6 +1316,15 @@
       remoteEl.value = prefill.remote || "";
       localEl.value = prefill.local;
     }
+    const acctEl = $("#af-acct", modal.el);
+    if (acctEl)
+      acctEl.addEventListener("change", () => {
+        if (acctEl.value === cur) return;
+        // The other account checks the folder for itself and opens this
+        // dialog again with its own suggestion.
+        modal.close();
+        moveTo(acctEl.value);
+      });
 
     function suggestLocal() {
       if (localTouched || !base) return;
@@ -1078,7 +1363,7 @@
       schedulePreview();
     });
     $("#af-rbrowse", modal.el).addEventListener("click", async () => {
-      const picked = await browseKoofr(remoteEl.value.trim(), "Choose a Koofr folder to sync");
+      const picked = await browseCloud(remoteEl.value.trim(), "Choose a " + C() + " folder to sync");
       if (picked == null) return;
       remoteEl.value = picked;
       suggestLocal();
@@ -1095,7 +1380,7 @@
   }
 
   function previewText(pv) {
-    let text = "Koofr has " + plural(pv.remote_count, "file") + " here (" + fmtBytes(pv.remote_bytes) + "). The PC folder has " + plural(pv.local_count, "file") + (pv.local_count ? " (" + fmtBytes(pv.local_bytes) + ")" : "") + ".";
+    let text = C() + " has " + plural(pv.remote_count, "file") + " here (" + fmtBytes(pv.remote_bytes) + "). The PC folder has " + plural(pv.local_count, "file") + (pv.local_count ? " (" + fmtBytes(pv.local_bytes) + ")" : "") + ".";
     if (pv.free_bytes != null && pv.remote_bytes > pv.free_bytes) {
       text += " Careful: that is more than the " + fmtBytes(pv.free_bytes) + " free on this drive.";
     }
@@ -1118,6 +1403,10 @@
   }
 
   function renderUpload() {
+    setText($("#up-title"), "Upload to " + S.name);
+    setText($("#up-sub"), "Files go straight to " + C() + ". They are not kept in sync with this PC.");
+    setText($("#up-dest-label"), C() + " folder");
+    $("#up-dest").placeholder = "Top of your " + C();
     const list = $("#upload-list");
     const seen = {};
     S.uploads.forEach((u, index) => {
@@ -1131,7 +1420,7 @@
       }
       if (list.children[index] !== li) list.insertBefore(li, list.children[index]);
       setText($(".name", li), u.name);
-      $(".name", li).title = u.path + "  to  Koofr: /" + u.dest;
+      $(".name", li).title = u.path + "  to  " + C() + ": /" + u.dest;
       setHtml($(".st", li), uploadRow(u));
       $(".retry", li).hidden = !(u.state === "failed" || u.state === "cancelled");
     });
@@ -1172,7 +1461,7 @@
     run("set_upload_dest", { dest: uploadDest() });
   });
   $("#up-browse").addEventListener("click", async () => {
-    const picked = await browseKoofr(uploadDest(), "Choose where uploads go");
+    const picked = await browseCloud(uploadDest(), "Choose where uploads go");
     if (picked == null) return;
     $("#up-dest").value = picked;
     delete $("#up-dest").dataset.dirty;
@@ -1227,7 +1516,38 @@
     $("#st-letter-row").hidden = !s.feature_drive;
     $("#st-drive").disabled = !S.windows && !s.feature_drive;
     setText($("#st-drive-note"), S.windows ? "Browse your whole account as a drive letter. Turning this on installs a small driver." : "Only available on Windows.");
-    setText($("#st-account"), "Connected as " + S.account.email);
+    // Wording that names the account or its service.
+    const c = C();
+    const p = providerOf(S.provider);
+    setText($("#st-title"), S.name + " settings");
+    setText($("#st-name"), S.name);
+    setText($("#st-account"), S.account.email || c + " account");
+    setText($("#st-reconnect-note"), "Sign in again, for example after changing your password.");
+    setText($("#st-disconnect-note"), "Stops using this account here. Files stay on this PC and in " + c + ".");
+    setText($("#st-drive-label"), c + " drive");
+    setText($("#st-sidebar-label"), S.name + " in File Explorer's sidebar");
+    setText($("#st-sidebar-note"), S.windows ? "Adds " + S.name + " next to OneDrive and This PC. It opens the folder this account's synced folders are in." : "Only available on Windows.");
+    setText($("#st-base"), s.base_folder || "Not chosen yet");
+    $("#st-base").title = s.base_folder || "";
+    $("#st-base-open").disabled = !s.base_folder;
+    setText($("#st-every-label"), "Check " + c + " for changes every");
+    setText($("#st-auto-label"), "Automatically sync new folders added to your " + c + " folder");
+    setText($("#st-auto-note"), "New folders you put there get a matching folder in " + c + ". If " + c + " already has one with that name, SyncHopper asks first. When this is off, SyncHopper tells you about new folders instead.");
+    $("#st-only").hidden = !(p.http2_choice || p.request_limit);
+    setText($("#st-h-only"), "Only for " + c);
+    $("#st-http2-row").hidden = !p.http2_choice;
+    setText($("#st-http2-note"), "Off is much faster for uploads to " + c + ". Turn on only to test.");
+    $("#st-limit-row").hidden = !p.request_limit;
+    setText($("#st-limit-label"), "Limit requests to " + c);
+    setText($("#st-limit-note"), "Limits syncs, uploads and the drive to " + p.request_limit + " requests per second each, the rate " + c + " recommends. Turn this on if " + c + " says SyncHopper is sending too many requests. Big syncs may be a little slower, and the drive reconnects when you change this.");
+    const ready = readyAccounts();
+    setText(
+      $("#st-menu-note"),
+      ready.length === 1
+        ? "Adds Send to " + ready[0].cloud + " and Sync folder to " + ready[0].cloud + " to File Explorer's right-click menu."
+        : "Adds Send to and Sync folder to to File Explorer's right-click menu. SyncHopper then asks which account."
+    );
+    $("#ge-limit-note").hidden = ready.length < 2;
     [["up", s.upload_limit_mbps], ["down", s.download_limit_mbps]].forEach((pair) => {
       const mode = $("#ad-" + pair[0] + "-mode");
       const input = $("#ad-" + pair[0]);
@@ -1240,7 +1560,6 @@
     });
     $("#st-sidebar").disabled = !S.windows && !s.feature_sidebar;
     $("#st-auto").disabled = !s.feature_sync;
-    if (!S.windows) setText($("#st-sidebar-note"), "Only available on Windows.");
     const up = S.update || {};
     let appNote = "You have SyncHopper " + S.version + ".";
     if (!up.enabled) appNote += " This copy was built on this PC, so it can't update itself. Install the release version to get updates.";
@@ -1264,9 +1583,9 @@
     } catch (e) {
       toast(String(e), 8000);
     }
-    const fresh = await invoke("get_state").catch(() => null);
-    if (fresh) S = fresh;
+    await refresh();
     syncControls(true);
+    renderAccounts();
   }
 
   document.addEventListener("change", async (e) => {
@@ -1277,8 +1596,8 @@
     if (el.dataset.num != null) value = Number(value);
     if (key === "feature_drive" && value === true) {
       const ok = await confirmDialog(
-        "Turn on the Koofr drive?",
-        "The drive shows your whole Koofr account as a drive letter without keeping the files on this PC. It needs a small free driver called WinFsp. If it is not installed yet, SyncHopper installs it now and Windows asks for permission.",
+        "Turn on the " + C() + " drive?",
+        "The drive shows your whole " + C() + " account as a drive letter without keeping the files on this PC. It needs a small free driver called WinFsp. If it is not installed yet, SyncHopper installs it now and Windows asks for permission.",
         "Turn on"
       );
       if (!ok) {
@@ -1287,7 +1606,7 @@
       }
     }
     if (key === "feature_sync" && value === false) {
-      const ok = await confirmDialog("Turn off synced folders?", "Syncing stops for every folder. The files stay where they are, and you can turn this back on any time.", "Turn off");
+      const ok = await confirmDialog("Turn off synced folders?", "Syncing stops for every folder in this account. The files stay where they are, and you can turn this back on any time.", "Turn off");
       if (!ok) {
         el.checked = true;
         return;
@@ -1317,16 +1636,146 @@
   });
 
   $("#st-disconnect").addEventListener("click", async () => {
+    const last = readyAccounts().length === 1;
     const ok = await confirmDialog(
-      "Disconnect from Koofr?",
-      "SyncHopper stops syncing and forgets this account and its folder list. Your files stay where they are, on this PC and in Koofr. Setup starts over next.",
+      "Disconnect " + S.name + "?",
+      "SyncHopper stops syncing this account and forgets its sign-in and its folder list. Your files stay where they are, on this PC and in " + C() + "." + (last ? " It is your only account, so setup starts over next." : ""),
       "Disconnect",
       true
     );
-    if (ok) await run("disconnect");
+    if (ok) await run("remove_account");
   });
 
-  $("#st-rerun").addEventListener("click", () => startWizard(true));
+  $("#st-rename").addEventListener("click", () => {
+    openModal({
+      title: "Rename " + S.name,
+      body:
+        '<div class="field"><label for="rn-name">Name</label><input id="rn-name" type="text" class="fill" maxlength="40" autocomplete="off" spellcheck="false" value="' + esc(S.name) + '"></div>' +
+        '<p class="small muted">This is the name SyncHopper shows for the account, here and in File Explorer. Nothing changes in ' + esc(C()) + ".</p>",
+      buttons: [
+        { label: "Cancel" },
+        {
+          label: "Rename",
+          kind: "primary",
+          action: async (m) => {
+            await invoke("rename_account", { name: $("#rn-name", m.el).value });
+            await refresh();
+            render();
+            return true;
+          },
+        },
+      ],
+    });
+  });
+
+  $("#st-base-open").addEventListener("click", () => run("open_target", { kind: "base_folder" }));
+
+  // ----- signing in again -----------------------------------------------
+
+  // The boxes each kind of sign-in needs. `v` holds what is typed so far.
+  function signInFields(p, v) {
+    const c = esc(p.name);
+    if (p.sign_in === "api_key") {
+      return (
+        '<div class="field"><label for="wz-email">' + c + ' email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.email) + '"></div>' +
+        '<div class="field"><label for="wz-pass">' + c + ' password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(v.password) + '"></div>' +
+        '<div class="field"><label for="wz-key">API key</label><input id="wz-key" type="password" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.apiKey) + '">' +
+        '<p class="small muted">' + c + " hands out the API key through its command-line tool. " +
+        '<button type="button" class="link" data-open="filen_cli_page">Get the tool</button>, run <span class="selectable strong">filen export-api-key</span> in it, sign in, and paste the key here. ' +
+        "A new key is needed whenever you change your " + c + " password.</p></div>"
+      );
+    }
+    if (p.sign_in === "browser") {
+      return (
+        "<p>" + c + " signs you in on its own page. SyncHopper opens it in your browser and never sees your password.</p>" +
+        '<p class="small muted">The page asks you to let rclone use your account. rclone is the sync engine SyncHopper is built on.</p>'
+      );
+    }
+    return (
+      '<div class="field"><label for="wz-email">' + c + ' email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.email) + '"></div>' +
+      '<div class="field"><label for="wz-pass">App password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(v.password) + '">' +
+      '<p class="small muted">No app password yet? <button type="button" class="link" data-open="koofr_password_page">Open ' + c + "'s app password page</button>, create one, and paste it here.</p></div>"
+    );
+  }
+
+  // What is in the sign-in boxes inside `root`.
+  function signInValues(root) {
+    const val = (id) => {
+      const el = $(id, root);
+      return el ? el.value : "";
+    };
+    return { email: val("#wz-email"), password: val("#wz-pass"), api_key: val("#wz-key") };
+  }
+
+  // While a sign-in waits in the browser: what to show, with a way to open
+  // the page again and to give up.
+  function browserWaitHtml(link) {
+    return (
+      '<span class="wait">' +
+      statusLine("busy", "sync", "Waiting for you to finish signing in in your browser") +
+      '<span class="wait-links small">' +
+      (link ? '<button type="button" class="link" data-signin-link="' + esc(link) + '">Open the sign-in page again</button>' : "") +
+      '<button type="button" class="link" data-signin-cancel>Cancel</button></span></span>'
+    );
+  }
+
+  document.addEventListener("click", (e) => {
+    const open = e.target.closest("[data-open]");
+    const link = e.target.closest("[data-signin-link]");
+    const cancel = e.target.closest("[data-signin-cancel]");
+    if (open) run("open_target", { kind: open.dataset.open });
+    if (link) run("open_target", { kind: "signin_link", value: link.dataset.signinLink });
+    if (cancel) run("cancel_sign_in");
+  });
+
+  let reconnectModal = null;
+  $("#st-reconnect").addEventListener("click", () => {
+    const p = providerOf(S.provider);
+    const browser = p.sign_in === "browser";
+    const modal = openModal({
+      title: "Reconnect " + S.name,
+      width: 520,
+      body:
+        '<p class="muted small">Your folders and settings stay as they are. Only the saved sign-in is replaced.</p>' +
+        signInFields(p, { email: S.account.email || "", password: "", apiKey: "" }) +
+        '<p id="rc-wait" role="status"></p>',
+      buttons: [
+        { label: "Cancel", action: () => { run("cancel_sign_in"); return true; } },
+        {
+          label: browser ? "Sign in to " + p.name : "Reconnect",
+          kind: "primary",
+          action: async (m) => {
+            m.setError("");
+            m.waiting = browser;
+            updateReconnect();
+            try {
+              await invoke("reconnect", { signin: signInValues(m.el) });
+            } catch (e) {
+              m.waiting = false;
+              updateReconnect();
+              throw e;
+            }
+            m.waiting = false;
+            toast("Reconnected to " + p.name + ".");
+            return true;
+          },
+        },
+      ],
+      onClose: () => {
+        reconnectModal = null;
+      },
+    });
+    reconnectModal = modal;
+  });
+
+  // Keeps the reconnect dialog's waiting line in step.
+  function updateReconnect() {
+    if (!reconnectModal) return;
+    const el = $("#rc-wait", reconnectModal.el);
+    if (!el) return;
+    const link = S.signing_in ? S.signing_in.link : null;
+    setHtml(el, reconnectModal.waiting ? browserWaitHtml(link) : "");
+  }
 
   $("#ad-log").addEventListener("click", () => run("open_target", { kind: "log" }));
   $("#ad-rclone").addEventListener("click", () => run("open_target", { kind: "rclone_site" }));
@@ -1334,8 +1783,7 @@
   $("#ad-check").addEventListener("click", async () => {
     const before = S.update ? S.update.status : "";
     await run("check_updates");
-    const fresh = await invoke("get_state").catch(() => null);
-    if (fresh) S = fresh;
+    await refresh();
     syncControls(true);
     const up = S.update || {};
     if (up.status === "current" && before !== "current") toast("You have the newest version of SyncHopper.");
@@ -1393,7 +1841,7 @@
       body:
         '<p class="small muted">One pattern per line. A star stands for any text, so *.tmp means every file ending in .tmp. Files that match are never uploaded or downloaded.</p>' +
         '<textarea id="ig-text" rows="9" spellcheck="false" aria-label="Ignore patterns, one per line" class="fill">' + esc(S.settings.ignore_patterns.join("\n")) + "</textarea>" +
-        '<p class="small muted">Saving a changed list makes every folder compare itself with Koofr again, which can take a while for big folders.</p>',
+        '<p class="small muted">The list is the same for every account. Saving a changed list makes every folder compare itself with its account again, which can take a while for big folders.</p>',
       buttons: [
         { label: "Use the standard list", left: true, close: false, action: (m) => { $("#ig-text", m.el).value = S.default_ignores.join("\n"); return false; } },
         { label: "Cancel" },
@@ -1411,29 +1859,40 @@
   });
 
   $("#ad-defaults").addEventListener("click", async () => {
-    const ok = await confirmDialog("Restore the advanced defaults?", "Everything on this screen goes back to how it started. Your account, folders and the basic settings are not touched.", "Restore defaults");
+    const ok = await confirmDialog("Restore the general defaults?", "Everything on this screen goes back to how it started, except Start with Windows and the right-click menu. Your accounts, their folders and their own settings are not touched.", "Restore defaults");
     if (!ok) return;
     await run("restore_defaults");
-    const fresh = await invoke("get_state").catch(() => null);
-    if (fresh) S = fresh;
+    await refresh();
     syncControls(true);
   });
 
   // ----- setup wizard -------------------------------------------------------
+  //
+  // Sets up one account: pick the service, sign in, choose features and
+  // folders, check, go. It runs when SyncHopper has no account yet, and
+  // again for every account added later (then the service was already
+  // picked on the Add cloud provider screen, and Back from signing in
+  // leaves setup).
 
-  const STEPS = ["Connect", "Features", "Folders", "Review"];
+  const STEPS = ["Service", "Sign in", "Features", "Folders", "Review"];
 
-  async function startWizard(rerun) {
+  // `providerId` is the service picked on the Add cloud provider screen, or
+  // null to start by picking one.
+  function startWizard(providerId) {
     wiz = {
-      rerun: rerun,
-      step: 0,
+      first: readyAccounts().length === 0, // the very first account
+      picked: !!providerId, // the service was picked before setup opened
+      provider: providerId || null,
+      account: null, // the account's id once it has signed in
+      step: providerId ? 1 : 0,
       email: "",
       password: "",
+      apiKey: "",
       testing: false,
       result: null, // { ok, text }
-      sync: S.settings.feature_sync,
-      drive: S.settings.feature_drive && S.windows,
-      auto: S.settings.autostart,
+      sync: true,
+      drive: false,
+      auto: RAW.general.autostart,
       base: "",
       folders: null,
       foldersError: "",
@@ -1443,18 +1902,25 @@
       busy: false,
       error: "",
     };
-    S.pairs.forEach((p) => {
-      wiz.chosen[p.remote] = true;
-    });
+    compose();
     go("wizard");
     renderWizard();
-    wiz.base = (await invoke("default_base_folder").catch(() => "")) || "";
-    if (view === "wizard" && wiz.step === 2) renderWizard();
+  }
+
+  // Leaves setup without finishing: the account that was being set up, if
+  // it got as far as signing in, is taken out again.
+  async function leaveWizard() {
+    const acct = wiz ? wiz.account : null;
+    run("cancel_sign_in");
+    wiz = null;
+    if (acct) await run("remove_account", { account: acct });
+    await refresh();
+    go(readyAccounts().length ? "add" : "loading");
+    if (!readyAccounts().length) startWizard(null);
   }
 
   function connected() {
-    // A saved email means a working connection was saved with it.
-    return !!S.account.email;
+    return !!(wiz.account && wiz.result && wiz.result.ok);
   }
 
   function wizEngineLine() {
@@ -1475,11 +1941,12 @@
       setText($("#wz-engine-text"), wizEngineLine());
       $("#wz-engine-retry").hidden = !engineStuck();
     }
+    showResult();
   }
 
   function renderSteps() {
     $("#wiz-steps").innerHTML = STEPS.map((name, i) => {
-      const skipped = i === 2 && !wiz.sync && wiz.step !== 2;
+      const skipped = i === 3 && !wiz.sync && wiz.step !== 3;
       const cls = i === wiz.step ? "current" : i < wiz.step ? "done" : "";
       return '<li class="' + cls + (skipped ? " skipped" : "") + '"' + (i === wiz.step ? ' aria-current="step"' : "") + '><span class="num">' + (i < wiz.step && !skipped ? icon("ok", 20) : i + 1) + "</span>" + name + "</li>";
     }).join("");
@@ -1490,54 +1957,81 @@
     const page = $("#wiz-page");
     const back = $("#wiz-back");
     const next = $("#wiz-next");
-    back.textContent = wiz.step === 0 && wiz.rerun ? "Cancel" : "Back";
-    back.disabled = wiz.step === 0 && !wiz.rerun;
-    next.textContent = wiz.step === 3 ? (wiz.rerun ? "Save changes" : "Start syncing") : "Next";
+    const p = providerOf(wiz.provider);
+    const c = esc(C());
+    // Back from the first screen leaves setup, when there is somewhere to go.
+    const firstScreen = wiz.step === (wiz.picked ? 1 : 0);
+    back.textContent = firstScreen && !wiz.first ? "Cancel" : "Back";
+    back.disabled = firstScreen && wiz.first;
+    next.textContent = wiz.step === 4 ? "Start syncing" : "Next";
     next.disabled = wiz.busy;
+    next.hidden = wiz.step === 0;
     setText($("#wiz-footer-note"), wiz.error || "");
     $("#wiz-footer-note").className = "small " + (wiz.error ? "err" : "muted");
 
     if (wiz.step === 0) {
-      const keep = !!S.account.email;
       page.innerHTML =
-        "<header><h1>Connect your Koofr account</h1><p class=\"muted\">Koofr gives other apps their own password, so your normal password is never used here.</p></header>" +
-        (S.test_mode ? banner("info", "Test mode: this build uses a folder on this PC in place of Koofr. Any email works and the password is ignored.") : "") +
-        (keep ? "<p>" + statusLine("ok", "ok", "Connected as " + S.account.email) + "</p><p class=\"small muted\">Leave the boxes empty to keep this account, or fill them in to switch to another one.</p>" : "") +
-        '<div class="field"><label for="wz-email">Koofr email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(wiz.email) + '"></div>' +
-        '<div class="field"><label for="wz-pass">App password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(wiz.password) + '">' +
-        '<p class="small muted">No app password yet? <button type="button" class="link" id="wz-koofr">Open Koofr\'s app password page</button>, create one, and paste it here.</p></div>' +
-        '<div class="row gap12"><button type="button" class="btn" id="wz-test">Test connection</button><span id="wz-result" class="grow" role="status"></span></div>' +
+        "<header><h1>Choose your cloud provider</h1><p class=\"muted\">" +
+        (wiz.first ? "Pick the service your files are with. You can add more accounts later, with the same service or another." : "Pick the service for the new account.") +
+        "</p></header>" +
+        '<ul class="panel rows pick" id="wz-providers">' + providerRows() + "</ul>" +
+        '<p id="wz-engine" class="tiny muted" role="status"><span id="wz-engine-text"></span><button type="button" class="link" id="wz-engine-retry" hidden>Try again</button></p>';
+      onProviderPick($("#wz-providers"), (id) => {
+        wiz.provider = id;
+        wiz.step = 1;
+        wiz.error = "";
+        compose();
+        renderWizard();
+      });
+      $("#wz-engine-retry").addEventListener("click", () => run("retry_engine"));
+      wizardTick();
+    } else if (wiz.step === 1) {
+      const browser = p.sign_in === "browser";
+      const lead =
+        p.sign_in === "password"
+          ? c + " gives other apps their own password, so your normal password is never used here."
+          : p.sign_in === "api_key"
+            ? c + " needs your email, your password and an API key. They are checked with " + c + " and saved on this PC only."
+            : "";
+      page.innerHTML =
+        "<header><h1>Connect your " + c + " account</h1>" + (lead ? '<p class="muted">' + lead + "</p>" : "") + "</header>" +
+        (S.test_mode ? banner("info", "Test mode: this build uses a folder on this PC in place of " + c + ". Any sign-in works.") : "") +
+        signInFields(p, wiz) +
+        '<div class="row gap12"><button type="button" class="btn" id="wz-test">' + (browser ? "Sign in to " + c : "Test connection") + '</button><span id="wz-result" class="grow" role="status"></span></div>' +
         '<p id="wz-engine" class="tiny muted" role="status"><span id="wz-engine-text"></span><button type="button" class="link" id="wz-engine-retry" hidden>Try again</button></p>' +
-        '<p class="tiny muted">The app password is saved on this PC only, scrambled the way rclone stores it. You can cancel it any time on the same Koofr page.</p>';
-      $("#wz-email").addEventListener("input", (e) => {
-        wiz.email = e.target.value;
+        '<p class="tiny muted">' +
+        (browser ? "What " + c + " gives SyncHopper to sign in with" : "The sign-in") +
+        " is saved on this PC only, " + (RAW.lock_signins ? "locked so that only your Windows account can read it." : "scrambled the way rclone stores it.") +
+        (p.sign_in === "password" ? " You can cancel the app password any time on the same " + c + " page." : "") +
+        "</p>";
+      const typed = (key) => (e) => {
+        wiz[key] = e.target.value;
         wiz.result = null;
         showResult();
-      });
-      $("#wz-pass").addEventListener("input", (e) => {
-        wiz.password = e.target.value;
-        wiz.result = null;
-        showResult();
-      });
-      $("#wz-pass").addEventListener("keydown", (e) => {
-        if (e.key === "Enter") testConnection();
-      });
-      $("#wz-koofr").addEventListener("click", () => run("open_target", { kind: "koofr_password_page" }));
+      };
+      if ($("#wz-email")) $("#wz-email").addEventListener("input", typed("email"));
+      if ($("#wz-pass")) $("#wz-pass").addEventListener("input", typed("password"));
+      if ($("#wz-key")) $("#wz-key").addEventListener("input", typed("apiKey"));
+      const last = $("#wz-key") || $("#wz-pass");
+      if (last)
+        last.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") testConnection();
+        });
       $("#wz-test").addEventListener("click", testConnection);
       $("#wz-engine-retry").addEventListener("click", () => run("retry_engine"));
       showResult();
       wizardTick();
-    } else if (wiz.step === 1) {
+    } else if (wiz.step === 2) {
       page.innerHTML =
-        "<header><h1>Choose what to turn on</h1><p class=\"muted\">Every one of these can be changed later in Settings.</p></header>" +
+        "<header><h1>Choose what to turn on</h1><p class=\"muted\">Every one of these can be changed later in settings.</p></header>" +
         '<div class="panel">' +
-        '<div class="check"><input id="wz-sync" type="checkbox"' + (wiz.sync ? " checked" : "") + '><label for="wz-sync"><span>Synced folders</span><span class="small muted">Keep chosen Koofr folders on this PC. Changes on either side are copied to the other.</span></label></div>' +
-        '<div class="check"><input id="wz-drive" type="checkbox"' + (wiz.drive ? " checked" : "") + (S.windows ? "" : " disabled") + '><label for="wz-drive"><span>Koofr drive</span><span class="small muted">' +
+        '<div class="check"><input id="wz-sync" type="checkbox"' + (wiz.sync ? " checked" : "") + '><label for="wz-sync"><span>Synced folders</span><span class="small muted">Keep chosen ' + c + " folders on this PC. Changes on either side are copied to the other.</span></label></div>" +
+        '<div class="check"><input id="wz-drive" type="checkbox"' + (wiz.drive ? " checked" : "") + (S.windows ? "" : " disabled") + '><label for="wz-drive"><span>' + c + ' drive</span><span class="small muted">' +
         (S.windows ? "Browse your whole account as a drive letter without keeping the files on this PC. Installs a small driver called WinFsp, and Windows asks for permission." : "Browse your whole account as a drive letter. Only available on Windows.") +
         "</span></label></div>" +
-        '<div class="check"><input id="wz-auto" type="checkbox"' + (wiz.auto ? " checked" : "") + '><label for="wz-auto"><span>Start with Windows</span><span class="small muted">Open quietly in the tray when you sign in, so syncing is always on.</span></label></div>' +
+        (wiz.first ? '<div class="check"><input id="wz-auto" type="checkbox"' + (wiz.auto ? " checked" : "") + '><label for="wz-auto"><span>Start with Windows</span><span class="small muted">Open quietly in the tray when you sign in, so syncing is always on.</span></label></div>' : "") +
         "</div>" +
-        '<p class="small muted">Upload is always there: a button in the main window for sending files straight to Koofr without keeping them in sync.</p>';
+        '<p class="small muted">Upload is always there: a button in the main window for sending files straight to ' + c + " without keeping them in sync.</p>";
       $("#wz-sync").addEventListener("change", (e) => {
         wiz.sync = e.target.checked;
         renderSteps();
@@ -1545,14 +2039,15 @@
       $("#wz-drive").addEventListener("change", (e) => {
         wiz.drive = e.target.checked;
       });
-      $("#wz-auto").addEventListener("change", (e) => {
-        wiz.auto = e.target.checked;
-      });
-    } else if (wiz.step === 2) {
+      if ($("#wz-auto"))
+        $("#wz-auto").addEventListener("change", (e) => {
+          wiz.auto = e.target.checked;
+        });
+    } else if (wiz.step === 3) {
       let listHtml;
-      if (wiz.loading) listHtml = '<p class="small muted list-note">Loading your Koofr folders</p>';
+      if (wiz.loading) listHtml = '<p class="small muted list-note">Loading your ' + c + " folders</p>";
       else if (wiz.foldersError) listHtml = '<p class="err list-note">' + esc(wiz.foldersError) + ' <button type="button" class="link" id="wz-reload">Try again</button></p>';
-      else if (wiz.folders && !wiz.folders.length) listHtml = '<p class="small muted list-note">Your Koofr account has no folders yet. You can add some later with Add folder.</p>';
+      else if (wiz.folders && !wiz.folders.length) listHtml = '<p class="small muted list-note">Your ' + c + " account has no folders yet. You can add some later with Add folder.</p>";
       else
         listHtml =
           '<ul class="list">' +
@@ -1568,7 +2063,7 @@
       page.innerHTML =
         "<header><h1>Pick folders to keep on this PC</h1><p class=\"muted\">Ticked folders are copied to this PC and stay in sync. Everything else stays online only.</p></header>" +
         '<div class="field"><label for="wz-base">Where to keep them</label><div class="row gap8"><input id="wz-base" type="text" class="grow" autocomplete="off" spellcheck="false" value="' + esc(wiz.base) + '"><button type="button" class="btn" id="wz-browse">Browse</button></div></div>' +
-        '<div role="group" aria-label="Koofr folders" class="box">' + listHtml + "</div>" +
+        '<div role="group" aria-label="' + c + ' folders" class="box">' + listHtml + "</div>" +
         '<p class="small muted" role="status">' +
         (wiz.folders ? plural(names.length, "folder") + " will be kept on this PC. " + plural(others, "folder stays", "folders stay") + " online only. You can add more later, including a single folder from deeper inside your account." : "") +
         "</p>";
@@ -1598,8 +2093,8 @@
     } else {
       const feats = [];
       if (wiz.sync) feats.push("Synced folders");
-      if (wiz.drive) feats.push("Koofr drive");
-      if (wiz.auto) feats.push("Start with Windows");
+      if (wiz.drive) feats.push(C() + " drive");
+      if (wiz.first && wiz.auto) feats.push("Start with Windows");
       const plan = wizardPlan();
       let planHtml = "";
       if (wiz.sync) {
@@ -1608,11 +2103,9 @@
           const pv = wiz.previews[name];
           let what = "Counting files";
           if (pv && pv.error) what = "Could not count the files";
-          else if (pv && pv.data) what = "Koofr has " + plural(pv.data.remote_count, "file") + " (" + fmtBytes(pv.data.remote_bytes) + "), this PC has " + num(pv.data.local_count);
+          else if (pv && pv.data) what = C() + " has " + plural(pv.data.remote_count, "file") + " (" + fmtBytes(pv.data.remote_bytes) + "), this PC has " + num(pv.data.local_count);
           rows.push("<li><span class=\"strong\">" + esc(name) + '</span><span class="what">' + esc(what) + "</span></li>");
         });
-        plan.keep.forEach((name) => rows.push("<li><span class=\"strong\">" + esc(name) + '</span><span class="what">Already syncing, stays as it is</span></li>'));
-        plan.drop.forEach((name) => rows.push("<li><span class=\"strong\">" + esc(name) + '</span><span class="what">Stops syncing. Files stay on this PC and in Koofr.</span></li>'));
         planHtml =
           "<h2>What the first sync will do</h2>" +
           (rows.length ? '<ul class="panel plan">' + rows.join("") + "</ul>" : '<p class="small muted">No folders were picked, so nothing is copied yet. Use Add folder in the main window when you are ready.</p>') +
@@ -1620,27 +2113,20 @@
           spaceWarning(plan);
       }
       page.innerHTML =
-        "<header><h1>Check before the first sync</h1><p class=\"muted\">Nothing is copied or changed until you press " + (wiz.rerun ? "Save changes" : "Start syncing") + ".</p></header>" +
-        '<dl class="summary"><dt>Account</dt><dd>' + esc(S.account.email) + "</dd><dt>Features</dt><dd>" + esc(feats.join(", ") || "Upload to Koofr only") + "</dd>" +
+        "<header><h1>Check before the first sync</h1><p class=\"muted\">Nothing is copied or changed until you press Start syncing.</p></header>" +
+        '<dl class="summary"><dt>Account</dt><dd>' + esc([C(), S.account.email].filter(Boolean).join(", ")) + "</dd><dt>Features</dt><dd>" + esc(feats.join(", ") || "Upload to " + C() + " only") + "</dd>" +
         (wiz.sync ? "<dt>Kept in</dt><dd>" + esc(wiz.base) + "</dd>" : "") +
         "</dl>" +
         planHtml +
-        (wiz.drive && S.drive.state !== "connected" ? '<p class="small muted">The Koofr drive needs the WinFsp driver. If it is not installed yet, Windows asks for permission to install it right after this step.</p>' : "") +
-        "<p>" + statusLine("ok", "ok", "No files will be deleted on this PC or in Koofr.") + "</p>";
+        (wiz.drive && S.drive.state !== "connected" ? '<p class="small muted">The ' + c + " drive needs the WinFsp driver. If it is not installed yet, Windows asks for permission to install it right after this step.</p>" : "") +
+        "<p>" + statusLine("ok", "ok", "No files will be deleted on this PC or in " + C() + ".") + "</p>";
     }
   }
 
+  // A new account has no synced folders yet, so everything ticked is added.
   function wizardPlan() {
-    const existing = {};
-    S.pairs.forEach((p) => {
-      existing[p.remote] = true;
-    });
     const listed = wiz.folders || [];
-    return {
-      add: listed.filter((n) => wiz.chosen[n] && !existing[n]),
-      keep: listed.filter((n) => wiz.chosen[n] && existing[n]),
-      drop: listed.filter((n) => !wiz.chosen[n] && existing[n]),
-    };
+    return { add: listed.filter((n) => wiz.chosen[n]) };
   }
 
   function spaceWarning(plan) {
@@ -1654,21 +2140,29 @@
       }
     });
     if (free != null && need > free) {
-      return banner("warn", "These folders hold " + fmtBytes(need) + " in Koofr, but this drive only has " + fmtBytes(free) + " free. Go back and untick some, or pick a drive with more room.");
+      return banner("warn", "These folders hold " + fmtBytes(need) + " in " + esc(C()) + ", but this drive only has " + fmtBytes(free) + " free. Go back and untick some, or pick a drive with more room.");
     }
     return "";
   }
 
   function showResult() {
     const el = $("#wz-result");
-    if (!el) return;
-    if (wiz.testing) el.innerHTML = statusLine("busy", "sync", "Checking with Koofr");
-    else if (wiz.result) el.innerHTML = statusLine(wiz.result.ok ? "ok" : "warn", wiz.result.ok ? "ok" : "warn", wiz.result.text);
-    else el.innerHTML = "";
+    if (!el || !wiz) return;
+    const browser = providerOf(wiz.provider).sign_in === "browser";
+    let html = "";
+    if (wiz.testing && browser) {
+      // The account that is waiting on its sign-in page carries the link.
+      const waiting = (RAW.accounts || []).find((a) => a.signing_in);
+      html = browserWaitHtml(waiting && waiting.signing_in ? waiting.signing_in.link : null);
+    } else if (wiz.testing) html = statusLine("busy", "sync", "Checking with " + C());
+    else if (wiz.result) html = statusLine(wiz.result.ok ? "ok" : "warn", wiz.result.ok ? "ok" : "warn", wiz.result.text);
+    setHtml(el, html);
     const btn = $("#wz-test");
     if (btn) btn.disabled = wiz.testing;
   }
 
+  // Signs in with what is on the screen. On success the account exists and
+  // the rest of setup works on it.
   async function testConnection() {
     if (wiz.testing) return false;
     if (S.engine.state !== "ready") {
@@ -1676,21 +2170,31 @@
       showResult();
       return false;
     }
+    const mine = wiz;
     wiz.testing = true;
     wiz.result = null;
     showResult();
     try {
-      const about = await invoke("connect", { email: wiz.email, password: wiz.password });
+      const done = await invoke("add_account", { provider: wiz.provider, signin: { email: wiz.email, password: wiz.password, api_key: wiz.apiKey } });
+      if (wiz !== mine) {
+        // Setup was left while this was under way.
+        run("remove_account", { account: done.account });
+        return false;
+      }
+      wiz.account = done.account;
       let text = "Connected.";
-      if (about.used != null && about.total != null) text += " " + fmtBytes(about.used) + " of " + fmtBytes(about.total) + " used.";
+      if (done.about.used != null && done.about.total != null) text += " " + fmtBytes(done.about.used) + " of " + fmtBytes(done.about.total) + " used.";
       wiz.result = { ok: true, text: text };
       wiz.folders = null; // a different account may have different folders
+      wiz.base = "";
     } catch (e) {
+      if (wiz !== mine) return false;
+      wiz.account = null;
       wiz.result = { ok: false, text: String(e) };
     }
     wiz.testing = false;
-    const fresh = await invoke("get_state").catch(() => null);
-    if (fresh) S = fresh;
+    await refresh();
+    if (wiz !== mine) return false;
     showResult();
     return wiz.result.ok;
   }
@@ -1703,10 +2207,10 @@
       wiz.folders = await invoke("list_remote", { path: "" });
     } catch (e) {
       wiz.folders = null;
-      wiz.foldersError = "Could not list your Koofr folders. " + e;
+      wiz.foldersError = "Could not list your " + C() + " folders. " + e;
     }
     wiz.loading = false;
-    if (view === "wizard" && wiz.step === 2) renderWizard();
+    if (view === "wizard" && wiz.step === 3) renderWizard();
   }
 
   function loadWizardPreviews() {
@@ -1720,18 +2224,32 @@
       } catch (e) {
         mine.previews[name] = { error: String(e) };
       }
-      if (wiz === mine && view === "wizard" && wiz.step === 3) renderWizard();
+      if (wiz === mine && view === "wizard" && wiz.step === 4) renderWizard();
     });
   }
 
-  $("#wiz-back").addEventListener("click", () => {
+  $("#wiz-back").addEventListener("click", async () => {
     if (!wiz || wiz.busy) return;
     wiz.error = "";
-    if (wiz.step === 0) {
-      if (wiz.rerun) go("settings");
+    if (wiz.step === (wiz.picked ? 1 : 0)) {
+      if (!wiz.first) leaveWizard();
       return;
     }
-    wiz.step -= wiz.step === 3 && !wiz.sync ? 2 : 1;
+    if (wiz.step === 1) {
+      // Back to picking the service: a sign-in made so far is dropped.
+      run("cancel_sign_in");
+      const acct = wiz.account;
+      wiz.account = null;
+      wiz.result = null;
+      wiz.testing = false;
+      wiz.provider = null;
+      wiz.step = 0;
+      if (acct) await run("remove_account", { account: acct });
+      compose();
+      renderWizard();
+      return;
+    }
+    wiz.step -= wiz.step === 4 && !wiz.sync ? 2 : 1;
     renderWizard();
   });
 
@@ -1739,11 +2257,13 @@
     if (!wiz || wiz.busy) return;
     wiz.error = "";
     if (wiz.step === 0) {
-      const typed = wiz.password.trim() !== "" || wiz.email.trim() !== "";
-      if (typed && !(wiz.result && wiz.result.ok)) {
+      return;
+    } else if (wiz.step === 1) {
+      if (!connected()) {
         wiz.busy = true;
         $("#wiz-next").disabled = true;
         const ok = await testConnection();
+        if (!wiz) return;
         wiz.busy = false;
         $("#wiz-next").disabled = false;
         if (!ok) return;
@@ -1753,27 +2273,25 @@
         renderWizard();
         return;
       }
-      if (!connected()) {
-        wiz.error = "Enter your Koofr email and app password, then test the connection.";
-        renderWizard();
-        return;
-      }
-      wiz.step = 1;
-    } else if (wiz.step === 1) {
-      wiz.step = wiz.sync ? 2 : 3;
-      if (wiz.sync && !wiz.folders && !wiz.loading) {
-        renderWizard();
-        loadWizardFolders();
-        return;
-      }
+      wiz.step = 2;
     } else if (wiz.step === 2) {
+      wiz.step = wiz.sync ? 3 : 4;
+      if (wiz.sync) {
+        if (!wiz.base) wiz.base = (await invoke("default_base_folder").catch(() => "")) || "";
+        if (!wiz.folders && !wiz.loading) {
+          renderWizard();
+          loadWizardFolders();
+          return;
+        }
+      }
+    } else if (wiz.step === 3) {
       const any = (wiz.folders || []).some((n) => wiz.chosen[n]);
       if (any && !wiz.base.trim()) {
         wiz.error = "Pick where to keep the folders on this PC.";
         renderWizard();
         return;
       }
-      wiz.step = 3;
+      wiz.step = 4;
       wiz.previews = {};
       loadWizardPreviews();
     } else {
@@ -1785,15 +2303,15 @@
           choices: {
             feature_sync: wiz.sync,
             feature_drive: wiz.drive,
-            autostart: wiz.auto,
+            autostart: wiz.first ? wiz.auto : RAW.general.autostart,
             base_folder: wiz.base.trim(),
             folders: listed.filter((n) => wiz.chosen[n]),
             listed: listed,
           },
         });
-        const fresh = await invoke("get_state").catch(() => null);
-        if (fresh) S = fresh;
+        cur = wiz.account;
         wiz = null;
+        await refresh();
         go("main");
         if (notes && notes.length) toast(notes.join(" "), 12000);
         return;
@@ -1805,6 +2323,7 @@
     renderWizard();
   });
 
+
   // ----- wiring up ----------------------------------------------------------
 
   // Buttons in index.html name their icon with data-icon. Draw it in.
@@ -1814,7 +2333,7 @@
 
   T.event.listen("state", (e) => onState(e.payload));
   T.event.listen("navigate", (e) => {
-    if (S && S.setup_complete && VIEWS.includes(e.payload)) go(e.payload);
+    if (S && S.setup_complete && view !== "wizard" && VIEWS.includes(e.payload)) go(e.payload);
   });
   T.event.listen("files-dropped", (e) => {
     $("#drop-zone").classList.remove("over");

@@ -1,4 +1,4 @@
-//! The optional Koofr drive: the whole account shown as a drive letter.
+//! The optional network drive: a whole account shown as a drive letter.
 //! Files there stay online and are fetched when opened.
 
 use crate::core::Core;
@@ -42,7 +42,9 @@ impl Drive {
     pub fn view(&self) -> DriveView {
         let s = self.core.settings();
         let inner = self.inner.lock().unwrap();
-        let mut letters = platform::free_letters();
+        // A letter another account's drive is set to isn't offered here.
+        let taken = self.core.other_letters();
+        let mut letters: Vec<String> = platform::free_letters().into_iter().filter(|l| !taken.contains(l)).collect();
         if !letters.contains(&s.drive_letter) {
             letters.push(s.drive_letter.clone());
             letters.sort();
@@ -95,7 +97,7 @@ impl Drive {
             return self.stop();
         }
         if !cfg!(windows) {
-            return self.set("error", "The Koofr drive is only available on Windows.");
+            return self.set("error", "The network drive is only available on Windows.");
         }
         {
             let inner = self.inner.lock().unwrap();
@@ -115,8 +117,11 @@ impl Drive {
             return self.set("needs_driver", "");
         }
         let letter = s.drive_letter.clone();
+        if let Some(other) = self.core.shared.accounts().into_iter().find(|a| a.id != self.core.account && a.feature_drive && a.drive_letter == letter) {
+            return self.set("error", &format!("Drive letter {letter}: is set for {} too. Pick another letter in this account's settings.", other.name));
+        }
         if platform::letter_in_use(&letter) {
-            return self.set("error", &format!("Drive letter {letter}: is already in use. Pick another letter in Settings."));
+            return self.set("error", &format!("Drive letter {letter}: is already in use. Pick another letter in this account's settings."));
         }
         let cancel = Cancel::default();
         let generation = {
@@ -143,7 +148,7 @@ impl Drive {
             "--dir-cache-time".into(),
             "1m".into(),
             "--volname".into(),
-            "Koofr".into(),
+            self.core.label(),
             "--use-json-log".into(),
             "--log-level".into(),
             "NOTICE".into(),
@@ -199,7 +204,7 @@ impl Drive {
                     .or_else(|| res.errors.last().map(|l| l.msg.clone()))
                     .unwrap_or_else(|| format!("The drive stopped (code {}).", res.exit));
                 inner.state = "error".into();
-                inner.message = friendly_error(&raw);
+                inner.message = friendly_error(me.core.provider, &raw);
                 me.core.log(&format!("[drive] Stopped: {raw}"));
             }
             drop(inner);
