@@ -1,7 +1,7 @@
 {
   "name": "synchopper",
   "private": true,
-  "version": "0.4.91",
+  "version": "0.4.92",
   "description": "Two-way sync for cloud storage, built on rclone",
   "scripts": {
     "tauri": "tauri",

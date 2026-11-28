@@ -274,7 +274,7 @@ async fn refresh_explorer() {
 /// `target`, or removes it when `target` is None. `slot` says which of
 /// SyncHopper's entries it is. Uses the registry steps Microsoft documents
 /// for cloud storage providers, for the current user only.
-pub async fn set_sidebar(slot: usize, name: &str, target: Option<&Path>, exe: &Path) -> Result<(), String> {
+pub async fn set_sidebar(slot: usize, name: &str, target: Option<&Path>, icon: &str) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
@@ -287,7 +287,6 @@ pub async fn set_sidebar(slot: usize, name: &str, target: Option<&Path>, exe: &P
     match target {
         Some(folder) => {
             let folder = folder.to_string_lossy().to_string();
-            let icon = format!("{},0", exe.to_string_lossy());
             let icon_key = format!(r"{clsid_key}\DefaultIcon");
             let server_key = format!(r"{clsid_key}\InProcServer32");
             let instance_key = format!(r"{clsid_key}\Instance");
@@ -295,7 +294,7 @@ pub async fn set_sidebar(slot: usize, name: &str, target: Option<&Path>, exe: &P
             let folder_key = format!(r"{clsid_key}\ShellFolder");
             let steps: Vec<Vec<&str>> = vec![
                 vec!["add", &clsid_key, "/ve", "/t", "REG_SZ", "/d", name, "/f"],
-                vec!["add", &icon_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", &icon, "/f"],
+                vec!["add", &icon_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", icon, "/f"],
                 vec!["add", &clsid_key, "/v", "System.IsPinnedToNameSpaceTree", "/t", "REG_DWORD", "/d", "0x1", "/f"],
                 vec!["add", &clsid_key, "/v", "SortOrderIndex", "/t", "REG_DWORD", "/d", "0x42", "/f"],
                 vec!["add", &server_key, "/ve", "/t", "REG_EXPAND_SZ", "/d", r"%SystemRoot%\system32\shell32.dll", "/f"],

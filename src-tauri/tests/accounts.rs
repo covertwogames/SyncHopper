@@ -12,7 +12,9 @@ use synchopper_lib::app::{App, Commons, Hub, SetupChoices, SignIn};
 use synchopper_lib::config;
 use synchopper_lib::core::Shared;
 use synchopper_lib::engine::Phase;
+use synchopper_lib::colors;
 use synchopper_lib::filen;
+use synchopper_lib::providers;
 use synchopper_lib::rclone;
 
 /// The whole app with plain folders standing in for the cloud accounts. The
@@ -235,7 +237,7 @@ async fn two_accounts_sync_side_by_side_and_keep_to_their_own_folders() {
     assert_eq!(list[1]["cloud"], "pCloud");
     assert_eq!(list[1]["pairs"].as_array().unwrap().len(), 2);
     assert_eq!(list[2]["setup_complete"], false);
-    assert_eq!(snap["providers"].as_array().unwrap().len(), 3);
+    assert_eq!(snap["providers"].as_array().unwrap().len(), 4);
     assert_eq!(rig.hub.status_line(), "SyncHopper: up to date");
     let report = rig.hub.diagnostics();
     assert!(report.contains("Accounts: 3") && report.contains("Account: pCloud") && !report.contains("tester@example.com"), "{report}");
@@ -476,7 +478,7 @@ async fn a_real_sign_in_that_fails_saves_nothing_for_any_service() {
     // Nothing listens there, so Filen can't be reached.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     hub.commons.set_filen_gateway(&format!("http://{closed}"));
-    let filen = |email: &str, password: &str, code: &str| SignIn { email: email.into(), password: password.into(), code: code.into() };
+    let filen = |email: &str, password: &str, code: &str| SignIn { email: email.into(), password: password.into(), code: code.into(), ..Default::default() };
     let err = hub.add_account("filen", filen("", "x", "")).await.unwrap_err();
     assert!(err.contains("email address you use for Filen"), "{err}");
     let err = hub.add_account("filen", filen("a@b.c", "", "")).await.unwrap_err();
@@ -489,7 +491,9 @@ async fn a_real_sign_in_that_fails_saves_nothing_for_any_service() {
     assert!(hub.shared.accounts().is_empty(), "a failed sign-in leaves no account behind");
     assert!(hub.apps().is_empty());
     let data = dir.path().join("data");
-    assert!(!data.join("rclone.conf").exists() && !data.join("signin.key").exists());
+    // The key for the saved sign-ins may be there already: it is made before
+    // a sign-in is tried, so that even the try is locked. It opens nothing.
+    assert!(!data.join("rclone.conf").exists());
     let left: Vec<String> = names(&data).into_iter().filter(|n| n.starts_with("signin-")).collect();
     assert!(left.is_empty(), "{left:?}");
     let log = std::fs::read_to_string(hub.shared.log_path()).unwrap_or_default();
@@ -633,7 +637,7 @@ async fn a_filen_account_keeps_its_keys_and_never_its_password() {
     let a = fake.account("v3-2fa");
     let s = |k: &str| a[k].as_str().unwrap().to_string();
     let (email, password, code) = (s("email"), s("password"), s("two_factor"));
-    let signin = |code: &str| SignIn { email: email.clone(), password: password.clone(), code: code.into() };
+    let signin = |code: &str| SignIn { email: email.clone(), password: password.clone(), code: code.into(), ..Default::default() };
 
     // Filen asks for the code first, then turns down a wrong one. Neither
     // keeps anything.
@@ -685,7 +689,7 @@ async fn a_filen_account_keeps_its_keys_and_never_its_password() {
 
     // Reconnecting: a wrong password leaves the saved sign-in as it was;
     // the right one replaces it.
-    let err = rig.hub.reconnect(&id, SignIn { email: email.clone(), password: "wrong".into(), code: code.clone() }).await.unwrap_err();
+    let err = rig.hub.reconnect(&id, SignIn { email: email.clone(), password: "wrong".into(), code: code.clone(), ..Default::default() }).await.unwrap_err();
     assert_eq!(err, "Filen did not accept the sign-in. Filen says: Invalid email or password.");
     assert_eq!(rclone::section(&rc.signins().await.unwrap(), &remote).as_deref(), Some(body.as_str()));
     rig.hub.reconnect(&id, signin(&code)).await.unwrap();
@@ -787,7 +791,7 @@ async fn a_filen_sign_in_the_engine_cant_use_keeps_nothing() {
     hub.commons.set_filen_gateway(&fake.url);
     let a = fake.account("v2");
     let s = |k: &str| a[k].as_str().unwrap().to_string();
-    let err = hub.add_account("filen", SignIn { email: s("email"), password: s("password"), code: String::new() }).await.unwrap_err();
+    let err = hub.add_account("filen", SignIn { email: s("email"), password: s("password"), ..Default::default() }).await.unwrap_err();
     assert!(err.starts_with("Could not reach Filen") || err.starts_with("Signed in to Filen, but the sync engine could not open the account"), "{err}");
     assert!(fake.requests().iter().any(|r| r.path == "/v3/user/baseFolder"), "the sign-in itself went through");
     assert!(hub.shared.accounts().is_empty(), "no account is kept");
@@ -798,4 +802,312 @@ async fn a_filen_sign_in_the_engine_cant_use_keeps_nothing() {
         let t = String::from_utf8_lossy(&std::fs::read(&f).unwrap()).to_string();
         assert!(!t.contains(&s("password")) && !t.contains(&s("derived_key")), "{}", f.display());
     }
+}
+
+// ----- sign-ins are never on the disk unlocked ------------------------------
+
+/// While `work` runs, keeps reading every file under `dir` and returns the
+/// names of any that held one of `secrets` at any moment.
+async fn files_that_ever_held<F: std::future::Future>(dir: &Path, secrets: &[&str], work: F) -> (Vec<String>, F::Output) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, root, wanted) = (stop.clone(), dir.to_path_buf(), secrets.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let watcher = std::thread::spawn(move || {
+        let mut hits = std::collections::BTreeSet::new();
+        let mut rounds = 0u64;
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            for f in all_files(&root) {
+                if let Ok(bytes) = std::fs::read(&f) {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if wanted.iter().any(|w| text.contains(w.as_str())) {
+                        hits.insert(f.file_name().unwrap().to_string_lossy().to_string());
+                    }
+                }
+            }
+            rounds += 1;
+        }
+        (hits.into_iter().collect::<Vec<_>>(), rounds)
+    });
+    let out = work.await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (hits, rounds) = watcher.join().unwrap();
+    assert!(rounds > 20, "the watcher only looked {rounds} times");
+    (hits, out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_locked_file_is_the_engines_own_format_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let text = "[koofr]\ntype = koofr\nuser = a@b.c\npassword = Gr\u{fc}\u{df}e\n\n[shacct1]\ntype = alias\nremote = /tmp\n";
+    // What SyncHopper locks, the engine opens.
+    let ours = dir.path().join("ours.conf");
+    let locked = rclone::lock_text(pass, text).unwrap();
+    assert!(locked.starts_with("# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\n") && !locked.contains("koofr"));
+    assert_ne!(rclone::lock_text(pass, text).unwrap(), locked, "a new random start every time");
+    std::fs::write(&ours, &locked).unwrap();
+    assert!(rclone::config_locked(&ours));
+    let show = |file: &Path, key: &str| {
+        let out = std::process::Command::new("rclone")
+            .args(["--config", &file.to_string_lossy(), "config", "show"])
+            .env("RCLONE_CONFIG_PASS", key)
+            .env("RCLONE_ASK_PASSWORD", "false")
+            .output()
+            .unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let (ok, shown) = show(&ours, pass);
+    assert!(ok, "{shown}");
+    assert_eq!(rclone::section(&shown, "koofr"), rclone::section(text, "koofr"));
+    assert_eq!(rclone::section(&shown, "shacct1"), rclone::section(text, "shacct1"));
+    assert!(!show(&ours, "another-key-entirely-0123456789abcdef").0, "the wrong key opens nothing");
+    assert_eq!(rclone::unlock_text(pass, &locked).as_deref(), Some(text));
+    assert_eq!(rclone::unlock_text("wrong", &locked), None);
+    assert_eq!(rclone::unlock_text(pass, text), None, "a plain file is not a locked one");
+
+    // What the engine locks, SyncHopper opens.
+    let theirs = dir.path().join("theirs.conf");
+    std::fs::write(&theirs, text).unwrap();
+    let mut child = std::process::Command::new("rclone")
+        .args(["--config", &theirs.to_string_lossy(), "config", "encryption", "set"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(format!("{pass}\n{pass}\n").as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
+    let by_engine = std::fs::read_to_string(&theirs).unwrap();
+    assert!(rclone::config_locked(&theirs));
+    let opened = rclone::unlock_text(pass, &by_engine).expect("SyncHopper opens what the engine locked");
+    assert_eq!(rclone::section(&opened, "koofr"), rclone::section(text, "koofr"));
+    assert_eq!(rclone::section(&opened, "shacct1"), rclone::section(text, "shacct1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saving_and_trying_out_a_sign_in_never_puts_it_on_the_disk_unlocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    // Saving, adding to and removing from the saved sign-ins.
+    let commons = real_commons(&data);
+    let (hits, _) = files_that_ever_held(&data, &["SECRET-ONE", "SECRET-TWO", "type = "], async {
+        commons.save_signin("koofr", Some("type = koofr\nuser = a@b.c\npassword = SECRET-ONE")).await.unwrap();
+        commons.save_signin("shacct1", Some("type = pcloud\ntoken = SECRET-TWO")).await.unwrap();
+        commons.save_signin("koofr", None).await.unwrap();
+        commons.save_signin("koofr", Some("type = koofr\nuser = a@b.c\npassword = SECRET-ONE")).await.unwrap();
+    })
+    .await;
+    assert!(hits.is_empty(), "these files held a sign-in unlocked at some moment: {hits:?}");
+    let rc = commons.shared.rclone(Vec::new()).unwrap();
+    let text = rc.signins().await.unwrap();
+    assert!(text.contains("SECRET-ONE") && text.contains("SECRET-TWO"), "and yet both are saved, for the engine to read with the key");
+    assert!(!data.join("rclone.conf.new").exists());
+
+    // A sign-in from 0.4, saved plain, is locked at start. The plain file
+    // itself is what was there; no second plain copy is made of it.
+    let old = dir.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("rclone.conf"), OLD_FILE).unwrap();
+    let commons = real_commons(&old);
+    let (hits, _) = files_that_ever_held(&old, &["DcF7Gw8hf"], commons.secure_signins()).await;
+    assert!(hits.iter().all(|h| h == "rclone.conf"), "{hits:?}");
+    assert!(rclone::config_locked(&old.join("rclone.conf")));
+
+    // A whole sign-in, tried out in its own file first: Filen through the
+    // stand-in, then the engine tries the keys on Filen itself, which takes
+    // a moment and fails from here. The trial file exists all that time.
+    let fake = FakeFilen::start().await;
+    let third = dir.path().join("third");
+    let hub = Hub::new(third.clone(), None, Arc::new(TestHost::default()));
+    hub.shared.set_engine(|e| {
+        e.state = "ready".into();
+        e.exe = Some("rclone".into());
+    });
+    hub.commons.set_filen_gateway(&fake.url);
+    let a = fake.account("v2");
+    let s = |k: &str| a[k].as_str().unwrap().to_string();
+    let expect = &a["expect"];
+    let secrets = [expect["api_key"].as_str().unwrap(), expect["master_keys"][0].as_str().unwrap(), "master_keys = ", "type = filen"];
+    let saw_trial = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, folder) = (saw_trial.clone(), third.clone());
+    let look = std::thread::spawn(move || {
+        for _ in 0..4000 {
+            if names(&folder).iter().any(|n| n.starts_with("signin-") && n.ends_with(".conf")) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+    let (hits, result) = files_that_ever_held(&third, &secrets, hub.add_account("filen", SignIn { email: s("email"), password: s("password"), ..Default::default() })).await;
+    look.join().unwrap();
+    assert!(result.is_err(), "Filen itself can't be reached from here");
+    assert!(saw_trial.load(std::sync::atomic::Ordering::SeqCst), "the trial file was there to be looked at");
+    assert!(hits.is_empty(), "these files held the Filen keys unlocked at some moment: {hits:?}");
+    assert!(third.join("signin.key").is_file(), "the key was made before the sign-in was tried");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_the_engine_writes_itself_stays_locked_too() {
+    // Browser sign-ins (pCloud, kDrive) are written by the engine once the
+    // browser comes back. This runs the same call with a kind of account
+    // that needs no browser.
+    let dir = tempfile::tempdir().unwrap();
+    let pass = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let trial = dir.path().join("signin-x.conf");
+    let probe = rclone::Rclone { exe: "rclone".into(), config: trial.clone(), cache: dir.path().join("cache"), extra: Vec::new(), pass: Some(pass.into()) };
+    probe.write_signins("").unwrap();
+    assert!(rclone::config_locked(&trial));
+    let cancel = synchopper_lib::util::Cancel::default();
+    let target = dir.path().to_string_lossy().to_string();
+    probe.browser_sign_in("shacctx", "alias", &[("remote", &target)], &cancel, |_| {}).await.unwrap();
+    assert!(rclone::config_locked(&trial), "the engine kept the file locked");
+    let raw = std::fs::read_to_string(&trial).unwrap();
+    assert!(!raw.contains("alias") && !raw.contains(&target));
+    let text = probe.signins().await.unwrap();
+    assert_eq!(rclone::section(&text, "shacctx").unwrap(), format!("type = alias\nremote = {target}"));
+}
+
+// ----- kDrive ---------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_engine_starts_a_kdrive_sign_in_without_asking_anything_more() {
+    // As far as it can go without Infomaniak: the engine takes the kDrive's
+    // number, opens its sign-in page on this PC and waits, and that page
+    // sends the browser on to Infomaniak's own sign-in.
+    let dir = tempfile::tempdir().unwrap();
+    let trial = dir.path().join("signin-k.conf");
+    let pass = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let probe = rclone::Rclone { exe: "rclone".into(), config: trial.clone(), cache: dir.path().join("cache"), extra: Vec::new(), pass: Some(pass.into()) };
+    probe.write_signins("").unwrap();
+    let cancel = synchopper_lib::util::Cancel::default();
+    let link = Arc::new(std::sync::Mutex::new(None::<String>));
+    let (seen, stop) = (link.clone(), cancel.clone());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(40),
+        probe.browser_sign_in("shacctk", providers::KDRIVE.kind, &[("drive_id", "654321")], &cancel, move |l| {
+            *seen.lock().unwrap() = Some(l.to_string());
+            // Ask the page where it sends the browser, then give up waiting.
+            let (l, stop) = (l.to_string(), stop.clone());
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+                if let Ok(res) = client.get(&l).send().await {
+                    let to = res.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    *seen.lock().unwrap() = Some(format!("{l} -> {to}"));
+                }
+                stop.cancel();
+            });
+        }),
+    )
+    .await
+    .expect("the engine did not wait on a question");
+    assert_eq!(result, Err(rclone::SIGN_IN_CANCELLED.to_string()));
+    let seen = link.lock().unwrap().clone().expect("the engine gave a sign-in link");
+    let (page, to) = seen.split_once(" -> ").expect("the sign-in page answered");
+    assert!(page.starts_with("http://127.0.0.1:53682/auth?state="), "{page}");
+    assert!(to.starts_with("https://login.infomaniak.com/authorize?") && to.contains("scope=drive") && to.contains("redirect_uri=http%3A%2F%2Flocalhost%3A53682%2F") && to.contains("code_challenge="), "{to}");
+    assert!(rclone::config_locked(&trial), "the trial file is still locked");
+    // The engine notes the kind of account and the kDrive's number before
+    // the browser comes back, and no sign-in. SyncHopper throws this trial
+    // file away unless the sign-in finishes.
+    let noted = probe.signins().await.unwrap();
+    assert_eq!(rclone::section(&noted, "shacctk").as_deref(), Some("type = kdrive\ndrive_id = 654321"), "{noted}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kdrive_account_needs_its_number_and_keeps_it_for_reconnecting() {
+    let rig = HubRig::new();
+    let drive = |d: &str| SignIn { drive: d.into(), ..Default::default() };
+    let err = rig.hub.add_account("kdrive", SignIn::default()).await.unwrap_err();
+    assert_eq!(err, "Paste the address of your kDrive from your browser. It has the kDrive's number in it, after /drive/.");
+    assert_eq!(rig.hub.add_account("kdrive", drive("my drive")).await.unwrap_err(), err);
+    assert!(rig.hub.shared.accounts().is_empty());
+
+    let (id, _) = rig.hub.add_account("kdrive", drive("https://ksuite.infomaniak.com/1234567/kdrive/app/drive/654321/files/5")).await.unwrap();
+    let account = rig.hub.shared.account(&id).unwrap();
+    assert_eq!((account.provider.as_str(), account.name.as_str(), account.kdrive.as_str(), account.drive_letter.as_str()), ("kdrive", "kDrive", "654321", "I"));
+    let app = rig.hub.app(&id).unwrap();
+    assert_eq!(app.snapshot()["kdrive"], "654321");
+    assert_eq!(app.core.cloud(), "kDrive");
+    app.finish_setup(rig.choices("pc/kDrive", &[])).await.unwrap();
+
+    // Reconnecting with the box left as it is keeps the same kDrive; a new
+    // address changes it; nonsense is turned down and changes nothing.
+    rig.hub.reconnect(&id, SignIn::default()).await.unwrap();
+    assert_eq!(rig.hub.shared.account(&id).unwrap().kdrive, "654321");
+    assert_eq!(rig.hub.reconnect(&id, drive("nonsense")).await.unwrap_err(), err);
+    assert_eq!(rig.hub.shared.account(&id).unwrap().kdrive, "654321");
+    rig.hub.reconnect(&id, drive("777")).await.unwrap();
+    assert_eq!(rig.hub.shared.account(&id).unwrap().kdrive, "777");
+    // Other services never ask for one.
+    let (other, _) = rig.hub.add_account("pcloud", SignIn::default()).await.unwrap();
+    assert_eq!(rig.hub.shared.account(&other).unwrap().kdrive, "");
+    let listed: Vec<String> = rig.hub.snapshot()["providers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(listed, vec!["koofr", "pcloud", "filen", "kdrive"]);
+}
+
+// ----- account colors ---------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_get_colors_in_order_and_can_change_them() {
+    let rig = HubRig::new();
+    let koofr = rig.add("koofr", "pc/Koofr", &[]).await;
+    let pcloud = rig.add("pcloud", "pc/pCloud", &[]).await;
+    let filen = rig.add("filen", "pc/Filen", &[]).await;
+    let color = |id: &str| rig.hub.shared.account(id).unwrap().color;
+    assert_eq!((color(koofr.id()), color(pcloud.id()), color(filen.id())), ("teal".to_string(), "blue".to_string(), "orange".to_string()));
+    assert_eq!(pcloud.snapshot()["color"], "blue");
+    let palette: Vec<(String, String)> = rig.hub.snapshot()["colors"].as_array().unwrap().iter().map(|c| (c["id"].as_str().unwrap().to_string(), c["hex"].as_str().unwrap().to_string())).collect();
+    assert_eq!(palette.len(), 8);
+    assert_eq!(palette[0], ("teal".to_string(), "#0b7a75".to_string()));
+    assert_eq!(palette.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(), colors::ALL.iter().map(|c| c.id).collect::<Vec<_>>());
+
+    rig.hub.set_account_color(pcloud.id(), "purple").await.unwrap();
+    assert_eq!(color(pcloud.id()), "purple");
+    let err = rig.hub.set_account_color(pcloud.id(), "mauve").await.unwrap_err();
+    assert_eq!(err, "SyncHopper doesn't have that color.");
+    assert!(rig.hub.set_account_color("nobody", "red").await.is_err());
+    assert_eq!(color(pcloud.id()), "purple");
+    // Two accounts may share a color if that is what is picked.
+    rig.hub.set_account_color(filen.id(), "teal").await.unwrap();
+    assert_eq!(color(filen.id()), "teal");
+    // The next account takes the first color nobody has: blue was given up.
+    let (next, _) = rig.hub.add_account("koofr", SignIn { email: "second@example.com".into(), password: "x".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(color(&next), "blue");
+
+    // Saved, and there after a restart.
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rig.path("data/settings.json")).unwrap()).unwrap();
+    let on_disk: Vec<&str> = saved["accounts"].as_array().unwrap().iter().map(|a| a["color"].as_str().unwrap()).collect();
+    assert_eq!(on_disk, vec!["teal", "purple", "teal", "blue"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_saved_before_colors_get_theirs_in_the_order_they_were_added() {
+    // A settings file as the 0.4.91 test build left it: three accounts and
+    // no colors.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let account = |id: &str, provider: &str, name: &str, slot: usize| serde_json::json!({ "id": id, "provider": provider, "name": name, "remote": id, "sidebar_slot": slot, "setup_complete": true });
+    let mut later = account("shacct4", "koofr", "Koofr 2", 3);
+    later["color"] = "blue".into();
+    let mut odd = account("shacct5", "pcloud", "pCloud 2", 4);
+    odd["color"] = "chartreuse".into();
+    let store = serde_json::json!({ "format": 2, "general": {}, "accounts": [
+        account("koofr", "koofr", "Koofr", 0), account("shacct2", "pcloud", "pCloud", 1), account("shacct3", "filen", "Filen", 2), later, odd
+    ] });
+    std::fs::write(data.join("settings.json"), store.to_string()).unwrap();
+    let opened = config::open(&data.join("settings.json"));
+    assert!(!opened.migrated);
+    let got: Vec<(&str, &str)> = opened.store.accounts.iter().map(|a| (a.name.as_str(), a.color.as_str())).collect();
+    // The one that already had blue keeps it, so the others go around it.
+    assert_eq!(got, vec![("Koofr", "teal"), ("pCloud", "orange"), ("Filen", "purple"), ("Koofr 2", "blue"), ("pCloud 2", "pink")]);
+    // The setup 0.4.1 leaves: its one account is teal, the app's own color.
+    let old = dir.path().join("old.json");
+    std::fs::write(&old, r#"{"setup_complete":true,"account_email":"a@b.c"}"#).unwrap();
+    let opened = config::open(&old);
+    assert_eq!(opened.store.accounts[0].color, "teal");
 }

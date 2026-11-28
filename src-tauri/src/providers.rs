@@ -31,6 +31,9 @@ pub struct Provider {
     pub refuses_emoji: bool,
     /// The drive letter suggested first.
     pub letter: &'static str,
+    /// Signing in also needs to know which of the user's drives to use
+    /// (kDrive: the number in the kDrive's web address).
+    pub asks_drive: bool,
 }
 
 pub const KOOFR: Provider = Provider {
@@ -44,6 +47,7 @@ pub const KOOFR: Provider = Provider {
     max_path: Some(1023),
     refuses_emoji: true,
     letter: "K",
+    asks_drive: false,
 };
 
 pub const PCLOUD: Provider = Provider {
@@ -57,6 +61,7 @@ pub const PCLOUD: Provider = Provider {
     max_path: None,
     refuses_emoji: false,
     letter: "P",
+    asks_drive: false,
 };
 
 pub const FILEN: Provider = Provider {
@@ -70,10 +75,43 @@ pub const FILEN: Provider = Provider {
     max_path: None,
     refuses_emoji: false,
     letter: "F",
+    asks_drive: false,
+};
+
+/// Infomaniak's kDrive. Signs in on Infomaniak's own page, and needs to be
+/// told which kDrive to use, since one sign-in can have several.
+pub const KDRIVE: Provider = Provider {
+    id: "kdrive",
+    name: "kDrive",
+    kind: "kdrive",
+    sign_in: "browser",
+    http2_default: true,
+    http2_choice: false,
+    request_limit: None,
+    max_path: None,
+    refuses_emoji: false,
+    letter: "I",
+    asks_drive: true,
 };
 
 /// In the order the Add cloud provider screen lists them.
-pub static ALL: [&Provider; 3] = [&KOOFR, &PCLOUD, &FILEN];
+pub static ALL: [&Provider; 4] = [&KOOFR, &PCLOUD, &FILEN, &KDRIVE];
+
+/// The kDrive's number, from what someone typed or pasted: the number
+/// itself, or the address of the kDrive in a browser, which has the number
+/// after "/drive/".
+pub fn kdrive_id(typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    let digits = |s: &str| -> String { s.chars().take_while(|c| c.is_ascii_digit()).collect() };
+    let id = if !typed.is_empty() && typed.chars().all(|c| c.is_ascii_digit()) {
+        typed.to_string()
+    } else {
+        let lower = typed.to_ascii_lowercase();
+        let at = lower.find("/drive/")?;
+        digits(&typed[at + "/drive/".len()..])
+    };
+    (!id.is_empty() && id.len() <= 12 && id.chars().any(|c| c != '0')).then_some(id)
+}
 
 pub fn find(id: &str) -> Option<&'static Provider> {
     ALL.iter().copied().find(|p| p.id == id)
@@ -95,6 +133,29 @@ mod tests {
     fn providers_are_found_by_id() {
         assert_eq!(get("pcloud").name, "pCloud");
         assert_eq!(get("filen").sign_in, "keys");
+        assert_eq!((get("kdrive").name, get("kdrive").sign_in, get("kdrive").asks_drive), ("kDrive", "browser", true));
+        assert!(ALL.iter().filter(|p| p.asks_drive).count() == 1);
+    }
+
+    #[test]
+    fn the_kdrive_number_is_found_in_what_people_paste() {
+        // The address forms rclone's own help and kDrive's web app show.
+        for typed in [
+            "654321",
+            "  654321\n",
+            "https://ksuite.infomaniak.com/1234567/kdrive/app/drive/654321/files/5",
+            "https://ksuite.infomaniak.com/kdrive/app/drive/654321/files",
+            "https://kdrive.infomaniak.com/app/drive/654321/files/12/preview",
+            "kdrive.infomaniak.com/app/Drive/654321",
+            "https://kdrive.infomaniak.com/app/drive/654321?x=1",
+        ] {
+            assert_eq!(kdrive_id(typed).as_deref(), Some("654321"), "{typed:?}");
+        }
+        // A number with a zero in front is kept as typed.
+        assert_eq!(kdrive_id("0654321").as_deref(), Some("0654321"));
+        for typed in ["", "   ", "my drive", "https://ksuite.infomaniak.com/1234567/kdrive/app/", "https://kdrive.infomaniak.com/app/drive/", "/drive/abc", "12a34", "0", "1234567890123"] {
+            assert_eq!(kdrive_id(typed), None, "{typed:?}");
+        }
         assert_eq!(get("something-new").id, "koofr");
         assert!(find("something-new").is_none());
         let mut ids: Vec<&str> = ALL.iter().map(|p| p.id).collect();

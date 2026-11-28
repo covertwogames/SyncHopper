@@ -534,8 +534,14 @@ impl Rclone {
     /// writes the result into its settings file as account `name`.
     /// `on_link` is told the page's address, for when the browser doesn't
     /// open by itself.
-    pub async fn browser_sign_in(&self, name: &str, kind: &str, cancel: &Cancel, mut on_link: impl FnMut(&str)) -> Result<(), String> {
-        let args = ["config".to_string(), "create".to_string(), name.to_string(), kind.to_string()];
+    pub async fn browser_sign_in(&self, name: &str, kind: &str, extra: &[(&str, &str)], cancel: &Cancel, mut on_link: impl FnMut(&str)) -> Result<(), String> {
+        let mut args = vec!["config".to_string(), "create".to_string(), name.to_string(), kind.to_string()];
+        // Settings the service needs besides the sign-in, such as which
+        // drive to use. None of them is a secret.
+        for (key, value) in extra {
+            args.push(key.to_string());
+            args.push(value.to_string());
+        }
         let mut child = self
             .spawn(&args, |c| {
                 c.stdout(Stdio::null()).stderr(Stdio::piped());
@@ -591,8 +597,10 @@ impl Rclone {
     }
 
     /// Replaces the saved sign-ins with `text`, locked with this engine's
-    /// key when it has one. The new file is checked before it takes the old
-    /// one's place, so a failure leaves the old file as it was.
+    /// key when it has one. The file is written already locked, so the
+    /// sign-ins never sit on the disk unlocked, not even for a moment. The
+    /// new file is checked before it takes the old one's place, so a
+    /// failure leaves the old file as it was.
     pub async fn save_signins(&self, text: &str) -> Result<(), String> {
         if section_names(text).is_empty() {
             return match std::fs::remove_file(&self.config) {
@@ -601,8 +609,12 @@ impl Rclone {
             };
         }
         let pending = self.config.with_extension("conf.new");
-        std::fs::write(&pending, text).map_err(|e| format!("Could not save the sign-in: {e}"))?;
-        if let Err(e) = self.lock_and_check(&pending, text).await {
+        let writer = Rclone { config: pending.clone(), extra: Vec::new(), ..self.clone() };
+        let written = match writer.write_signins(text) {
+            Ok(()) => writer.check_signins(text).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&pending);
             return Err(e);
         }
@@ -610,35 +622,30 @@ impl Rclone {
         std::fs::rename(&pending, &self.config).map_err(|e| format!("Could not save the sign-in: {e}"))
     }
 
-    /// Has the engine lock the file at `pending` with this engine's key,
-    /// then makes sure it opens with that key and holds the same accounts.
-    async fn lock_and_check(&self, pending: &Path, text: &str) -> Result<(), String> {
-        let Some(pass) = &self.pass else { return Ok(()) };
-        let failed = || "The sync engine could not lock the saved sign-in.".to_string();
-        let plain = Rclone { config: pending.to_path_buf(), pass: None, extra: Vec::new(), ..self.clone() };
-        let args = ["config".to_string(), "encryption".to_string(), "set".to_string()];
-        let mut child = plain
-            .spawn(&args, |c| {
-                c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            })
-            .await
-            .map_err(|e| spawn_failure(&self.exe, &e))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // The engine asks for the key twice. It goes in through stdin so
-            // it never shows in a process list.
-            stdin.write_all(format!("{pass}\n{pass}\n").as_bytes()).await.map_err(|e| e.to_string())?;
-            stdin.shutdown().await.ok();
+    /// Writes `text` as this engine's sign-ins file: locked with the key
+    /// when there is one, as the engine itself would lock it, and plain
+    /// otherwise. Also used for the file a new sign-in is tried out in.
+    pub fn write_signins(&self, text: &str) -> Result<(), String> {
+        let content = match &self.pass {
+            Some(pass) => lock_text(pass, text)?,
+            None => text.to_string(),
+        };
+        std::fs::write(&self.config, content).map_err(|e| format!("Could not save the sign-in: {e}"))
+    }
+
+    /// Makes sure the engine itself opens the file just written, with the
+    /// key, and finds every account in it exactly as it was given.
+    async fn check_signins(&self, text: &str) -> Result<(), String> {
+        if self.pass.is_none() {
+            return Ok(());
         }
-        let out = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
-            .await
-            .map_err(|_| "The sync engine did not answer.".to_string())?
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() || !config_locked(pending) {
+        let failed = || "The sync engine could not open the locked sign-in file, so the old one was kept.".to_string();
+        if !config_locked(&self.config) {
             return Err(failed());
         }
-        let locked = Rclone { config: pending.to_path_buf(), extra: Vec::new(), ..self.clone() };
-        let back = locked.capture(&["config", "show"], Duration::from_secs(30)).await.map_err(|_| failed())?;
-        if section_names(&back) == section_names(text) {
+        let back = self.capture(&["config", "show"], Duration::from_secs(30)).await.map_err(|_| failed())?;
+        let names = section_names(text);
+        if section_names(&back) == names && names.iter().all(|n| section(&back, n) == section(text, n)) {
             Ok(())
         } else {
             Err(failed())
@@ -713,6 +720,44 @@ pub const SIGN_IN_CANCELLED: &str = "cancelled";
 const LOCKED_MARK: &str = "RCLONE_ENCRYPT_V0:";
 
 /// True when the engine's settings file at `path` is locked with a key.
+/// `text` locked with `pass`, in the form the engine writes when its
+/// settings file has a password (rclone's "RCLONE_ENCRYPT_V0"): the key is
+/// the SHA-256 of the password in rclone's wrapping, and the text is sealed
+/// with NaCl secretbox under a fresh random nonce.
+pub fn lock_text(pass: &str, text: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    use crypto_secretbox::aead::{Aead, KeyInit};
+    let mut nonce = [0u8; 24];
+    getrandom::fill(&mut nonce).map_err(|e| format!("The system gave no random numbers: {e}"))?;
+    let cipher = crypto_secretbox::XSalsa20Poly1305::new(&config_key(pass).into());
+    let sealed = cipher.encrypt(&nonce.into(), text.as_bytes()).map_err(|_| "Could not lock the sign-in.".to_string())?;
+    let mut all = nonce.to_vec();
+    all.extend_from_slice(&sealed);
+    Ok(format!("# Encrypted rclone configuration File\n\n{LOCKED_MARK}\n{}\n", base64::engine::general_purpose::STANDARD.encode(all)))
+}
+
+/// The text inside a locked sign-ins file. None when `pass` is not its key
+/// or the file is not a locked one.
+pub fn unlock_text(pass: &str, file: &str) -> Option<String> {
+    use base64::Engine as _;
+    use crypto_secretbox::aead::{Aead, KeyInit};
+    let mut lines = file.lines().skip_while(|l| l.trim() != LOCKED_MARK);
+    lines.next()?;
+    let body: String = lines.map(str::trim).collect();
+    let all = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
+    if all.len() < 24 + 16 {
+        return None;
+    }
+    let cipher = crypto_secretbox::XSalsa20Poly1305::new(&config_key(pass).into());
+    let nonce: [u8; 24] = all[..24].try_into().ok()?;
+    String::from_utf8(cipher.decrypt(&nonce.into(), &all[24..]).ok()?).ok()
+}
+
+fn config_key(pass: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("[{pass}][rclone-config]").as_bytes()).into()
+}
+
 pub fn config_locked(path: &Path) -> bool {
     use std::io::Read;
     let mut head = [0u8; 256];

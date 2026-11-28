@@ -6,6 +6,7 @@
 //! settings: the sync engine program, the saved sign-ins and the right-click
 //! menu. `Hub` is the set of accounts, and what the window talks to.
 
+use crate::colors;
 use crate::config::{self, Account, Settings};
 use crate::core::{Core, Host, Shared};
 use crate::engine::Engine;
@@ -118,6 +119,8 @@ pub struct SignIn {
     pub email: String,
     pub password: String,
     pub code: String,
+    /// kDrive: the address of the kDrive in a browser, or its number.
+    pub drive: String,
 }
 
 /// A folder someone asked to sync from outside the main window, for example
@@ -569,6 +572,18 @@ impl Commons {
         (self.load_key().as_deref() == Some(key.as_str())).then_some(key)
     }
 
+    /// The key, made now if there is none yet. A sign-in is tried out in a
+    /// file of its own before it is saved, and that file is locked too, so
+    /// the key has to exist before the very first sign-in.
+    fn ready_key(&self) -> Option<String> {
+        if let Some(key) = self.shared.config_pass() {
+            return Some(key);
+        }
+        let key = self.load_key().or_else(|| self.make_key())?;
+        self.shared.set_config_pass(Some(key.clone()));
+        Some(key)
+    }
+
     /// Makes sure the saved sign-ins are locked with a key only this
     /// Windows user can read. Called once at startup, before any account
     /// runs. Sign-ins saved by version 0.4 and earlier are locked here.
@@ -757,6 +772,7 @@ impl App {
             obj.remove("base_known");
         }
         let browser = self.browser.lock().unwrap().clone();
+        let account = self.core.shared.account(&self.core.account);
         json!({
             "id": self.core.account,
             "provider": self.core.provider.id,
@@ -768,6 +784,8 @@ impl App {
             "setup_complete": s.setup_complete,
             "account": { "email": s.account_email, "used": about.as_ref().and_then(|a| a.used), "total": about.as_ref().and_then(|a| a.total) },
             "signing_in": browser.map(|b| json!({ "link": b.link })),
+            "color": account.as_ref().map(|a| a.color.clone()).unwrap_or_default(),
+            "kdrive": account.as_ref().map(|a| a.kdrive.clone()).unwrap_or_default(),
             "engine": self.core.engine_info(),
             "engine_channel": self.commons.has_engine_channel(),
             "settings": settings,
@@ -853,9 +871,11 @@ impl App {
         if wanted {
             let folder = PathBuf::from(s.base_folder.trim());
             std::fs::create_dir_all(&folder).map_err(|e| format!("Could not create {}: {e}", folder.display()))?;
-            platform::set_sidebar(slot, &self.core.label(), Some(&folder), &exe).await
+            let color = self.core.shared.account(&self.core.account).map(|a| a.color).unwrap_or_default();
+            let icon = colors::explorer_icon(&exe, &self.core.data, &color);
+            platform::set_sidebar(slot, &self.core.label(), Some(&folder), &icon).await
         } else {
-            platform::set_sidebar(slot, "", None, &exe).await
+            platform::set_sidebar(slot, "", None, "").await
         }
     }
 
@@ -889,6 +909,9 @@ impl App {
         let rc = self.core.rclone()?;
         let name = self.core.shared.account(&self.core.account).map(|a| a.remote).filter(|r| !r.is_empty()).unwrap_or_else(|| self.core.account.clone());
         if self.core.test_mode {
+            if p.asks_drive {
+                self.check_typed(f, &email)?;
+            }
             // In test mode the account is a folder on this PC and any
             // sign-in works. A test build pointed at a stand-in for Filen
             // signs in to it for real and saves the keys, so the Filen
@@ -904,15 +927,19 @@ impl App {
             let about = rc.about(&self.core.remote("")).await?;
             *self.about.lock().unwrap() = Some(about.clone());
             self.core.update(|s| s.account_email = email);
+            self.remember_drive(self.drive_number(f));
             return Ok(about);
         }
         self.check_typed(f, &email)?;
+        let drive = self.drive_number(f);
         // The sign-in is tried out in a file of its own first, and only
-        // goes in with the saved sign-ins once the service accepts it.
+        // goes in with the saved sign-ins once the service accepts it. That
+        // file is locked with the same key as the saved sign-ins, so a
+        // sign-in is never on the disk unlocked.
         let trial = self.core.data.join(format!("signin-{}.conf", self.core.account));
         let _ = std::fs::remove_file(&trial);
-        let probe = Rclone { config: trial.clone(), pass: None, extra: Vec::new(), ..rc.clone() };
-        let result = self.try_sign_in(&rc, &probe, &trial, &name, &email, f).await;
+        let probe = Rclone { config: trial.clone(), pass: self.commons.ready_key(), extra: Vec::new(), ..rc.clone() };
+        let result = self.try_sign_in(&rc, &probe, &name, &email, f, drive.as_deref()).await;
         let _ = std::fs::remove_file(&trial);
         let (about, lines) = result?;
         self.commons.save_signin(&name, Some(&lines)).await?;
@@ -920,6 +947,7 @@ impl App {
         if p.sign_in != "browser" {
             self.core.update(|s| s.account_email = email);
         }
+        self.remember_drive(drive);
         self.core.log(&format!("Connected to {cloud}"));
         Ok(about)
     }
@@ -928,6 +956,9 @@ impl App {
     fn check_typed(&self, f: &SignIn, email: &str) -> Result<(), String> {
         let p = self.core.provider;
         let cloud = p.name;
+        if p.asks_drive && self.drive_number(f).is_none() {
+            return Err(format!("Paste the address of your {cloud} from your browser. It has the {cloud}'s number in it, after /drive/."));
+        }
         if p.sign_in == "browser" {
             return Ok(());
         }
@@ -940,6 +971,30 @@ impl App {
             // end are part of it.
             "keys" if f.password.is_empty() => Err(format!("Enter your {cloud} password.")),
             _ => Ok(()),
+        }
+    }
+
+    /// Which of the user's drives this account is, for services that need
+    /// to be told (kDrive): what was typed, or what was saved before when
+    /// nothing was typed, as when reconnecting.
+    fn drive_number(&self, f: &SignIn) -> Option<String> {
+        if !self.core.provider.asks_drive {
+            return None;
+        }
+        if f.drive.trim().is_empty() {
+            return self.core.shared.account(&self.core.account).map(|a| a.kdrive).filter(|d| !d.is_empty());
+        }
+        providers::kdrive_id(&f.drive)
+    }
+
+    fn remember_drive(&self, drive: Option<String>) {
+        if let Some(drive) = drive {
+            let id = self.core.account.clone();
+            self.core.shared.change(move |s| {
+                if let Some(a) = s.account_mut(&id) {
+                    a.kdrive = drive;
+                }
+            });
         }
     }
 
@@ -957,31 +1012,47 @@ impl App {
 
     /// Builds the sign-in in the trial file and asks the service. Returns
     /// the account's space and the lines to save.
-    async fn try_sign_in(&self, rc: &Rclone, probe: &Rclone, trial: &Path, name: &str, email: &str, f: &SignIn) -> Result<(About, String), String> {
+    async fn try_sign_in(&self, rc: &Rclone, probe: &Rclone, name: &str, email: &str, f: &SignIn, drive: Option<&str>) -> Result<(About, String), String> {
         let p = self.core.provider;
         let cloud = p.name;
-        let cant_save = |e: std::io::Error| format!("Could not save the connection: {e}");
         match p.sign_in {
-            "browser" => self.browser_sign_in(probe, name).await?,
+            "browser" => {
+                // The engine writes this file itself once the browser comes
+                // back. It keeps a locked file locked, so it is given a
+                // locked, empty one to start from.
+                if probe.pass.is_some() {
+                    probe.write_signins("")?;
+                }
+                let extra: Vec<(&str, &str)> = drive.map(|d| ("drive_id", d)).into_iter().collect();
+                self.browser_sign_in(probe, name, &extra).await?
+            }
             "keys" => {
                 let lines = self.filen_lines(rc, email, f).await?;
-                std::fs::write(trial, format!("[{name}]\n{lines}")).map_err(cant_save)?;
+                probe.write_signins(&format!("[{name}]\n{lines}"))?;
             }
             _ => {
                 let password = rc.obscure(f.password.trim()).await?;
-                std::fs::write(trial, format!("[{name}]\ntype = {}\nprovider = koofr\nuser = {email}\npassword = {password}\n", p.kind)).map_err(cant_save)?;
+                probe.write_signins(&format!("[{name}]\ntype = {}\nprovider = koofr\nuser = {email}\npassword = {password}\n", p.kind))?;
             }
         }
         match probe.about(&format!("{name}:")).await {
             Ok(about) => {
-                let text = std::fs::read_to_string(trial).map_err(cant_save)?;
+                let text = probe.signins().await.map_err(|e| format!("Could not save the connection: {e}"))?;
                 let lines = rclone::section(&text, name).ok_or_else(|| "The sync engine did not keep the connection.".to_string())?;
                 Ok((about, lines))
             }
             Err(raw) => {
                 self.core.log(&format!("Connection test failed: {raw}"));
                 let friendly = friendly_error(p, &raw);
-                Err(if p.sign_in == "keys" && !friendly.starts_with("Could not reach") {
+                Err(if p.asks_drive && !friendly.starts_with("Could not reach") && !friendly.contains("did not accept") {
+                    // The sign-in itself went through, so the likeliest
+                    // cause is the wrong drive.
+                    format!(
+                        "Signed in, but {cloud} number {} could not be opened with this sign-in. Check that the address is your own {cloud}'s. Details: {}",
+                        drive.unwrap_or(""),
+                        raw.chars().take(200).collect::<String>()
+                    )
+                } else if p.sign_in == "keys" && !friendly.starts_with("Could not reach") {
                     // Filen already took the password and handed over the
                     // keys, so this is the engine failing to use them.
                     format!("Signed in to {cloud}, but the sync engine could not open the account with its keys. Details: {}", raw.chars().take(200).collect::<String>())
@@ -1002,7 +1073,7 @@ impl App {
     /// Signs in on the service's own page: the engine opens the browser and
     /// waits there for the answer. The window shows a link to the same page
     /// in case the browser did not open, and can cancel the wait.
-    async fn browser_sign_in(&self, probe: &Rclone, name: &str) -> Result<(), String> {
+    async fn browser_sign_in(&self, probe: &Rclone, name: &str, extra: &[(&str, &str)]) -> Result<(), String> {
         let cloud = self.core.cloud();
         let cancel = Cancel::default();
         {
@@ -1015,7 +1086,7 @@ impl App {
         self.core.host.state_changed();
         let result = tokio::time::timeout(
             BROWSER_SIGN_IN_WAIT,
-            probe.browser_sign_in(name, self.core.provider.kind, &cancel, |link| {
+            probe.browser_sign_in(name, self.core.provider.kind, extra, &cancel, |link| {
                 if let Some(b) = self.browser.lock().unwrap().as_mut() {
                     b.link = Some(link.to_string());
                 }
@@ -1075,8 +1146,8 @@ impl App {
             let _ = std::fs::remove_dir_all(self.core.pair_dir(id));
         }
         *self.about.lock().unwrap() = None;
-        if let (Some(exe), Some(slot)) = (self.core.host.exe_path(), account.and_then(|a| a.sidebar_slot)) {
-            let _ = platform::set_sidebar(slot, "", None, &exe).await;
+        if let (Some(_), Some(slot)) = (self.core.host.exe_path(), account.and_then(|a| a.sidebar_slot)) {
+            let _ = platform::set_sidebar(slot, "", None, "").await;
         }
         self.core.update(|s| {
             s.setup_complete = false;
@@ -1622,6 +1693,7 @@ impl Hub {
             "general": self.shared.general(),
             "lock_signins": self.lock_signins,
             "providers": providers::ALL,
+            "colors": colors::ALL,
             "accounts": self.apps().iter().map(|a| a.snapshot()).collect::<Vec<_>>(),
             "default_ignores": config::default_ignores(),
             "pending": self.pending.lock().unwrap().clone(),
@@ -1689,6 +1761,7 @@ impl Hub {
             name: self.free_name(p.name),
             remote: id.clone(),
             sidebar_slot: (0..platform::SIDEBAR_CLSIDS.len()).find(|n| !slots.contains(n)),
+            color: colors::next_free(&accounts.iter().map(|a| a.color.as_str()).collect::<Vec<_>>()).to_string(),
             drive_letter: letter,
             use_http2: p.http2_default,
             ..Default::default()
@@ -1743,6 +1816,19 @@ impl Hub {
     }
 
     /// Changes the name the window shows for an account.
+    /// Gives the account another color, here and in File Explorer.
+    pub async fn set_account_color(&self, id: &str, color: &str) -> Result<(), String> {
+        let app = self.app(id)?;
+        let color = colors::find(color).ok_or_else(|| "SyncHopper doesn't have that color.".to_string())?.id;
+        self.shared.change(|s| {
+            if let Some(a) = s.account_mut(id) {
+                a.color = color.to_string();
+            }
+        });
+        // The File Explorer entry is written again with the new icon.
+        app.apply_sidebar().await
+    }
+
     pub async fn rename_account(&self, id: &str, name: &str) -> Result<(), String> {
         let app = self.app(id)?;
         let name: String = name.trim().chars().filter(|c| !c.is_control()).collect();

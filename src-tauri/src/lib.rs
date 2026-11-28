@@ -4,6 +4,7 @@
 //! call, and the plumbing between Tauri and the app logic in `app.rs`.
 
 pub mod app;
+pub mod colors;
 pub mod config;
 pub mod core;
 pub mod engine;
@@ -463,6 +464,11 @@ async fn rename_account(hub: Ctx<'_>, account: String, name: String) -> Result<(
     hub.rename_account(&account, &name).await
 }
 
+#[tauri::command]
+async fn set_account_color(hub: Ctx<'_>, account: String, color: String) -> Result<(), String> {
+    hub.set_account_color(&account, &color).await
+}
+
 /// Where a new or existing account would keep its folders on this PC.
 #[tauri::command]
 fn default_base_folder(hub: Ctx<'_>, account: String) -> Result<String, String> {
@@ -890,6 +896,7 @@ pub fn run() {
             cancel_sign_in,
             remove_account,
             rename_account,
+            set_account_color,
             default_base_folder,
             list_remote,
             make_remote_dir,

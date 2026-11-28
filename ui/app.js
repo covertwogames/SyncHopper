@@ -14,7 +14,7 @@
   // Commands that are about one account. The account being shown, or being
   // set up, is filled in for them.
   const PER_ACCOUNT = new Set([
-    "dismiss_folder_notice", "ignore_file", "unignore_file", "reconnect", "remove_account", "rename_account",
+    "dismiss_folder_notice", "ignore_file", "unignore_file", "reconnect", "remove_account", "rename_account", "set_account_color",
     "default_base_folder", "list_remote", "make_remote_dir", "preview_pair", "finish_setup", "update_settings",
     "restore_defaults", "add_pair", "remove_pair", "pair_action", "sync_all", "set_paused_all", "upload_add",
     "upload_action", "set_upload_dest", "drive_action", "open_target",
@@ -550,7 +550,7 @@
     const body =
       "<p>" + esc(plural(count, "item")) + " from File Explorer. Which account " + (count === 1 ? "is it" : "are they") + " for?</p>" +
       '<ul class="box list pick">' +
-      readyAccounts().map((a) => '<li tabindex="0" role="button" data-id="' + esc(a.id) + '">' + icon("cloud", 18) + '<span class="name">' + esc(a.name) + "</span></li>").join("") +
+      readyAccounts().map((a) => '<li tabindex="0" role="button" data-id="' + esc(a.id) + '">' + accountIcon(a, 18) + '<span class="name">' + esc(a.name) + "</span></li>").join("") +
       "</ul>";
     if (pendingModal) {
       pendingModal.setBody(body);
@@ -616,7 +616,7 @@
         const sum = accountSummary(a);
         return (
           '<button type="button" class="acct' + (onAccount && a.id === cur ? " current" : "") + '" data-acct="' + esc(a.id) + '"' + (onAccount && a.id === cur ? ' aria-current="true"' : "") + ">" +
-          icon("cloud") +
+          accountIcon(a) +
           '<span class="who"><span class="name">' + esc(a.name) + '</span><span class="state">' + esc(sum.text) + "</span></span>" +
           (sum.flag ? '<span class="flag ' + sum.flag + '">' + icon(sum.flag === "warn" ? "warn" : "sync", 16) + "</span>" : "") +
           "</button>"
@@ -640,6 +640,13 @@
     browser: "Sign in through your browser",
     keys: "Email and password",
   };
+
+  // An account's icon: the SyncHopper mark on the account's color.
+  function accountIcon(a, size) {
+    const ok = (RAW.colors || []).some((c) => c.id === a.color);
+    const px = size || 20;
+    return '<img class="acct-ico" src="accounts/' + (ok ? a.color : "teal") + '.png" width="' + px + '" height="' + px + '" alt="">';
+  }
 
   // The rows of the list of services to choose from.
   function providerRows() {
@@ -997,6 +1004,43 @@
 
   document.addEventListener("click", (e) => {
     if (!e.target.closest("#row-menu")) closeRowMenu();
+  });
+
+  // The list of colors for the shown account, in the same pop-up the row
+  // menu uses.
+  function openColorMenu(anchor) {
+    const menu = $("#row-menu");
+    menu.innerHTML = (RAW.colors || [])
+      .map(
+        (c) =>
+          '<button type="button" role="menuitemradio" aria-checked="' + (c.id === S.color) + '" class="color-item' + (c.id === S.color ? " chosen" : "") + '" data-color="' + esc(c.id) + '">' +
+          '<span class="swatch" style="background:' + esc(c.hex) + '"></span>' + esc(c.name) + "</button>"
+      )
+      .join("");
+    menu.dataset.id = "";
+    menu.hidden = false;
+    const r = anchor.getBoundingClientRect();
+    const h = menu.offsetHeight;
+    menu.style.top = (r.bottom + 6 + h > window.innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6) + "px";
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + "px";
+    menu._opener = anchor;
+    ($(".chosen", menu) || $("button", menu)).focus();
+  }
+
+  $("#st-color").addEventListener("click", (e) => {
+    e.stopPropagation();
+    if ($("#row-menu").hidden) openColorMenu(e.currentTarget);
+    else closeRowMenu();
+  });
+
+  $("#row-menu").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-color]");
+    if (!b) return;
+    closeRowMenu();
+    if (b.dataset.color === S.color) return;
+    if ((await run("set_account_color", { color: b.dataset.color })) === undefined) return;
+    await refresh();
+    render();
   });
 
   $("#row-menu").addEventListener("click", async (e) => {
@@ -1521,6 +1565,12 @@
     const p = providerOf(S.provider);
     setText($("#st-title"), S.name + " settings");
     setText($("#st-name"), S.name);
+    const mine = (RAW.colors || []).find((c) => c.id === S.color) || (RAW.colors || [])[0];
+    if (mine) {
+      $("#st-color-swatch").style.background = mine.hex;
+      $("#st-color").title = "Color: " + mine.name;
+      $("#st-color").setAttribute("aria-label", "Color of this account's icon: " + mine.name);
+    }
     setText($("#st-account"), S.account.email || c + " account");
     setText($("#st-reconnect-note"), "Sign in again, for example after changing your password.");
     setText($("#st-disconnect-note"), "Stops using this account here. Files stay on this PC and in " + c + ".");
@@ -1699,13 +1749,21 @@
         '<div class="field"><label for="wz-email">' + c + ' email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.email) + '"></div>' +
         '<div class="field"><label for="wz-pass">' + c + ' password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(v.password) + '"></div>' +
         '<div class="field" id="wz-code-field"' + (v.needsCode ? "" : " hidden") + '><label for="wz-code">Two-factor code</label>' +
-        '<input id="wz-code" class="narrow code" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" value="' + esc(v.code || "") + '">' +
+        '<input id="wz-code" type="text" class="narrow code" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" value="' + esc(v.code || "") + '">' +
         '<p class="small muted">The code from your authenticator app.</p></div>'
       );
     }
     if (p.sign_in === "browser") {
+      // kDrive signs in with an Infomaniak account, which can have more
+      // than one kDrive, so it is asked which one.
+      const which = p.asks_drive
+        ? '<div class="field"><label for="wz-kdrive">Address of your ' + c + '</label>' +
+          '<input id="wz-kdrive" type="text" class="narrow" autocomplete="off" spellcheck="false" placeholder="https://ksuite.infomaniak.com/.../kdrive/app/drive/123456/files" value="' + esc(v.kdrive || "") + '">' +
+          '<p class="small muted">Open your ' + c + " in your browser and copy the address from the address bar. SyncHopper only uses the number after /drive/, which says which " + c + " is yours.</p></div>"
+        : "";
       return (
-        "<p>" + c + " signs you in on its own page. SyncHopper opens it in your browser and never sees your password.</p>" +
+        which +
+        "<p>" + c + " signs you in on " + (p.asks_drive ? "Infomaniak's" : "its own") + " page. SyncHopper opens it in your browser and never sees your password.</p>" +
         '<p class="small muted">The page asks you to let rclone use your account. rclone is the sync engine SyncHopper is built on.</p>'
       );
     }
@@ -1722,7 +1780,7 @@
       const el = $(id, root);
       return el ? el.value : "";
     };
-    return { email: val("#wz-email"), password: val("#wz-pass"), code: val("#wz-code") };
+    return { email: val("#wz-email"), password: val("#wz-pass"), code: val("#wz-code"), drive: val("#wz-kdrive") };
   }
 
   // While a sign-in waits in the browser: what to show, with a way to open
@@ -1756,7 +1814,7 @@
       body:
         '<p class="muted small">Your folders and settings stay as they are. Only the saved sign-in is replaced.</p>' +
         (p.sign_in === "keys" ? '<p class="small">' + keysWhy(esc(p.name)) + "</p>" : "") +
-        signInFields(p, { email: S.account.email || "", password: "", code: "" }) +
+        signInFields(p, { email: S.account.email || "", password: "", code: "", kdrive: S.kdrive || "" }) +
         (p.sign_in === "keys" ? '<p class="tiny muted">' + keysKept(esc(p.name), true) + "</p>" : "") +
         '<p id="rc-wait" role="status"></p>',
       buttons: [
@@ -1914,6 +1972,7 @@
       password: "",
       code: "", // Filen's two-factor code
       needsCode: false, // Filen asked for one
+      kdrive: "", // kDrive: the address of the kDrive
       testing: false,
       result: null, // { ok, text }
       sync: true,
@@ -2031,7 +2090,10 @@
           : (browser ? "What " + c + " gives SyncHopper to sign in with" : "The sign-in") +
             " is saved on this PC only, " + (RAW.lock_signins ? "locked so that only your Windows account can read it." : "scrambled the way rclone stores it.") +
             (p.sign_in === "password" ? " You can cancel the app password any time on the same " + c + " page." : "")) +
-        "</p>";
+        "</p>" +
+        (p.asks_drive
+          ? '<p class="tiny muted">SyncHopper works in your ' + c + "'s Private folder. " + c + " keeps the old version each time a file is replaced, and old versions count against your storage. You can clear them out on " + c + "'s website.</p>"
+          : "");
       const typed = (key) => (e) => {
         wiz[key] = e.target.value;
         wiz.result = null;
@@ -2040,7 +2102,8 @@
       if ($("#wz-email")) $("#wz-email").addEventListener("input", typed("email"));
       if ($("#wz-pass")) $("#wz-pass").addEventListener("input", typed("password"));
       if ($("#wz-code")) $("#wz-code").addEventListener("input", typed("code"));
-      for (const id of ["#wz-pass", "#wz-code"]) {
+      if ($("#wz-kdrive")) $("#wz-kdrive").addEventListener("input", typed("kdrive"));
+      for (const id of ["#wz-pass", "#wz-code", "#wz-kdrive"]) {
         if ($(id))
           $(id).addEventListener("keydown", (e) => {
             if (e.key === "Enter") testConnection();
@@ -2204,7 +2267,7 @@
     wiz.result = null;
     showResult();
     try {
-      const done = await invoke("add_account", { provider: wiz.provider, signin: { email: wiz.email, password: wiz.password, code: wiz.code } });
+      const done = await invoke("add_account", { provider: wiz.provider, signin: { email: wiz.email, password: wiz.password, code: wiz.code, drive: wiz.kdrive } });
       if (wiz !== mine) {
         // Setup was left while this was under way.
         run("remove_account", { account: done.account });

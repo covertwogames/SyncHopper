@@ -332,7 +332,7 @@ impl Default for General {
 #[serde(default)]
 pub struct Account {
     pub id: String,
-    /// Which service this is: "koofr", "pcloud" or "filen".
+    /// Which service this is: "koofr", "pcloud", "filen" or "kdrive".
     pub provider: String,
     /// The name shown in the window. The user can change it.
     pub name: String,
@@ -341,6 +341,11 @@ pub struct Account {
     /// Which of SyncHopper's File Explorer sidebar entries is this
     /// account's. None until it has one.
     pub sidebar_slot: Option<usize>,
+    /// The color of the account's icon, one of `colors::ALL`.
+    pub color: String,
+    /// kDrive only: the number of the kDrive this account is. It is part of
+    /// the kDrive's web address, so it is not a secret.
+    pub kdrive: String,
 
     pub setup_complete: bool,
     /// The email address or other name the account signs in with.
@@ -370,6 +375,8 @@ impl Default for Account {
             name: String::new(),
             remote: String::new(),
             sidebar_slot: None,
+            color: String::new(),
+            kdrive: String::new(),
             setup_complete: d.setup_complete,
             account_email: d.account_email,
             feature_sync: d.feature_sync,
@@ -500,6 +507,16 @@ impl Store {
             a.name = a.name.trim().chars().filter(|c| !c.is_control()).take(40).collect();
             if a.name.is_empty() {
                 a.name = a.provider.clone();
+            }
+            a.kdrive.retain(|c| c.is_ascii_digit());
+        }
+        // An account without a color (saved before accounts had colors)
+        // gets the first one no other account has, in the order the
+        // accounts were added. So the first account keeps the app's teal.
+        for i in 0..self.accounts.len() {
+            if crate::colors::find(&self.accounts[i].color).is_none() {
+                let used: Vec<&str> = self.accounts.iter().map(|a| a.color.as_str()).filter(|c| crate::colors::find(c).is_some()).collect();
+                self.accounts[i].color = crate::colors::next_free(&used).to_string();
             }
         }
     }

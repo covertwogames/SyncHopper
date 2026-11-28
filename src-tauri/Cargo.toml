@@ -1,6 +1,6 @@
 [package]
 name = "synchopper"
-version = "0.4.91"
+version = "0.4.92"
 description = "Two-way sync for cloud storage"
 authors = ["Cover Two Games"]
 edition = "2021"
@@ -40,6 +40,8 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha1 = "0.10"
 md4 = "0.10"
 md2 = "0.10"
+# Writing the saved sign-ins already locked, in the sync engine's own format.
+crypto_secretbox = { version = "0.1", default-features = false, features = ["alloc", "salsa20"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
