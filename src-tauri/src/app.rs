@@ -9,6 +9,7 @@
 use crate::config::{self, Account, Settings};
 use crate::core::{Core, Host, Shared};
 use crate::engine::Engine;
+use crate::filen;
 use crate::mount::Drive;
 use crate::newfolders::NewFolders;
 use crate::platform;
@@ -75,6 +76,11 @@ pub struct Commons {
     signin_lock: tokio::sync::Mutex<()>,
     /// The accounts, to tell when the engine comes back.
     apps: Mutex<Vec<Weak<App>>>,
+    /// Where Filen sign-ins go: Filen itself, or a stand-in in tests.
+    filen_gateway: Mutex<String>,
+    /// When this run of SyncHopper began. Files from before then can't
+    /// belong to anything going on now.
+    started: std::time::SystemTime,
 }
 
 /// One cloud account and everything that runs for it.
@@ -101,15 +107,17 @@ struct BrowserSignIn {
 }
 
 /// What someone typed to sign in. Which parts are used depends on the
-/// service: Koofr takes an email and an app password, Filen an email, a
-/// password and an API key, and pCloud none of them (it signs in on its own
-/// page in the browser).
+/// service: Koofr takes an email and an app password, Filen an email, the
+/// account password and, when Filen asks for one, a two-factor code, and
+/// pCloud none of them (it signs in on its own page in the browser). The
+/// Filen password is used to sign in and unlock the account's keys, and is
+/// never saved.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SignIn {
     pub email: String,
     pub password: String,
-    pub api_key: String,
+    pub code: String,
 }
 
 /// A folder someone asked to sync from outside the main window, for example
@@ -191,6 +199,18 @@ fn mask_email(email: &str) -> String {
 /// this Windows user can read it.
 const KEY_FILE: &str = "signin.key";
 
+/// Where Filen sign-ins go. A test build can point them at a stand-in for
+/// Filen with SYNCHOPPER_FILEN_URL; release builds always go to Filen.
+fn default_filen_gateway() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("SYNCHOPPER_FILEN_URL") {
+        if !url.trim().is_empty() {
+            return url.trim().to_string();
+        }
+    }
+    filen::GATEWAY.to_string()
+}
+
 impl Commons {
     pub fn new(shared: Arc<Shared>, download_base: String) -> Arc<Commons> {
         Arc::new(Commons {
@@ -203,7 +223,18 @@ impl Commons {
             channel_tried: Mutex::new(None),
             signin_lock: tokio::sync::Mutex::new(()),
             apps: Mutex::new(Vec::new()),
+            filen_gateway: Mutex::new(default_filen_gateway()),
+            started: std::time::SystemTime::now(),
         })
+    }
+
+    pub fn filen_gateway(&self) -> String {
+        self.filen_gateway.lock().unwrap().clone()
+    }
+
+    /// Points Filen sign-ins at a stand-in for Filen. For tests.
+    pub fn set_filen_gateway(&self, url: &str) {
+        *self.filen_gateway.lock().unwrap() = url.to_string();
     }
 
     /// Release builds get the engine only from the signed channel. Call
@@ -543,6 +574,7 @@ impl Commons {
     /// runs. Sign-ins saved by version 0.4 and earlier are locked here.
     pub async fn secure_signins(&self) {
         let _guard = self.signin_lock.lock().await;
+        self.remove_plain_leftovers();
         let path = self.shared.config_path();
         let key = self.load_key();
         if rclone::config_locked(&path) {
@@ -573,6 +605,56 @@ impl Commons {
                 self.shared.log("The saved sign-ins are now locked with a key only this Windows user can read.");
             }
             Err(e) => self.shared.log(&format!("Could not lock the saved sign-ins, so they stay as they were: {e}")),
+        }
+    }
+
+    /// A sign-in is written in plain text for a moment while it is tried
+    /// out (signin-<account>.conf) and while the engine locks the saved
+    /// sign-ins (rclone.conf.new). If SyncHopper stopped at just that
+    /// moment, the file would stay behind. Neither is needed after a
+    /// restart, so both are removed at start. Only files from before this
+    /// run are touched, so a sign-in someone starts meanwhile is left alone.
+    fn remove_plain_leftovers(&self) {
+        let path = self.shared.config_path();
+        let Some(data) = path.parent() else { return };
+        let mut removed = 0;
+        for entry in std::fs::read_dir(data).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let leftover = name == "rclone.conf.new" || (name.starts_with("signin-") && name.ends_with(".conf"));
+            let earlier = entry.metadata().and_then(|m| m.modified()).map(|t| t < self.started).unwrap_or(false);
+            if leftover && earlier && entry.path().is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        match removed {
+            0 => {}
+            1 => self.shared.log("Removed an unlocked copy of a sign-in left behind when SyncHopper last stopped"),
+            n => self.shared.log(&format!("Removed {n} unlocked copies of sign-ins left behind when SyncHopper last stopped")),
+        }
+    }
+
+    /// Earlier test builds saved a Filen account's password in its saved
+    /// sign-in. SyncHopper never keeps a Filen password, so such a sign-in
+    /// is taken out. The account then asks to be reconnected, and
+    /// reconnecting saves only its keys. `names` are the Filen accounts'
+    /// names in the engine's settings.
+    pub async fn drop_filen_passwords(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let Ok(rc) = self.shared.rclone(Vec::new()) else { return };
+        let Ok(text) = rc.signins().await else { return };
+        for name in names {
+            let Some(body) = rclone::section(&text, name) else { continue };
+            // A sign-in made from the keys has them; one made with the
+            // password does not.
+            if body.lines().any(|l| l.split('=').next().map(str::trim) == Some("master_keys")) {
+                continue;
+            }
+            match self.save_signin(name, None).await {
+                Ok(()) => self.shared.log("Took out a Filen sign-in saved by an earlier test version, because it held the account password. Reconnecting the account signs in again and saves only its keys."),
+                Err(e) => self.shared.log(&format!("Could not take out an old Filen sign-in: {e}")),
+            }
         }
     }
 
@@ -805,27 +887,26 @@ impl App {
         let cloud = p.name;
         let email = f.email.trim().to_string();
         let rc = self.core.rclone()?;
+        let name = self.core.shared.account(&self.core.account).map(|a| a.remote).filter(|r| !r.is_empty()).unwrap_or_else(|| self.core.account.clone());
         if self.core.test_mode {
+            // In test mode the account is a folder on this PC and any
+            // sign-in works. A test build pointed at a stand-in for Filen
+            // signs in to it for real and saves the keys, so the Filen
+            // sign-in can be tried end to end.
+            if p.sign_in == "keys" && self.commons.filen_gateway() != filen::GATEWAY {
+                self.check_typed(f, &email)?;
+                let lines = self.filen_lines(&rc, &email, f).await?;
+                self.commons.save_signin(&name, Some(&lines)).await?;
+            }
+            // Fetched again: saving the first sign-in locks the file, and
+            // the engine then needs the key to open it.
+            let rc = self.core.rclone()?;
             let about = rc.about(&self.core.remote("")).await?;
             *self.about.lock().unwrap() = Some(about.clone());
             self.core.update(|s| s.account_email = email);
             return Ok(about);
         }
-        if p.sign_in != "browser" {
-            if email.is_empty() || !email.contains('@') || email.chars().any(|c| c.is_control() || c == '[' || c == ']') {
-                return Err(format!("Enter the email address you use for {cloud}."));
-            }
-            if f.password.trim().is_empty() {
-                return Err(match p.sign_in {
-                    "password" => format!("Enter a {cloud} app password."),
-                    _ => format!("Enter your {cloud} password."),
-                });
-            }
-            if p.sign_in == "api_key" && f.api_key.split_whitespace().next().is_none() {
-                return Err(format!("Enter your {cloud} API key."));
-            }
-        }
-        let name = self.core.shared.account(&self.core.account).map(|a| a.remote).filter(|r| !r.is_empty()).unwrap_or_else(|| self.core.account.clone());
+        self.check_typed(f, &email)?;
         // The sign-in is tried out in a file of its own first, and only
         // goes in with the saved sign-ins once the service accepts it.
         let trial = self.core.data.join(format!("signin-{}.conf", self.core.account));
@@ -843,6 +924,37 @@ impl App {
         Ok(about)
     }
 
+    /// Checks what was typed before anything is sent anywhere.
+    fn check_typed(&self, f: &SignIn, email: &str) -> Result<(), String> {
+        let p = self.core.provider;
+        let cloud = p.name;
+        if p.sign_in == "browser" {
+            return Ok(());
+        }
+        if email.is_empty() || !email.contains('@') || email.chars().any(|c| c.is_control() || c == '[' || c == ']') {
+            return Err(format!("Enter the email address you use for {cloud}."));
+        }
+        match p.sign_in {
+            "password" if f.password.trim().is_empty() => Err(format!("Enter a {cloud} app password.")),
+            // A Filen password is used exactly as typed: spaces at either
+            // end are part of it.
+            "keys" if f.password.is_empty() => Err(format!("Enter your {cloud} password.")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Signs in to Filen and returns the account's lines for the saved
+    /// sign-ins: its keys, never its password.
+    async fn filen_lines(&self, rc: &Rclone, email: &str, f: &SignIn) -> Result<String, String> {
+        let keys = filen::sign_in(&self.commons.filen_gateway(), email, &f.password, &f.code).await.map_err(|e| {
+            self.core.log(&format!("Filen sign-in did not work: {e:?}"));
+            e.text()
+        })?;
+        let internal = rc.obscure("INTERNAL").await?;
+        let api_key = rc.obscure(&keys.api_key).await?;
+        keys.config_lines(self.core.provider.kind, &internal, &api_key)
+    }
+
     /// Builds the sign-in in the trial file and asks the service. Returns
     /// the account's space and the lines to save.
     async fn try_sign_in(&self, rc: &Rclone, probe: &Rclone, trial: &Path, name: &str, email: &str, f: &SignIn) -> Result<(About, String), String> {
@@ -851,12 +963,9 @@ impl App {
         let cant_save = |e: std::io::Error| format!("Could not save the connection: {e}");
         match p.sign_in {
             "browser" => self.browser_sign_in(probe, name).await?,
-            "api_key" => {
-                let password = rc.obscure(f.password.trim()).await?;
-                // A pasted key often carries a line break or spaces.
-                let key: String = f.api_key.split_whitespace().collect();
-                let key = rc.obscure(&key).await?;
-                std::fs::write(trial, format!("[{name}]\ntype = {}\nemail = {email}\npassword = {password}\napi_key = {key}\n", p.kind)).map_err(cant_save)?;
+            "keys" => {
+                let lines = self.filen_lines(rc, email, f).await?;
+                std::fs::write(trial, format!("[{name}]\n{lines}")).map_err(cant_save)?;
             }
             _ => {
                 let password = rc.obscure(f.password.trim()).await?;
@@ -872,10 +981,13 @@ impl App {
             Err(raw) => {
                 self.core.log(&format!("Connection test failed: {raw}"));
                 let friendly = friendly_error(p, &raw);
-                Err(if friendly.contains("did not accept") {
+                Err(if p.sign_in == "keys" && !friendly.starts_with("Could not reach") {
+                    // Filen already took the password and handed over the
+                    // keys, so this is the engine failing to use them.
+                    format!("Signed in to {cloud}, but the sync engine could not open the account with its keys. Details: {}", raw.chars().take(200).collect::<String>())
+                } else if friendly.contains("did not accept") {
                     match p.sign_in {
                         "password" => format!("{cloud} did not accept that email and app password. Make sure it is an app password from {cloud}'s password page, not your normal {cloud} password."),
-                        "api_key" => format!("{cloud} did not accept that email, password and API key. The API key comes from the Filen command-line tool, and changes when you change your {cloud} password."),
                         _ => format!("{cloud} did not accept the sign-in. Try again."),
                     }
                 } else if friendly.starts_with("Could not reach") {
@@ -1479,6 +1591,8 @@ impl Hub {
             }
         });
         self.commons.secure_signins().await;
+        let filen: Vec<String> = self.shared.accounts().into_iter().filter(|a| a.provider == providers::FILEN.id).map(|a| a.remote).collect();
+        self.commons.drop_filen_passwords(&filen).await;
         // An account whose setup was never finished is not kept: it has no
         // folders yet, and adding it again takes a moment.
         self.drop_unfinished().await;

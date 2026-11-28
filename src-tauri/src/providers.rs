@@ -13,8 +13,9 @@ pub struct Provider {
     /// What the sync engine calls this kind of account.
     pub kind: &'static str,
     /// How an account signs in: "password" (an email and a password made for
-    /// apps), "browser" (the service's own sign-in page) or "api_key" (an
-    /// email, a password and a key).
+    /// apps), "browser" (the service's own sign-in page) or "keys" (an email
+    /// and the account password, used once to sign in and unlock the
+    /// account's keys; only the keys are saved).
     pub sign_in: &'static str,
     /// Whether new accounts talk HTTP/2. Koofr uploads are much slower with
     /// it, so Koofr starts with it off.
@@ -62,7 +63,7 @@ pub const FILEN: Provider = Provider {
     id: "filen",
     name: "Filen",
     kind: "filen",
-    sign_in: "api_key",
+    sign_in: "keys",
     http2_default: true,
     http2_choice: false,
     request_limit: None,
@@ -85,7 +86,6 @@ pub fn get(id: &str) -> &'static Provider {
 }
 
 pub const KOOFR_PASSWORD_URL: &str = "https://app.koofr.net/app/admin/preferences/password";
-pub const FILEN_CLI_URL: &str = "https://github.com/FilenCloudDienste/filen-cli/releases/latest";
 
 #[cfg(test)]
 mod tests {
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn providers_are_found_by_id() {
         assert_eq!(get("pcloud").name, "pCloud");
-        assert_eq!(get("filen").sign_in, "api_key");
+        assert_eq!(get("filen").sign_in, "keys");
         assert_eq!(get("something-new").id, "koofr");
         assert!(find("something-new").is_none());
         let mut ids: Vec<&str> = ALL.iter().map(|p| p.id).collect();

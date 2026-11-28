@@ -638,7 +638,7 @@
   const SIGN_IN_HINT = {
     password: "Email and an app password",
     browser: "Sign in through your browser",
-    api_key: "Email, password and an API key",
+    keys: "Email and password",
   };
 
   // The rows of the list of services to choose from.
@@ -1672,17 +1672,35 @@
 
   // ----- signing in again -----------------------------------------------
 
+  // Why Filen needs the account password, and what is kept instead.
+  function keysWhy(c) {
+    return (
+      c + " encrypts your files with a key made from your password, so SyncHopper needs your password once, to sign in and unlock your files. " +
+      "It is never saved and never leaves this PC. Like " + c + "'s own apps, SyncHopper sends " + c + " a code made from it instead."
+    );
+  }
+  function keysKept(c, reconnecting) {
+    return (
+      "SyncHopper keeps only the keys that unlock your files, saved on this PC" +
+      (RAW.lock_signins ? " and locked so that only your Windows account can read them." : ".") +
+      (reconnecting ? "" : " If you change your " + c + " password, choose Reconnect in this account's settings.")
+    );
+  }
+
+  // The words in an error that mean Filen wants a two-factor code.
+  const CODE_WORDS = "two-factor code";
+
   // The boxes each kind of sign-in needs. `v` holds what is typed so far.
   function signInFields(p, v) {
     const c = esc(p.name);
-    if (p.sign_in === "api_key") {
+    if (p.sign_in === "keys") {
+      // The code box shows once Filen asks for a code.
       return (
         '<div class="field"><label for="wz-email">' + c + ' email</label><input id="wz-email" type="email" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.email) + '"></div>' +
         '<div class="field"><label for="wz-pass">' + c + ' password</label><input id="wz-pass" type="password" class="narrow" autocomplete="off" value="' + esc(v.password) + '"></div>' +
-        '<div class="field"><label for="wz-key">API key</label><input id="wz-key" type="password" class="narrow" autocomplete="off" spellcheck="false" value="' + esc(v.apiKey) + '">' +
-        '<p class="small muted">' + c + " hands out the API key through its command-line tool. " +
-        '<button type="button" class="link" data-open="filen_cli_page">Get the tool</button>, run <span class="selectable strong">filen export-api-key</span> in it, sign in, and paste the key here. ' +
-        "A new key is needed whenever you change your " + c + " password.</p></div>"
+        '<div class="field" id="wz-code-field"' + (v.needsCode ? "" : " hidden") + '><label for="wz-code">Two-factor code</label>' +
+        '<input id="wz-code" class="narrow code" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" value="' + esc(v.code || "") + '">' +
+        '<p class="small muted">The code from your authenticator app.</p></div>'
       );
     }
     if (p.sign_in === "browser") {
@@ -1704,7 +1722,7 @@
       const el = $(id, root);
       return el ? el.value : "";
     };
-    return { email: val("#wz-email"), password: val("#wz-pass"), api_key: val("#wz-key") };
+    return { email: val("#wz-email"), password: val("#wz-pass"), code: val("#wz-code") };
   }
 
   // While a sign-in waits in the browser: what to show, with a way to open
@@ -1737,7 +1755,9 @@
       width: 520,
       body:
         '<p class="muted small">Your folders and settings stay as they are. Only the saved sign-in is replaced.</p>' +
-        signInFields(p, { email: S.account.email || "", password: "", apiKey: "" }) +
+        (p.sign_in === "keys" ? '<p class="small">' + keysWhy(esc(p.name)) + "</p>" : "") +
+        signInFields(p, { email: S.account.email || "", password: "", code: "" }) +
+        (p.sign_in === "keys" ? '<p class="tiny muted">' + keysKept(esc(p.name), true) + "</p>" : "") +
         '<p id="rc-wait" role="status"></p>',
       buttons: [
         { label: "Cancel", action: () => { run("cancel_sign_in"); return true; } },
@@ -1753,6 +1773,11 @@
             } catch (e) {
               m.waiting = false;
               updateReconnect();
+              const field = $("#wz-code-field", m.el);
+              if (field && String(e).includes(CODE_WORDS)) {
+                field.hidden = false;
+                setTimeout(() => $("#wz-code", m.el).focus(), 0);
+              }
               throw e;
             }
             m.waiting = false;
@@ -1887,7 +1912,8 @@
       step: providerId ? 1 : 0,
       email: "",
       password: "",
-      apiKey: "",
+      code: "", // Filen's two-factor code
+      needsCode: false, // Filen asked for one
       testing: false,
       result: null, // { ok, text }
       sync: true,
@@ -1990,8 +2016,8 @@
       const lead =
         p.sign_in === "password"
           ? c + " gives other apps their own password, so your normal password is never used here."
-          : p.sign_in === "api_key"
-            ? c + " needs your email, your password and an API key. They are checked with " + c + " and saved on this PC only."
+          : p.sign_in === "keys"
+            ? keysWhy(c)
             : "";
       page.innerHTML =
         "<header><h1>Connect your " + c + " account</h1>" + (lead ? '<p class="muted">' + lead + "</p>" : "") + "</header>" +
@@ -2000,9 +2026,11 @@
         '<div class="row gap12"><button type="button" class="btn" id="wz-test">' + (browser ? "Sign in to " + c : "Test connection") + '</button><span id="wz-result" class="grow" role="status"></span></div>' +
         '<p id="wz-engine" class="tiny muted" role="status"><span id="wz-engine-text"></span><button type="button" class="link" id="wz-engine-retry" hidden>Try again</button></p>' +
         '<p class="tiny muted">' +
-        (browser ? "What " + c + " gives SyncHopper to sign in with" : "The sign-in") +
-        " is saved on this PC only, " + (RAW.lock_signins ? "locked so that only your Windows account can read it." : "scrambled the way rclone stores it.") +
-        (p.sign_in === "password" ? " You can cancel the app password any time on the same " + c + " page." : "") +
+        (p.sign_in === "keys"
+          ? keysKept(c, false)
+          : (browser ? "What " + c + " gives SyncHopper to sign in with" : "The sign-in") +
+            " is saved on this PC only, " + (RAW.lock_signins ? "locked so that only your Windows account can read it." : "scrambled the way rclone stores it.") +
+            (p.sign_in === "password" ? " You can cancel the app password any time on the same " + c + " page." : "")) +
         "</p>";
       const typed = (key) => (e) => {
         wiz[key] = e.target.value;
@@ -2011,12 +2039,13 @@
       };
       if ($("#wz-email")) $("#wz-email").addEventListener("input", typed("email"));
       if ($("#wz-pass")) $("#wz-pass").addEventListener("input", typed("password"));
-      if ($("#wz-key")) $("#wz-key").addEventListener("input", typed("apiKey"));
-      const last = $("#wz-key") || $("#wz-pass");
-      if (last)
-        last.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") testConnection();
-        });
+      if ($("#wz-code")) $("#wz-code").addEventListener("input", typed("code"));
+      for (const id of ["#wz-pass", "#wz-code"]) {
+        if ($(id))
+          $(id).addEventListener("keydown", (e) => {
+            if (e.key === "Enter") testConnection();
+          });
+      }
       $("#wz-test").addEventListener("click", testConnection);
       $("#wz-engine-retry").addEventListener("click", () => run("retry_engine"));
       showResult();
@@ -2175,13 +2204,17 @@
     wiz.result = null;
     showResult();
     try {
-      const done = await invoke("add_account", { provider: wiz.provider, signin: { email: wiz.email, password: wiz.password, api_key: wiz.apiKey } });
+      const done = await invoke("add_account", { provider: wiz.provider, signin: { email: wiz.email, password: wiz.password, code: wiz.code } });
       if (wiz !== mine) {
         // Setup was left while this was under way.
         run("remove_account", { account: done.account });
         return false;
       }
       wiz.account = done.account;
+      // Not needed any more. Filen's especially is never kept.
+      wiz.password = "";
+      wiz.code = "";
+      for (const id of ["#wz-pass", "#wz-code"]) if ($(id)) $(id).value = "";
       let text = "Connected.";
       if (done.about.used != null && done.about.total != null) text += " " + fmtBytes(done.about.used) + " of " + fmtBytes(done.about.total) + " used.";
       wiz.result = { ok: true, text: text };
@@ -2191,11 +2224,17 @@
       if (wiz !== mine) return false;
       wiz.account = null;
       wiz.result = { ok: false, text: String(e) };
+      if (String(e).includes(CODE_WORDS)) {
+        wiz.needsCode = true;
+        const field = $("#wz-code-field");
+        if (field) field.hidden = false;
+      }
     }
     wiz.testing = false;
     await refresh();
     if (wiz !== mine) return false;
     showResult();
+    if (!wiz.result.ok && wiz.needsCode && $("#wz-code")) $("#wz-code").focus();
     return wiz.result.ok;
   }
 

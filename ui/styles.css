@@ -276,6 +276,7 @@ input[type="text"]:focus, input[type="email"]:focus, input[type="password"]:focu
 ::placeholder { color: var(--muted); opacity: 0.85; }
 textarea { height: auto; padding: 8px 10px; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 18px; }
 .narrow { align-self: flex-start; width: 420px; max-width: 100%; }
+input.code { width: 180px; letter-spacing: 0.08em; }
 
 select {
   height: 32px;

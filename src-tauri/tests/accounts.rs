@@ -4,6 +4,7 @@
 //! sign-ins being locked.
 
 mod common;
+use common::filen_server::FakeFilen;
 use common::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use synchopper_lib::app::{App, Commons, Hub, SetupChoices, SignIn};
 use synchopper_lib::config;
 use synchopper_lib::core::Shared;
 use synchopper_lib::engine::Phase;
+use synchopper_lib::filen;
 use synchopper_lib::rclone;
 
 /// The whole app with plain folders standing in for the cloud accounts. The
@@ -221,7 +223,7 @@ async fn two_accounts_sync_side_by_side_and_keep_to_their_own_folders() {
     let err = pcloud.engine.add_pair(&koofr_home, "Loose").unwrap_err();
     assert!(err.contains("Koofr keeps its synced folders in"), "{err}");
     // And an account can't keep its folders where another one does.
-    let (third, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), api_key: "k".into() }).await.unwrap();
+    let (third, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), ..Default::default() }).await.unwrap();
     let filen = rig.hub.app(&third).unwrap();
     let err = filen.finish_setup(rig.choices("pc/Koofr", &["Anything"])).await.unwrap_err();
     assert!(err.contains("overlaps the folders Koofr keeps"), "{err}");
@@ -266,7 +268,7 @@ async fn removing_an_account_leaves_its_files_and_the_other_accounts_alone() {
     let rig = HubRig::new();
     write(&rig.cloud("koofr").join("Documents/k.txt"), "k");
     let koofr = rig.add("koofr", "pc/Koofr", &["Documents"]).await;
-    let (id, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), api_key: "k".into() }).await.unwrap();
+    let (id, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), ..Default::default() }).await.unwrap();
     let filen = rig.hub.app(&id).unwrap();
     write(&rig.cloud(&id).join("Notes/n.txt"), "n");
     filen.finish_setup(rig.choices("pc/SyncHopper/Filen", &["Notes"])).await.unwrap();
@@ -303,7 +305,7 @@ async fn an_account_whose_setup_was_never_finished_is_gone_after_a_restart() {
     let (id, _) = rig.hub.add_account("pcloud", SignIn::default()).await.unwrap();
     assert_eq!(rig.hub.shared.accounts().len(), 2);
     // Signing in to another one drops the unfinished one right away.
-    let (id2, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), api_key: "k".into() }).await.unwrap();
+    let (id2, _) = rig.hub.add_account("filen", SignIn { email: "f@example.com".into(), password: "x".into(), ..Default::default() }).await.unwrap();
     assert!(rig.hub.app(&id).is_err());
     assert_eq!(rig.hub.shared.accounts().len(), 2);
 
@@ -471,15 +473,17 @@ async fn a_real_sign_in_that_fails_saves_nothing_for_any_service() {
         e.exe = Some("rclone".into());
     });
     assert!(hub.add_account("nothing", SignIn::default()).await.is_err());
-    let filen = |email: &str, password: &str, key: &str| SignIn { email: email.into(), password: password.into(), api_key: key.into() };
-    let err = hub.add_account("filen", filen("", "x", "k")).await.unwrap_err();
+    // Nothing listens there, so Filen can't be reached.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    hub.commons.set_filen_gateway(&format!("http://{closed}"));
+    let filen = |email: &str, password: &str, code: &str| SignIn { email: email.into(), password: password.into(), code: code.into() };
+    let err = hub.add_account("filen", filen("", "x", "")).await.unwrap_err();
     assert!(err.contains("email address you use for Filen"), "{err}");
-    let err = hub.add_account("filen", filen("a@b.c", " ", "k")).await.unwrap_err();
+    let err = hub.add_account("filen", filen("a@b.c", "", "")).await.unwrap_err();
     assert_eq!(err, "Enter your Filen password.");
-    let err = hub.add_account("filen", filen("a@b.c", "x", " \n ")).await.unwrap_err();
-    assert_eq!(err, "Enter your Filen API key.");
-    let err = hub.add_account("filen", filen("nobody@example.com", "secret-password", "secret-key")).await.unwrap_err();
-    assert!(!err.contains("secret-password") && !err.contains("secret-key"), "{err}");
+    let err = hub.add_account("filen", filen("nobody@example.com", "secret-password", "123456")).await.unwrap_err();
+    assert!(err.starts_with("Could not reach Filen."), "{err}");
+    assert!(!err.contains("secret-password"), "{err}");
     let err = hub.add_account("koofr", filen("nobody@example.com", "secret-password", "")).await.unwrap_err();
     assert!(!err.contains("secret-password"), "{err}");
     assert!(hub.shared.accounts().is_empty(), "a failed sign-in leaves no account behind");
@@ -489,7 +493,7 @@ async fn a_real_sign_in_that_fails_saves_nothing_for_any_service() {
     let left: Vec<String> = names(&data).into_iter().filter(|n| n.starts_with("signin-")).collect();
     assert!(left.is_empty(), "{left:?}");
     let log = std::fs::read_to_string(hub.shared.log_path()).unwrap_or_default();
-    assert!(!log.contains("secret-password") && !log.contains("secret-key"));
+    assert!(!log.contains("secret-password"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -597,4 +601,201 @@ async fn changes_made_at_the_same_moment_all_reach_the_settings_file() {
     let log = std::fs::read_to_string(shared.log_path()).unwrap_or_default();
     assert!(!log.contains("Could not save settings"), "{log}");
     assert!(!data.join("settings.json.tmp").exists());
+}
+
+/// Every file in `dir` and below.
+fn all_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(all_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// What rclone's scrambling of a value hides.
+fn reveal(obscured: &str) -> String {
+    let out = std::process::Command::new("rclone").args(["reveal", obscured]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filen_account_keeps_its_keys_and_never_its_password() {
+    // Test mode with a stand-in for Filen: the sign-in is the real one,
+    // and the account's files are a folder on this PC.
+    let fake = FakeFilen::start().await;
+    let rig = HubRig::new();
+    rig.hub.commons.set_filen_gateway(&fake.url);
+    let a = fake.account("v3-2fa");
+    let s = |k: &str| a[k].as_str().unwrap().to_string();
+    let (email, password, code) = (s("email"), s("password"), s("two_factor"));
+    let signin = |code: &str| SignIn { email: email.clone(), password: password.clone(), code: code.into() };
+
+    // Filen asks for the code first, then turns down a wrong one. Neither
+    // keeps anything.
+    let err = rig.hub.add_account("filen", signin("")).await.unwrap_err();
+    assert!(err.contains(filen::CODE_WORDS) && err.starts_with("Your Filen account asks"), "{err}");
+    let err = rig.hub.add_account("filen", signin("111111")).await.unwrap_err();
+    assert!(err.contains(filen::CODE_WORDS) && err.starts_with("Filen did not accept that"), "{err}");
+    assert!(rig.hub.shared.accounts().is_empty());
+    assert!(!rig.path("data/rclone.conf").exists());
+
+    let (id, _) = rig.hub.add_account("filen", signin(&code)).await.unwrap();
+    let app = rig.hub.app(&id).unwrap();
+    assert_eq!(app.core.settings().account_email, email);
+
+    // The saved sign-in is locked and holds the keys, as Filen's desktop
+    // app gives them to rclone.
+    let conf = rig.path("data/rclone.conf");
+    assert!(rclone::config_locked(&conf));
+    let rc = rig.hub.shared.rclone(Vec::new()).unwrap();
+    let text = rc.signins().await.unwrap();
+    let remote = rig.hub.shared.account(&id).unwrap().remote;
+    let body = rclone::section(&text, &remote).unwrap();
+    let field = |k: &str| body.lines().find_map(|l| l.split_once(" = ").filter(|(n, _)| *n == k).map(|(_, v)| v.to_string())).unwrap_or_default();
+    let e = &a["expect"];
+    assert_eq!(field("type"), "filen");
+    assert_eq!(field("email"), email);
+    assert_eq!(reveal(&field("password")), "INTERNAL", "rclone is told to use the keys");
+    assert_eq!(reveal(&field("api_key")), e["api_key"].as_str().unwrap());
+    let master_keys: Vec<&str> = e["master_keys"].as_array().unwrap().iter().map(|k| k.as_str().unwrap()).collect();
+    assert_eq!(field("master_keys"), master_keys.join("|"));
+    assert_eq!(field("private_key"), e["private_key"].as_str().unwrap());
+    assert_eq!(field("public_key"), e["public_key"].as_str().unwrap());
+    assert_eq!(field("auth_version"), "3");
+    assert_eq!(field("base_folder_uuid"), e["base_folder"].as_str().unwrap());
+    assert_eq!(body.lines().count(), 9, "nothing else: {body}");
+
+    // The password is nowhere on this PC: not in any of SyncHopper's files,
+    // the log included. Nor is the key worked out from it.
+    let kek = a["derived_key"].as_str().unwrap();
+    for f in all_files(&rig.path("data")) {
+        let bytes = std::fs::read(&f).unwrap();
+        let t = String::from_utf8_lossy(&bytes);
+        assert!(!t.contains(&password), "the password is in {}", f.display());
+        assert!(!t.contains(kek), "the key made from the password is in {}", f.display());
+    }
+    assert!(!text.contains(&password) && !text.contains(kek), "nor in the saved sign-ins once unlocked");
+    let left: Vec<String> = names(&rig.path("data")).into_iter().filter(|n| n.starts_with("signin-") || n.ends_with(".new")).collect();
+    assert!(left.is_empty(), "{left:?}");
+
+    // Reconnecting: a wrong password leaves the saved sign-in as it was;
+    // the right one replaces it.
+    let err = rig.hub.reconnect(&id, SignIn { email: email.clone(), password: "wrong".into(), code: code.clone() }).await.unwrap_err();
+    assert_eq!(err, "Filen did not accept the sign-in. Filen says: Invalid email or password.");
+    assert_eq!(rclone::section(&rc.signins().await.unwrap(), &remote).as_deref(), Some(body.as_str()));
+    rig.hub.reconnect(&id, signin(&code)).await.unwrap();
+    let again = rclone::section(&rc.signins().await.unwrap(), &remote).unwrap();
+    assert_ne!(again, body, "new scrambling of the same values");
+    assert!(again.contains(&format!("master_keys = {}", master_keys.join("|"))));
+    assert!(rclone::config_locked(&conf));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filen_sign_in_saved_with_its_password_by_a_test_build_is_taken_out() {
+    // How 0.4.90 (a test build) saved a Filen sign-in: the password and an
+    // API key. Starting this version takes that sign-in out, and leaves the
+    // others, including a Filen account saved with its keys.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(data.join("bin")).unwrap();
+    let engine = String::from_utf8_lossy(&std::process::Command::new("sh").args(["-c", "command -v rclone"]).output().unwrap().stdout).trim().to_string();
+    std::fs::copy(&engine, data.join("bin/rclone")).unwrap();
+    let account = |id: &str, provider: &str, name: &str, slot: usize| {
+        serde_json::json!({ "id": id, "provider": provider, "name": name, "remote": id, "sidebar_slot": slot, "setup_complete": true, "account_email": "a@b.c" })
+    };
+    let store = serde_json::json!({ "format": 2, "general": {}, "accounts": [
+        account("koofr", "koofr", "Koofr", 0), account("shacctold1", "filen", "Filen", 1), account("shacctnew2", "filen", "Filen 2", 2)
+    ] });
+    std::fs::write(data.join("settings.json"), store.to_string()).unwrap();
+    std::fs::write(
+        data.join("rclone.conf"),
+        "[koofr]\ntype = koofr\nprovider = koofr\nuser = a@b.c\npassword = DcF7Gw8hf\n\n\
+         [shacctold1]\ntype = filen\nemail = a@b.c\npassword = cGFzc3dvcmQ\napi_key = a2V5\n\n\
+         [shacctnew2]\ntype = filen\nemail = a@b.c\npassword = SU5URVJOQUw\napi_key = a2V5\nmaster_keys = abc\nprivate_key = x\npublic_key = y\nauth_version = 2\nbase_folder_uuid = z\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("koofr")).unwrap();
+    let rig = HubRig::open(dir);
+    rig.hub.start().await;
+    let rc = rig.hub.shared.rclone(Vec::new()).unwrap();
+    let text = rc.signins().await.unwrap();
+    assert_eq!(rclone::section_names(&text), vec!["koofr", "shacctnew2"]);
+    assert!(!text.contains("cGFzc3dvcmQ"));
+    assert!(rclone::config_locked(&rig.path("data/rclone.conf")));
+    let raw = std::fs::read_to_string(rig.path("data/rclone.conf")).unwrap();
+    assert!(!raw.contains("cGFzc3dvcmQ"), "the old password is not left in the file either");
+    let log = std::fs::read_to_string(rig.hub.shared.log_path()).unwrap();
+    assert_eq!(log.matches("Took out a Filen sign-in saved by an earlier test version").count(), 1, "{log}");
+    // Both accounts are still there; the one without a sign-in asks to be
+    // reconnected the next time it syncs.
+    assert_eq!(rig.hub.shared.accounts().len(), 3);
+    assert!(rclone::is_auth_error("couldn't find section in config file") || rclone::is_auth_error("didn't find section in config file"));
+
+    // Starting again finds nothing more to take out.
+    let HubRig { dir, hub, .. } = rig;
+    drop(hub);
+    let rig = HubRig::open(dir);
+    rig.hub.start().await;
+    let log = std::fs::read_to_string(rig.hub.shared.log_path()).unwrap();
+    assert_eq!(log.matches("Took out a Filen sign-in").count(), 1);
+    assert_eq!(rclone::section_names(&rig.hub.shared.rclone(Vec::new()).unwrap().signins().await.unwrap()), vec!["koofr", "shacctnew2"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlocked_copies_left_behind_by_a_crash_are_removed_at_start() {
+    // Left behind by the last run, before this one started.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    write(&data.join("rclone.conf.new"), "[koofr]\ntype = koofr\npassword = plain\n");
+    write(&data.join("signin-shacct1.conf"), "[shacct1]\ntype = filen\nmaster_keys = plain\n");
+    write(&data.join("signin.key"), "kept");
+    write(&data.join("signin-notes.txt"), "kept");
+    std::fs::create_dir_all(dir.path().join("koofr")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let rig = HubRig::open(dir);
+    // A sign-in being tried out right now, in this run.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write(&data.join("signin-shacct2.conf"), "[shacct2]\ntype = koofr\n");
+    rig.hub.commons.secure_signins().await;
+    let left = names(&data);
+    assert!(!left.contains(&"rclone.conf.new".to_string()) && !left.contains(&"signin-shacct1.conf".to_string()), "{left:?}");
+    assert!(left.contains(&"signin.key".to_string()) && left.contains(&"signin-notes.txt".to_string()), "{left:?}");
+    assert!(left.contains(&"signin-shacct2.conf".to_string()), "a sign-in under way now is left alone: {left:?}");
+    let log = std::fs::read_to_string(rig.hub.shared.log_path()).unwrap();
+    assert!(log.contains("Removed 2 unlocked copies of sign-ins left behind"), "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filen_sign_in_the_engine_cant_use_keeps_nothing() {
+    // Not in test mode: Filen (the stand-in) accepts the sign-in and hands
+    // over the keys, then the engine tries them on Filen itself, which this
+    // machine can't reach. Nothing may be kept.
+    let fake = FakeFilen::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let hub = Hub::new(data.clone(), None, Arc::new(TestHost::default()));
+    hub.shared.set_engine(|e| {
+        e.state = "ready".into();
+        e.exe = Some("rclone".into());
+    });
+    hub.commons.set_filen_gateway(&fake.url);
+    let a = fake.account("v2");
+    let s = |k: &str| a[k].as_str().unwrap().to_string();
+    let err = hub.add_account("filen", SignIn { email: s("email"), password: s("password"), code: String::new() }).await.unwrap_err();
+    assert!(err.starts_with("Could not reach Filen") || err.starts_with("Signed in to Filen, but the sync engine could not open the account"), "{err}");
+    assert!(fake.requests().iter().any(|r| r.path == "/v3/user/baseFolder"), "the sign-in itself went through");
+    assert!(hub.shared.accounts().is_empty(), "no account is kept");
+    assert!(!data.join("rclone.conf").exists(), "no sign-in is saved");
+    let left: Vec<String> = names(&data).into_iter().filter(|n| n.starts_with("signin-")).collect();
+    assert!(left.is_empty(), "the trial file is gone: {left:?}");
+    for f in all_files(&data) {
+        let t = String::from_utf8_lossy(&std::fs::read(&f).unwrap()).to_string();
+        assert!(!t.contains(&s("password")) && !t.contains(&s("derived_key")), "{}", f.display());
+    }
 }

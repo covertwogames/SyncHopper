@@ -7,6 +7,7 @@ pub mod app;
 pub mod config;
 pub mod core;
 pub mod engine;
+pub mod filen;
 pub mod mount;
 pub mod newfolders;
 pub mod platform;
@@ -632,7 +633,6 @@ fn open_target(hub: Ctx<'_>, handle: AppHandle, kind: String, account: Option<St
     let settings = || -> Result<config::Settings, String> { Ok(hub.app(account.as_deref().unwrap_or_default())?.core.settings()) };
     let result = match kind.as_str() {
         "koofr_password_page" => opener.open_url(providers::KOOFR_PASSWORD_URL, None::<&str>),
-        "filen_cli_page" => opener.open_url(providers::FILEN_CLI_URL, None::<&str>),
         "winfsp_page" => opener.open_url(app::WINFSP_URL, None::<&str>),
         "rclone_site" => opener.open_url(app::RCLONE_URL, None::<&str>),
         // The sign-in page the engine is waiting on. It is always on this PC.

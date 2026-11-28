@@ -1,6 +1,6 @@
 [package]
 name = "synchopper"
-version = "0.4.90"
+version = "0.4.91"
 description = "Two-way sync for cloud storage"
 authors = ["Cover Two Games"]
 edition = "2021"
@@ -31,12 +31,35 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 minisign-verify = "0.3"
 base64 = "0.23"
 getrandom = "0.3"
+# Signing in to Filen: the same key math Filen's own apps use.
+aes = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+md4 = "0.10"
+md2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Filen's sign-in runs 200,000 rounds of PBKDF2 or a 64 MB Argon2. Unoptimized,
+# that takes long enough to slow down the tests, so these are optimized even
+# in test builds.
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 opt-level = "s"
